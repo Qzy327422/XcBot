@@ -1,0 +1,130 @@
+{
+    "_comment": "XcBot 主配置文件",
+    "owner": [],
+    "_comment_owner": "机器人拥有者 QQ 号列表，通常保留 1 个即可。",
+    "black_list": [],
+    "_comment_black_list": "全局黑名单。这里填用户号或群号后，机器人会忽略对应对象。",
+    "silents": [],
+    "_comment_silents": "保留字段，一般不用改。",
+    "Connection": {
+        "_comment": "OneBot / Hyper 连接配置，除非你清楚自己在做什么，否则不要随便改。",
+        "mode": "FWS",
+        "_comment_mode": "连接模式，默认 FWS。",
+        "host": "127.0.0.1",
+        "_comment_host": "机器人连接宿主地址。",
+        "port": 3333,
+        "_comment_port": "机器人连接端口。",
+        "listener_host": "127.0.0.1",
+        "_comment_listener_host": "监听地址。",
+        "listener_port": 3333,
+        "_comment_listener_port": "监听端口。",
+        "retries": 5,
+        "_comment_retries": "连接失败后的重试次数。",
+        "satori_token": "",
+        "_comment_satori_token": "Satori Token，不用就留空。"
+    },
+    "Log_level": "ERROR",
+    "_comment_Log_level": "日志等级，可选如 DEBUG / INFO / WARNING / ERROR。",
+    "protocol": "OneBot",
+    "_comment_protocol": "协议类型，默认 OneBot。",
+    "Others": {
+        "project_name": "XcBot",
+        "version_name": "1.0",
+        "slogan": "✨ 忻城 ✨",
+        "robot_name_triggers": [
+            "忻城"
+        ],
+        "_comment_robot_name_triggers": "机器人名字触发词。群里有人发到这些词时，也会触发回复。可填多个。",
+        "emoji_plus_one_enabled": true,
+        "_comment_emoji_plus_one_enabled": "是否开启单个表情自动 +1 复读。",
+        "emoji_plus_one_cooldown_seconds": 1,
+        "_comment_emoji_plus_one_cooldown_seconds": "表情 +1 的防抖时间，单位秒。",
+        "poke_reply_enabled": true,
+        "_comment_poke_reply_enabled": "是否开启拍一拍自动回复。",
+        "poke_cooldown_seconds": 8,
+        "_comment_poke_cooldown_seconds": "拍一拍回复防抖时间，单位秒。",
+        "api_request_timeout_seconds": 60,
+        "_comment_api_request_timeout_seconds": "LLM/API 请求超时时间，单位秒。",
+        "summary_per_day_limit": 2,
+        "_comment_summary_per_day_limit": "每个群每天允许总结的次数。",
+        "summary_max_messages": 600,
+        "_comment_summary_max_messages": "每次最多可总结多少条消息。",
+        "context_max_messages": 60,
+        "_comment_context_max_messages": "单个会话最多保留多少条上下文消息。",
+        "compression_threshold": 40,
+        "_comment_compression_threshold": "消息达到多少条后，允许触发上下文压缩。",
+        "compression_keep_recent": 20,
+        "_comment_compression_keep_recent": "压缩时保留最近多少条消息不压缩。",
+        "auto_compress_after_messages": 40,
+        "_comment_auto_compress_after_messages": "自动压缩触发阈值。",
+        "weak_blacklist_trigger_probability": 0.3,
+        "_comment_weak_blacklist_trigger_probability": "弱黑名单用户被拦截/特殊处理的概率，0 到 1。",
+        "weak_blacklist_users": [],
+        "_comment_weak_blacklist_users": "弱黑名单用户列表。",
+        "llm_endpoints": [
+            {
+                "base_url": "https://api.deepseek.com/v1",
+                "model": "deepseek-chat",
+                "supports_multimodal": false,
+                "keys": [
+                    "请输入api key"
+                ]
+            }
+        ],
+        "_comment_llm_endpoints": "大模型接口列表。可配置多个 endpoint，每个 endpoint 下也可放多个 key，程序会自动切换/轮换。",
+        "bot_name": "忻城",
+        "_comment_bot_name": "机器人对外显示的中文名字。",
+        "bot_name_en": "XinCheng",
+        "_comment_bot_name_en": "机器人对外显示的英文名。",
+        "ROOT_User": [],
+        "_comment_ROOT_User": "ROOT 超级管理员 QQ 列表。",
+        "Auto_approval": [],
+        "_comment_Auto_approval": "自动审批关键词列表，入群答案包含这些关键词时自动通过。",
+        "reminder": "/",
+        "_comment_reminder": "命令前缀，例如 /帮助、/关于。",
+        "api_failure_cooldown_seconds": 5,
+        "api_default_index": 1,
+        "api_default_model": "",
+        "personality_prompt": "你是一只猫娘，基于XcBot",
+        "llm_split": {
+            "enabled": true,
+            "mode": "regex",
+            "prompt_suffix": "当你想回复第二句甚至更多句时，用 <split> 分隔符将两句话分开，以此类推，我会依次发送，但要保持多句话连贯。在用户要求（或你想）回复长段时不必遵守。",
+            "split_regex": ".*?[。？！~。]+|.+$",
+            "filter_regex": "\\n|\\r|<split>",
+            "max_chars_no_split": 80
+        },
+        "sensitive_words": [
+            "prompt=人格"
+        ]
+    },
+    "uin": 0,
+    "_comment_uin": "机器人 QQ 号。某些环境下可保留 0 或由外部程序自动写入。",
+    "WebUI": {
+        "_comment": "内置 Web 管理界面配置。启动机器人后访问 http://host:port/。如暴露到公网请务必设置 access_token。",
+        "enabled": true,
+        "host": "127.0.0.1",
+        "port": 7891,
+        "access_token": "",
+        "open_browser": false
+    },
+    "FeatureSwitches": {
+        "_comment": "功能热开关。可在 WebUI 中直接切换，保存后无需重启即可生效。",
+        "ai_chat": true,
+        "private_chat": true,
+        "group_chat": true,
+        "sensitive_filter": true,
+        "plugin_admin_commands": true,
+        "summary": true,
+        "compression_commands": true,
+        "emoji_plus_one": true,
+        "split_reply_quote": true,
+        "weak_blacklist": true,
+        "poke_reply": true,
+        "plugins_external": true
+    },
+    "split_reply_quote": {
+        "default_enabled": true,
+        "groups": {}
+    }
+}

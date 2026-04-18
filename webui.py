@@ -1,0 +1,885 @@
+# -*- coding: utf-8 -*-
+"""XcBot lightweight WebUI.
+
+只使用 Python 标准库，避免给机器人增加额外依赖。提供：
+- config.json / 插件配置的读取与保存
+- 运行状态、启动参数、环境信息
+- stdout/stderr 实时日志缓冲与最近日志文件读取
+"""
+
+from __future__ import annotations
+
+import html
+import io
+import json
+import os
+import platform
+import sys
+import atexit
+import threading
+import time
+import traceback
+import urllib.parse
+from collections import deque
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "config.json"
+LOG_DIR = BASE_DIR / "data" / "webui"
+LOG_FILE = LOG_DIR / "runtime.log"
+BOT_ICON_PATH = BASE_DIR / "assets" / "icon.jpg"
+LEGACY_CONFIG_PATHS = [
+    BASE_DIR / "Manage_User.ini",
+    BASE_DIR / "Super_User.ini",
+    BASE_DIR / "blacklist.sr",
+    BASE_DIR / "plugins" / "split_reply_quote.json",
+]
+
+_server: Optional[ThreadingHTTPServer] = None
+_server_thread: Optional[threading.Thread] = None
+_started_at = time.time()
+_log_buffer = deque(maxlen=2000)
+_log_lock = threading.RLock()
+_capture_installed = False
+_capture_stdout = None
+_capture_stderr = None
+_config_saved_callback = None
+_webui_reconfigure_lock = threading.RLock()
+_connection_status = {
+    "state": "starting",
+    "text": "正在启动",
+    "detail": "等待 OneBot / Hyper 连接",
+    "updated_at": int(time.time()),
+}
+
+
+FEATURE_META = [
+    {"key": "ai_chat", "title": "AI 对话", "desc": "AI 回复总开关", "group": "对话"},
+    {"key": "private_chat", "title": "私聊响应", "desc": "允许私聊直接触发 AI", "group": "对话"},
+    {"key": "group_chat", "title": "群聊响应", "desc": "允许群内 @ / 名字 / 前缀触发 AI", "group": "对话"},
+    {"key": "sensitive_filter", "title": "屏蔽词过滤", "desc": "对消息、人设、日志展示等文本执行敏感词替换", "group": "对话"},
+    {"key": "plugin_admin_commands", "title": "插件/模型命令", "desc": "允许使用 /插件视角、/model、/重载插件 等命令", "group": "功能配置"},
+    {"key": "summary", "title": "群聊总结", "desc": "总结群聊记录与数据看板", "group": "功能配置"},
+    {"key": "compression_commands", "title": "记忆压缩", "desc": "自动压缩上下文，并允许使用压缩相关命令", "group": "功能配置"},
+    {"key": "emoji_plus_one", "title": "表情 +1", "desc": "单个表情自动复读", "group": "功能配置"},
+    {"key": "split_reply_quote", "title": "回复引用", "desc": "开启后：回复引用发送者消息", "group": "功能配置"},
+    {"key": "weak_blacklist", "title": "弱黑名单", "desc": "按概率拦截触发", "group": "功能配置"},
+    {"key": "poke_reply", "title": "拍一拍回复", "desc": "收到拍一拍时自动回复", "group": "功能配置"},
+    {"key": "plugins_external", "title": "外部插件加载", "desc": "是否继续加载 plugins 目录中的第三方插件", "group": "功能配置"},
+]
+
+
+DEFAULT_FEATURE_SWITCHES = {item["key"]: (False if item["key"] in {"plugins_external"} else True) for item in FEATURE_META}
+
+
+class TeeStream(io.TextIOBase):
+    """将 stdout/stderr 同步写到原始流、内存缓冲和日志文件。"""
+
+    def __init__(self, original, stream_name: str):
+        self.original = original
+        self.stream_name = stream_name
+        self._encoding = getattr(original, "encoding", "utf-8") or "utf-8"
+        self._errors = getattr(original, "errors", "replace") or "replace"
+
+    @property
+    def encoding(self):
+        return self._encoding
+
+    @property
+    def errors(self):
+        return self._errors
+
+    def writable(self):
+        return True
+
+    def isatty(self):
+        return getattr(self.original, "isatty", lambda: False)()
+
+    def fileno(self):
+        return self.original.fileno()
+
+    def flush(self):
+        try:
+            self.original.flush()
+        except Exception:
+            pass
+
+    def write(self, s):
+        if not isinstance(s, str):
+            s = str(s)
+        try:
+            self.original.write(s)
+            self.original.flush()
+        except Exception:
+            pass
+        _append_log(s, self.stream_name)
+        return len(s)
+
+
+def _append_log(text: str, stream_name: str = "stdout"):
+    if text == "":
+        return
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = text.splitlines()
+    if text.endswith(("\n", "\r")) and lines:
+        pass
+    elif not lines:
+        lines = [text]
+    with _log_lock:
+        with LOG_FILE.open("a", encoding="utf-8", errors="replace") as f:
+            for line in lines:
+                item = {"time": now, "stream": stream_name, "message": line}
+                _log_buffer.append(item)
+                f.write(f"[{now}] [{stream_name}] {line}\n")
+
+
+def install_log_capture():
+    global _capture_installed, _capture_stdout, _capture_stderr
+    if _capture_installed:
+        return
+    _capture_stdout = TeeStream(sys.stdout, "stdout")
+    _capture_stderr = TeeStream(sys.stderr, "stderr")
+    sys.stdout = _capture_stdout
+    sys.stderr = _capture_stderr
+    _capture_installed = True
+
+
+def read_json(path: Path, default: Any = None) -> Any:
+    if default is None:
+        default = {}
+    if not path.exists():
+        return default
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(path: Path, data: Any):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup = path.with_suffix(path.suffix + f".{datetime.now().strftime('%Y%m%d%H%M%S')}.bak")
+    if path.exists():
+        backup.write_text(path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+        f.write("\n")
+
+
+def cleanup_legacy_config_files():
+    """删除历史遗留的外部配置文件，强制统一只保留 config.json。"""
+    for legacy_path in LEGACY_CONFIG_PATHS:
+        try:
+            if legacy_path.exists():
+                legacy_path.unlink()
+        except Exception:
+            pass
+
+
+def _normalize_webui_llm_endpoints(value):
+    if not isinstance(value, list):
+        return []
+    result = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        base_url = str(raw.get("base_url", "") or "").strip()
+        model = str(raw.get("model", "") or "").strip()
+        keys_raw = raw.get("keys", [])
+        if isinstance(keys_raw, str):
+            keys = [x.strip() for x in keys_raw.splitlines() if x.strip()]
+        elif isinstance(keys_raw, list):
+            keys = [str(x).strip() for x in keys_raw if str(x).strip()]
+        else:
+            keys = []
+        keys = [x for x in keys if not x.startswith("请输入") and x.lower() not in {"api_key", "your_api_key", "sk-xxxx"}]
+        if not base_url or not keys:
+            continue
+        if not model:
+            model = "deepseek-chat"
+        result.append({
+            "base_url": base_url,
+            "model": model,
+            "keys": keys,
+            "supports_multimodal": bool(raw.get("supports_multimodal", False)),
+        })
+    return result
+
+
+def force_apply_llm_endpoints_from_config(cfg: Dict[str, Any]):
+    """WebUI 保存后直接刷新 key_manager，兜底保证 LLM 接口列表无需重启。"""
+    try:
+        from key_manager import key_manager
+        others = cfg.get("Others", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(others, dict):
+            others = {}
+        endpoints = _normalize_webui_llm_endpoints(others.get("llm_endpoints", []))
+        key_manager.set_endpoints(endpoints)
+        default_model = str(others.get("api_default_model", "") or "").strip()
+        applied = False
+        if default_model:
+            applied = key_manager.set_default_by_model(default_model)
+        if not applied:
+            try:
+                default_index = int(others.get("api_default_index", 1) or 1)
+            except Exception:
+                default_index = 1
+            if default_index > 0 and key_manager.get_all_keys():
+                applied = key_manager.set_default_by_index(default_index)
+        if not applied and key_manager.get_all_keys():
+            key_manager.set_default_by_index(1)
+        print(f"✅ WebUI 已直接热刷新 LLM 接口列表: endpoints={len(endpoints)}, keys={len(key_manager.get_all_keys())}, current={key_manager.get_current_display()}")
+    except Exception as e:
+        print(f"WebUI 直接热刷新 LLM 接口列表失败: {e}")
+
+
+def normalize_string_list(values: Any) -> list[str]:
+    if isinstance(values, str):
+        values = values.splitlines()
+    if not isinstance(values, list):
+        return []
+    return [str(x).strip() for x in values if str(x).strip()]
+
+
+def merge_string_lists(*items: Any) -> list[str]:
+    """合并多个字符串列表并去重，保持原有顺序。"""
+    result: list[str] = []
+    seen = set()
+    for values in items:
+        for item in normalize_string_list(values):
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+    return result
+
+
+def get_webui_config() -> Dict[str, Any]:
+    cfg = read_json(CONFIG_PATH, {})
+    webui = cfg.get("WebUI") or cfg.get("webui") or {}
+    return {
+        "enabled": bool(webui.get("enabled", True)),
+        "host": str(webui.get("host", "127.0.0.1")),
+        "port": int(webui.get("port", 8765)),
+        "access_token": str(webui.get("access_token", "")),
+    }
+
+
+def _apply_webui_runtime_update(old_cfg: Dict[str, Any], new_cfg: Dict[str, Any]):
+    """在保存 WebUI 自身配置后，尽量原地热更新 WebUI 服务。"""
+    old_cfg = dict(old_cfg or {})
+    new_cfg = dict(new_cfg or {})
+
+    if old_cfg == new_cfg:
+        return
+
+    def _worker():
+        global _server
+        try:
+            # 避免在当前 HTTP 请求尚未返回时立即关闭正在处理请求的 server。
+            time.sleep(0.25)
+            with _webui_reconfigure_lock:
+                if not new_cfg.get("enabled", True):
+                    print("🌐 WebUI 配置已变更：已禁用，正在关闭 WebUI 服务。")
+                    stop_webui()
+                    return
+
+                current_server = _server
+                current_changed = (
+                    current_server is None
+                    or str(old_cfg.get("host", "127.0.0.1")) != str(new_cfg.get("host", "127.0.0.1"))
+                    or int(old_cfg.get("port", 8765)) != int(new_cfg.get("port", 8765))
+                )
+
+                if current_changed:
+                    print(
+                        "🌐 WebUI 配置已变更，正在热更新监听："
+                        f"{old_cfg.get('host', '127.0.0.1')}:{old_cfg.get('port', 8765)} -> "
+                        f"{new_cfg.get('host', '127.0.0.1')}:{new_cfg.get('port', 8765)}"
+                    )
+                    stop_webui()
+                    start_webui(
+                        host=str(new_cfg.get("host", "127.0.0.1")),
+                        port=int(new_cfg.get("port", 8765)),
+                        on_config_saved=_config_saved_callback,
+                    )
+                else:
+                    print("🌐 WebUI 配置已热更新：访问参数已立即生效。")
+        except Exception as e:
+            print(f"WebUI 自身热更新失败: {e}")
+
+    threading.Thread(target=_worker, name="XcBot-WebUI-HotUpdate", daemon=True).start()
+
+
+def set_connection_status(state: str, text: str = "", detail: str = "") -> None:
+    """供 main.py 更新 OneBot / Hyper 连接状态，WebUI 通过 /api/ui-state 异步展示。"""
+    global _connection_status
+    state = str(state or "unknown").strip() or "unknown"
+    default_text = {
+        "starting": "正在启动",
+        "connecting": "连接中",
+        "connected": "已连接",
+        "disconnected": "已断开",
+        "failed": "连接失败",
+        "stopped": "已停止",
+        "unknown": "未知状态",
+    }.get(state, state)
+    _connection_status = {
+        "state": state,
+        "text": str(text or default_text),
+        "detail": str(detail or ""),
+        "updated_at": int(time.time()),
+    }
+
+
+def collect_config_bundle() -> Dict[str, Any]:
+    cfg = read_json(CONFIG_PATH, {})
+    split_reply_quote = cfg.get("split_reply_quote", {"default_enabled": True, "groups": {}})
+    if not isinstance(split_reply_quote, dict):
+        split_reply_quote = {"default_enabled": True, "groups": {}}
+    features = dict(DEFAULT_FEATURE_SWITCHES)
+    raw_features = cfg.get("FeatureSwitches", {})
+    if isinstance(raw_features, dict):
+        for key in list(features.keys()):
+            if key in raw_features:
+                features[key] = bool(raw_features.get(key))
+    owner_users = normalize_string_list(cfg.get("owner", []))
+    root_users = normalize_string_list(deep_get(cfg, "Others.ROOT_User", []))
+    # WebUI 中“管理用户”是唯一入口；如果历史配置里 owner / ROOT_User 不一致，优先保留 owner，
+    # 同时合并 ROOT_User，避免旧字段把刚保存的页面值覆盖成空或旧值。
+    manage_users = merge_string_lists(owner_users, root_users)
+    super_users = manage_users[:]
+    blacklist_file = normalize_string_list(cfg.get("black_list", []))
+    return {
+        "config_json": cfg,
+        "feature_switches": features,
+        "feature_meta": FEATURE_META,
+        "ui_schema": build_ui_schema(cfg),
+        "super_users": super_users,
+        "manage_users": manage_users,
+        "blacklist_file": blacklist_file,
+        "split_reply_quote": split_reply_quote,
+        "paths": {
+            "config_json": str(CONFIG_PATH),
+            "runtime_log": str(LOG_FILE),
+        },
+    }
+
+
+def save_config_bundle(data: Dict[str, Any]):
+    old_webui_cfg = get_webui_config()
+    cfg = data.get("config_json", read_json(CONFIG_PATH, {}))
+    if not isinstance(cfg, dict):
+        cfg = read_json(CONFIG_PATH, {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+
+    feature_switches = dict(DEFAULT_FEATURE_SWITCHES)
+    raw = cfg.get("FeatureSwitches", {})
+    if isinstance(raw, dict):
+        for key in list(feature_switches.keys()):
+            if key in raw:
+                feature_switches[key] = bool(raw.get(key))
+    if "feature_switches" in data and isinstance(data["feature_switches"], dict):
+        for key in list(feature_switches.keys()):
+            if key in data["feature_switches"]:
+                feature_switches[key] = bool(data["feature_switches"][key])
+    cfg["FeatureSwitches"] = {
+        **({"_comment": raw.get("_comment", "功能热开关")} if isinstance(raw, dict) else {"_comment": "功能热开关"}),
+        **feature_switches,
+    }
+
+    if "manage_users" in data:
+        manage_users = normalize_string_list(data.get("manage_users", []))
+        cfg["owner"] = manage_users
+        others = cfg.setdefault("Others", {})
+        if not isinstance(others, dict):
+            others = {}
+            cfg["Others"] = others
+        others["ROOT_User"] = manage_users
+
+    if "blacklist_file" in data:
+        cfg["black_list"] = normalize_string_list(data.get("blacklist_file", []))
+
+    if "split_reply_quote" in data and isinstance(data["split_reply_quote"], dict):
+        cfg["split_reply_quote"] = data["split_reply_quote"]
+
+    data["config_json"] = cfg
+    write_json(CONFIG_PATH, cfg)
+    cleanup_legacy_config_files()
+    force_apply_llm_endpoints_from_config(cfg)
+    _apply_webui_runtime_update(old_webui_cfg, get_webui_config())
+    if callable(_config_saved_callback):
+        _config_saved_callback()
+
+
+def deep_get(data: Dict[str, Any], path: str, default=None):
+    cur = data
+    for key in path.split("."):
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def deep_set(data: Dict[str, Any], path: str, value):
+    cur = data
+    parts = path.split(".")
+    for key in parts[:-1]:
+        if not isinstance(cur.get(key), dict):
+            cur[key] = {}
+        cur = cur[key]
+    cur[parts[-1]] = value
+
+
+def field(path: str, label: str, typ="text", desc="", default=None, options=None, category="基础") -> Dict[str, Any]:
+    return {"path": path, "label": label, "type": typ, "desc": desc, "default": default, "options": options or [], "category": category}
+
+
+def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
+    return [
+        {"key": "welcome", "title": "欢迎", "icon": "🏠", "desc": "", "fields": []},
+        {"key": "bot", "title": "机器人", "icon": "🤖", "desc": "机器人名称、触发词和命令前缀", "fields": [
+            field("Others.bot_name", "中文名", "text"),
+            field("Others.bot_name_en", "英文名", "text"),
+            field("Others.reminder", "命令前缀", "text", "例如 /帮助 中的 /"),
+            field("Others.robot_name_triggers", "触发词", "list", "一行一个，群里提到会触发回复"),
+        ]},
+        {"key": "ai", "title": "AI 配置", "icon": "✨", "desc": "对话接口、超时和大模型接口", "fields": [
+            field("Others.api_request_timeout_seconds", "API 超时秒数", "number", "大模型请求超时时间"),
+            field("Others.context_max_messages", "上下文最大消息数", "number"),
+            field("Others.api_failure_cooldown_seconds", "失败冷却秒数", "number", "单个 API / Key 调用失败后，冷却多久再重试", 5),
+            field("Others.api_default_index", "默认 API 编号", "number", "填写聚合后的 API 编号（从 1 开始），留空则按默认模型或首个可用接口"),
+            field("Others.api_default_model", "默认模型", "text", "填写后优先锁定到该模型；留空则按默认 API 编号或首个可用接口"),
+            field("Others.llm_endpoints", "LLM 接口列表", "endpoints", "配置多个 OpenAI 兼容接口，并为每个接口设置是否支持多模态"),
+            field("Others.llm_split.enabled", "启用 LLM 分段回复", "bool", "仅对大模型生成结果生效"),
+            field("Others.llm_split.mode", "LLM 分段模式", "select", "auto_prompt=大模型自主分段；regex=按正则切分模型输出", "auto_prompt", ["auto_prompt", "regex"]),
+            field("Others.llm_split.prompt_suffix", "自主分段提示词", "textarea", "模式一使用。会自动追加到每次 LLM 用户消息后。建议保留 <split> 分隔符说明"),
+            field("Others.llm_split.split_regex", "分段正则表达式", "textarea", "模式二使用。用于识别分段点。建议：.*?[。？！~]+|.+$"),
+            field("Others.llm_split.filter_regex", "内容过滤正则表达式", "textarea", "模式二使用。对每段文本做清理，例如移除换行：\\n|\\r"),
+            field("Others.llm_split.max_chars_no_split", "超过多少字不分段", "number", "最终要发送的整条内容超过[ ]字时，忽略 <split>/正则分段，改为单条发送；填 0 表示不限制", 0),
+        ]},
+        {"key": "persona", "title": "人格设定", "icon": "💗", "desc": "编辑人设", "fields": [
+            field("Others.personality_prompt", "编辑人设", "textarea", "可使用 {bot_name} 与 {user_name} 占位符"),
+            field("Others.sensitive_words", "屏蔽词列表", "list", "一行一个，格式：原词=替换词；若只写原词则替换为空。例如：prompt=人格"),
+        ]},
+        {"key": "features", "title": "功能配置", "icon": "🧩", "desc": "配置功能", "fields": [
+            field("Others.emoji_plus_one_cooldown_seconds", "表情 +1 冷却秒数", "number", "单个表情自动复读的防抖时间"),
+            field("Others.weak_blacklist_trigger_probability", "弱黑名单回复概率", "number", "0 到 1 之间，越小越容易拦截"),
+            field("Others.weak_blacklist_users", "弱黑名单用户", "list", "一行一个 QQ 号"),
+            field("Others.poke_cooldown_seconds", "拍一拍冷却秒数", "number", "拍一拍自动回复的防抖时间"),
+            field("Others.summary_per_day_limit", "每日总结次数", "number", "每个群每天允许总结的次数"),
+            field("Others.summary_max_messages", "每次最多总结消息数", "number", "单次群聊总结最多读取多少条消息"),
+            field("Others.compression_threshold", "压缩触发阈值", "number", "消息达到多少条后允许触发压缩"),
+            field("Others.compression_keep_recent", "压缩保留最近消息", "number", "压缩时保留最近多少条原始消息"),
+            field("Others.auto_compress_after_messages", "自动压缩消息数", "number", "消息累计到多少条时自动尝试压缩"),
+        ]},
+        {"key": "security", "title": "权限/名单", "icon": "🛡️", "desc": "设置管理用户和黑名单", "fields": [
+            field("manage_users", "管理用户", "list", "唯一高权限入口，一行一个 "),
+            field("black_list", "配置黑名单", "list", "用户号或群号，一行一个"),
+        ]},
+        {"key": "connection", "title": "连接", "icon": "🔌", "desc": "OneBot / Hyper 连接参数", "fields": [
+            field("Connection.mode", "连接模式", "select", options=["FWS"]),
+            field("Connection.host", "连接地址", "text"),
+            field("Connection.port", "连接端口", "number"),
+            field("Connection.listener_host", "监听地址", "text"),
+            field("Connection.listener_port", "监听端口", "number"),
+            field("Connection.retries", "重试次数", "number"),
+            field("protocol", "协议", "select", options=["OneBot", "Satori"]),
+            field("Log_level", "日志等级", "select", options=["DEBUG", "INFO", "WARNING", "ERROR"]),
+        ]},
+        {"key": "webui", "title": "WebUI", "icon": "🌐", "desc": "Web 管理界面自身参数", "fields": [
+            field("WebUI.enabled", "启用 WebUI", "bool"),
+            field("WebUI.host", "监听地址", "text"),
+            field("WebUI.port", "监听端口", "number"),
+            field("WebUI.access_token", "访问 Token", "password", "暴露到公网时请务必设置"),
+        ]},
+        {"key": "logs", "title": "实时日志", "icon": "📜", "desc": "查看完整运行日志", "fields": []},
+    ]
+
+
+def get_ui_value(bundle: Dict[str, Any], path: str, default=None):
+    if path == "manage_users":
+        return bundle.get("manage_users", [])
+    if path == "black_list":
+        return bundle.get("blacklist_file", deep_get(bundle.get("config_json", {}), path, default) or [])
+    if path.startswith("split_reply_quote."):
+        split_cfg = bundle.get("split_reply_quote") or {}
+        return deep_get(split_cfg, path.split(".", 1)[1], default)
+    return deep_get(bundle.get("config_json", {}), path, default)
+
+
+def set_ui_value(payload: Dict[str, Any], path: str, value):
+    if path == "manage_users":
+        payload["manage_users"] = value
+        payload["super_users"] = value
+        return
+    if path == "black_list":
+        payload["blacklist_file"] = value
+        deep_set(payload.setdefault("config_json", {}), path, value)
+        return
+    if path.startswith("split_reply_quote."):
+        split_cfg = payload.get("split_reply_quote")
+        if not isinstance(split_cfg, dict):
+            split_cfg = {"default_enabled": True, "groups": {}}
+            payload["split_reply_quote"] = split_cfg
+        deep_set(split_cfg, path.split(".", 1)[1], value)
+        return
+    deep_set(payload.setdefault("config_json", {}), path, value)
+
+
+def collect_ui_state() -> Dict[str, Any]:
+    bundle = collect_config_bundle()
+    values = {}
+    for section in bundle["ui_schema"]:
+        for item in section.get("fields", []):
+            values[item["path"]] = get_ui_value(bundle, item["path"], item.get("default"))
+    return {**bundle, "form_values": values, "status": get_status(), "logs": get_recent_logs(300)}
+
+
+def save_ui_state(data: Dict[str, Any]):
+    cfg = read_json(CONFIG_PATH, {})
+    payload = {
+        "config_json": cfg,
+        "split_reply_quote": cfg.get("split_reply_quote", {"default_enabled": True, "groups": {}}),
+    }
+    values = data.get("form_values", {}) if isinstance(data, dict) else {}
+    for path, value in values.items():
+        set_ui_value(payload, path, value)
+    if isinstance(values, dict) and "manage_users" in values:
+        payload["manage_users"] = values.get("manage_users") or []
+        payload["super_users"] = values.get("manage_users") or []
+    if isinstance(values, dict) and "black_list" in values:
+        payload["blacklist_file"] = values.get("black_list") or []
+    if isinstance(data, dict):
+        for key in ("feature_switches", "super_users", "manage_users", "blacklist_file", "split_reply_quote"):
+            if key in data:
+                if key in {"super_users", "manage_users"} and isinstance(values, dict) and "manage_users" in values:
+                    continue
+                if key == "blacklist_file" and isinstance(values, dict) and "black_list" in values:
+                    continue
+                payload[key] = data[key]
+    payload["manage_users"] = normalize_string_list(payload.get("manage_users", []))
+    payload["blacklist_file"] = normalize_string_list(payload.get("blacklist_file", []))
+    save_config_bundle(payload)
+
+
+def get_recent_logs(limit: int = 300) -> list[Dict[str, str]]:
+    with _log_lock:
+        logs = list(_log_buffer)[-limit:]
+    if logs:
+        return logs
+    if LOG_FILE.exists():
+        lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+        return [{"time": "", "stream": "file", "message": line} for line in lines]
+    return []
+
+
+def get_status() -> Dict[str, Any]:
+    cfg = read_json(CONFIG_PATH, {})
+    connection_cfg = cfg.get("Connection", {}) if isinstance(cfg.get("Connection", {}), dict) else {}
+    return {
+        "project": (cfg.get("Others") or {}).get("project_name", "XcBot"),
+        "version": (cfg.get("Others") or {}).get("version_name", ""),
+        "bot_name": (cfg.get("Others") or {}).get("bot_name", ""),
+        "pid": os.getpid(),
+        "cwd": os.getcwd(),
+        "python": sys.executable,
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "argv": sys.argv,
+        "uptime_seconds": int(time.time() - _started_at),
+        "webui": get_webui_config(),
+        "connection": {
+            "protocol": cfg.get("protocol", "OneBot"),
+            "mode": connection_cfg.get("mode", ""),
+            "host": connection_cfg.get("host", ""),
+            "port": connection_cfg.get("port", ""),
+            "listener_host": connection_cfg.get("listener_host", ""),
+            "listener_port": connection_cfg.get("listener_port", ""),
+        },
+        "connection_status": dict(_connection_status),
+        "feature_switches": collect_config_bundle().get("feature_switches", {}),
+    }
+
+
+def _json_response(handler: BaseHTTPRequestHandler, data: Any, status: int = 200):
+    body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _text_response(handler: BaseHTTPRequestHandler, text: str, content_type="text/html; charset=utf-8", status: int = 200):
+    body = text.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _binary_response(handler: BaseHTTPRequestHandler, body: bytes, content_type="application/octet-stream", status: int = 200):
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "public, max-age=3600")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+class WebUIHandler(BaseHTTPRequestHandler):
+    server_version = "XcBotWebUI/1.0"
+
+    def log_message(self, fmt, *args):
+        try:
+            message = fmt % args
+        except Exception:
+            message = str(fmt)
+
+        # 忽略前端自动轮询产生的高频访问日志，避免刷屏
+        if 'GET /api/ui-state HTTP/1.1' in message:
+            return
+
+        _append_log("WebUI " + message, "webui")
+
+    def _auth_ok(self) -> bool:
+        token = get_webui_config().get("access_token", "")
+        if not token:
+            return True
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        header_token = self.headers.get("X-WebUI-Token", "")
+        return header_token == token or (qs.get("token") or [""])[0] == token
+
+    def _read_body_json(self) -> Tuple[Optional[Any], Optional[str]]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+            return json.loads(raw), None
+        except Exception as e:
+            return None, str(e)
+
+    def _guard(self) -> bool:
+        if self.path.startswith("/api/") and not self._auth_ok():
+            _json_response(self, {"ok": False, "error": "未授权：请在请求头 X-WebUI-Token 或 URL token 参数中提供 access_token"}, 401)
+            return False
+        return True
+
+    def do_GET(self):
+        if not self._guard():
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        try:
+            if parsed.path in ("/", "/index.html"):
+                _text_response(self, INDEX_HTML)
+            elif parsed.path in ("/assets/icon.jpg", "/favicon.ico"):
+                if BOT_ICON_PATH.exists():
+                    _binary_response(self, BOT_ICON_PATH.read_bytes(), "image/jpeg")
+                else:
+                    _json_response(self, {"ok": False, "error": "Icon Not Found"}, 404)
+            elif parsed.path == "/api/status":
+                _json_response(self, {"ok": True, "data": get_status()})
+            elif parsed.path == "/api/config":
+                _json_response(self, {"ok": True, "data": collect_config_bundle()})
+            elif parsed.path == "/api/logs":
+                qs = urllib.parse.parse_qs(parsed.query)
+                limit = int((qs.get("limit") or ["300"])[0])
+                _json_response(self, {"ok": True, "data": get_recent_logs(limit)})
+            elif parsed.path == "/api/features":
+                bundle = collect_config_bundle()
+                _json_response(self, {"ok": True, "data": {"feature_switches": bundle.get("feature_switches", {}), "feature_meta": bundle.get("feature_meta", FEATURE_META)}})
+            elif parsed.path == "/api/ui-state":
+                _json_response(self, {"ok": True, "data": collect_ui_state()})
+            elif parsed.path == "/api/raw-log":
+                text = LOG_FILE.read_text(encoding="utf-8", errors="replace") if LOG_FILE.exists() else ""
+                _text_response(self, text, "text/plain; charset=utf-8")
+            else:
+                _json_response(self, {"ok": False, "error": "Not Found"}, 404)
+        except Exception as e:
+            _json_response(self, {"ok": False, "error": str(e), "traceback": traceback.format_exc()}, 500)
+
+    def do_POST(self):
+        if not self._guard():
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        data, err = self._read_body_json()
+        if err:
+            _json_response(self, {"ok": False, "error": "JSON 解析失败: " + err}, 400)
+            return
+        try:
+            if parsed.path == "/api/config":
+                save_config_bundle(data or {})
+                _json_response(self, {"ok": True, "message": "配置已保存并已尝试热应用。", "data": collect_config_bundle()})
+            elif parsed.path == "/api/features":
+                payload = data or {}
+                feature_switches = payload.get("feature_switches", payload)
+                cfg = read_json(CONFIG_PATH, {})
+                raw = cfg.get("FeatureSwitches", {})
+                merged = dict(DEFAULT_FEATURE_SWITCHES)
+                if isinstance(raw, dict):
+                    for key in merged.keys():
+                        if key in raw:
+                            merged[key] = bool(raw.get(key))
+                if isinstance(feature_switches, dict):
+                    for key in merged.keys():
+                        if key in feature_switches:
+                            merged[key] = bool(feature_switches[key])
+                cfg["FeatureSwitches"] = {"_comment": raw.get("_comment", "功能热开关") if isinstance(raw, dict) else "功能热开关", **merged}
+                write_json(CONFIG_PATH, cfg)
+                if callable(_config_saved_callback):
+                    _config_saved_callback()
+                _json_response(self, {"ok": True, "message": "功能开关已保存并热应用。", "data": {"feature_switches": merged, "feature_meta": FEATURE_META}})
+            elif parsed.path == "/api/validate-config":
+                # 请求能被解析为 JSON 即视为通过；这里额外校验关键字段类型。
+                cfg = (data or {}).get("config_json", data or {})
+                if not isinstance(cfg, dict):
+                    raise ValueError("config_json 必须是对象")
+                if "Connection" in cfg and not isinstance(cfg["Connection"], dict):
+                    raise ValueError("Connection 必须是对象")
+                if "Others" in cfg and not isinstance(cfg["Others"], dict):
+                    raise ValueError("Others 必须是对象")
+                _json_response(self, {"ok": True, "message": "校验通过"})
+            elif parsed.path == "/api/ui-state":
+                save_ui_state(data or {})
+                _json_response(self, {"ok": True, "message": "设置已保存并已尝试热应用。", "data": collect_ui_state()})
+            else:
+                _json_response(self, {"ok": False, "error": "Not Found"}, 404)
+        except Exception as e:
+            _json_response(self, {"ok": False, "error": str(e), "traceback": traceback.format_exc()}, 500)
+
+
+def start_webui(host: Optional[str] = None, port: Optional[int] = None, on_config_saved=None) -> Optional[ThreadingHTTPServer]:
+    """启动 WebUI 后台线程。重复调用不会启动多个实例。"""
+    global _server, _server_thread, _config_saved_callback
+    cfg = get_webui_config()
+    if not cfg.get("enabled", True):
+        print("WebUI 已禁用，如需启用请修改 config.json -> WebUI.enabled")
+        return None
+    if _server is not None:
+        return _server
+
+    _config_saved_callback = on_config_saved
+    cleanup_legacy_config_files()
+    install_log_capture()
+    host = host or cfg["host"]
+    port = int(port or cfg["port"])
+    _server = ThreadingHTTPServer((host, port), WebUIHandler)
+    _server_thread = threading.Thread(target=_server.serve_forever, name="XcBot-WebUI", daemon=True)
+    _server_thread.start()
+    token = cfg.get("access_token", "")
+    url = f"http://{host}:{port}/" + (f"?token={urllib.parse.quote(token)}" if token else "")
+    print(f"🌐 WebUI 已启动: {url}")
+    print("✅ WebUI 保存配置后将尝试热应用开关与大部分运行参数。")
+    return _server
+
+
+def stop_webui():
+    global _server, _server_thread
+    server = _server
+    thread = _server_thread
+    _server = None
+    _server_thread = None
+
+    if server:
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+        try:
+            server.server_close()
+        except Exception:
+            pass
+
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        try:
+            thread.join(timeout=2)
+        except Exception:
+            pass
+
+
+atexit.register(stop_webui)
+
+
+INDEX_HTML = r'''<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>XcBot WebUI</title><link rel="icon" href="/assets/icon.jpg">
+  <style>
+    :root{--bg0:#06151b;--bg1:#0b2b26;--bg2:#12384a;--bg3:#071017;--glass:rgba(255,255,255,.105);--glass2:rgba(255,255,255,.072);--glass3:rgba(255,255,255,.045);--text:#f2fbff;--muted:rgba(224,242,254,.68);--muted2:rgba(224,242,254,.46);--line:rgba(255,255,255,.14);--line2:rgba(255,255,255,.08);--accent:#38d5ff;--accent2:#7cf7c8;--accent3:#a78bfa;--ok:#42e6a4;--bad:#fb7185;--shadow:0 24px 90px rgba(0,0,0,.42);--shadow2:0 12px 42px rgba(56,213,255,.14);--blur:24px;--radius:26px}
+    html[data-theme="light"]{--bg0:#f4f8fb;--bg1:#eef7f3;--bg2:#edf6ff;--bg3:#f8fbff;--glass:rgba(255,255,255,.78);--glass2:rgba(255,255,255,.64);--glass3:rgba(255,255,255,.48);--text:#142334;--muted:rgba(44,62,80,.68);--muted2:rgba(44,62,80,.48);--line:rgba(148,163,184,.24);--line2:rgba(148,163,184,.16);--accent:#3b82f6;--accent2:#34d399;--accent3:#8b5cf6;--ok:#059669;--bad:#e11d48;--shadow:0 24px 72px rgba(148,163,184,.18);--shadow2:0 14px 36px rgba(59,130,246,.14)}
+    *{box-sizing:border-box}html{min-height:100%;background:var(--bg0)}body{margin:0;min-height:100vh;color:var(--text);font-family:Inter,Segoe UI,Microsoft YaHei,Arial,sans-serif;overflow-x:hidden;background:radial-gradient(circle at 13% 9%,rgba(124,247,200,.24),transparent 27%),radial-gradient(circle at 72% 14%,rgba(56,213,255,.18),transparent 28%),radial-gradient(circle at 84% 78%,rgba(167,139,250,.16),transparent 30%),linear-gradient(145deg,var(--bg0),var(--bg1) 42%,var(--bg2) 74%,var(--bg3));background-attachment:fixed}body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.28;background-image:linear-gradient(rgba(255,255,255,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.055) 1px,transparent 1px);background-size:38px 38px}body:after{content:"";position:fixed;inset:14px;pointer-events:none;border:1px solid rgba(255,255,255,.08);border-radius:30px;box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}button,a,input,textarea,select{font:inherit}button,a{color:inherit}.app{display:grid;grid-template-columns:286px 1fr;min-height:100vh;padding:18px;gap:18px;position:relative;z-index:1}.sidebar{position:sticky;top:18px;height:calc(100vh - 36px);padding:18px 14px;border:1px solid var(--line);border-radius:var(--radius);background:linear-gradient(180deg,rgba(255,255,255,.13),rgba(255,255,255,.055));box-shadow:var(--shadow);backdrop-filter:blur(var(--blur)) saturate(145%);-webkit-backdrop-filter:blur(var(--blur)) saturate(145%);overflow:auto}.brand{display:flex;align-items:center;gap:12px;padding:0 10px 18px}.logo{width:44px;height:44px;border-radius:17px;display:grid;place-items:center;background:linear-gradient(135deg,var(--accent),var(--accent3));font-size:22px;box-shadow:0 14px 34px rgba(56,213,255,.25);overflow:hidden}.logo img{width:100%;height:100%;object-fit:cover;display:block}.brand h1{font-size:17px;margin:0;font-weight:900;letter-spacing:.2px}.brand p{margin:3px 0 0;color:var(--muted);font-size:12px}.nav-title{margin:14px 12px 8px;color:var(--muted2);font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}.nav{display:flex;flex-direction:column;gap:8px}.nav button{border:1px solid transparent;background:transparent;text-align:left;border-radius:17px;padding:12px 13px;display:flex;align-items:center;gap:11px;cursor:pointer;color:var(--muted);font-weight:750;transition:.2s ease}.nav button:hover{color:var(--text);background:rgba(255,255,255,.075);border-color:var(--line2);transform:translateX(2px)}.nav button.active{color:var(--text);background:linear-gradient(135deg,rgba(56,213,255,.26),rgba(124,247,200,.11));border-color:rgba(56,213,255,.32);box-shadow:inset 3px 0 0 var(--accent),0 12px 28px rgba(56,213,255,.10)}.main{min-width:0;padding:0;border:1px solid var(--line);border-radius:var(--radius);background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.03));box-shadow:var(--shadow);backdrop-filter:blur(16px) saturate(135%);-webkit-backdrop-filter:blur(16px) saturate(135%);overflow:hidden}.topbar{position:sticky;top:0;z-index:5;display:flex;align-items:center;justify-content:space-between;gap:14px;padding:18px 22px;background:linear-gradient(180deg,rgba(6,21,27,.72),rgba(6,21,27,.34));backdrop-filter:blur(22px) saturate(145%);border-bottom:1px solid var(--line2)}html[data-theme="light"] .topbar{background:linear-gradient(180deg,rgba(255,255,255,.70),rgba(255,255,255,.40))}.title h2{margin:0;font-size:24px;font-weight:950;letter-spacing:.2px}.title p{margin:5px 0 0;color:var(--muted);font-size:13px}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.btn{border:1px solid var(--line);background:linear-gradient(180deg,var(--glass),var(--glass2));border-radius:15px;padding:10px 14px;cursor:pointer;text-decoration:none;color:var(--text);font-weight:800;box-shadow:inset 0 1px 0 rgba(255,255,255,.10);transition:.2s ease}.btn:hover{transform:translateY(-1px);border-color:rgba(56,213,255,.36);box-shadow:var(--shadow2)}.btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent3));border-color:transparent;color:#031018;box-shadow:0 16px 36px rgba(56,213,255,.24)}.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:linear-gradient(180deg,var(--glass),var(--glass3));border-radius:999px;padding:7px 11px;color:var(--muted);font-size:12px;font-weight:800}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:18px;padding:22px}.card{grid-column:span 12;position:relative;background:linear-gradient(145deg,rgba(255,255,255,.12),rgba(255,255,255,.055));border:1px solid var(--line);border-radius:var(--radius);padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.18),inset 0 1px 0 rgba(255,255,255,.12);backdrop-filter:blur(var(--blur)) saturate(150%);-webkit-backdrop-filter:blur(var(--blur)) saturate(150%);overflow:hidden}.card:before{content:"";position:absolute;inset:-1px;border-radius:inherit;pointer-events:none;background:radial-gradient(circle at 18% 0%,rgba(124,247,200,.18),transparent 34%),radial-gradient(circle at 88% 8%,rgba(56,213,255,.16),transparent 35%)}.card>*{position:relative}.half{grid-column:span 6}.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:16px}.section-head h3{margin:0;font-size:18px;font-weight:930}.section-head p{margin:5px 0 0;color:var(--muted);font-size:13px}.form-grid,.feature-grid,.mini-stats{display:grid;gap:15px}.form-grid{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}.feature-grid{grid-template-columns:repeat(auto-fit,minmax(255px,1fr))}.mini-stats{grid-template-columns:repeat(auto-fit,minmax(155px,1fr))}.field,.feature,.stat{border:1px solid var(--line2);background:linear-gradient(180deg,rgba(255,255,255,.075),rgba(255,255,255,.035));border-radius:21px;padding:15px;box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}.feature{transition:.2s ease}.feature:hover{transform:translateY(-2px);border-color:rgba(56,213,255,.26);box-shadow:0 16px 36px rgba(0,0,0,.14)}.label{display:flex;justify-content:space-between;gap:10px;margin-bottom:9px;font-weight:850}.desc{color:var(--muted);font-size:12px;margin-top:9px;line-height:1.5}input,textarea,select{width:100%;border:1px solid var(--line);border-radius:16px;background:rgba(5,12,25,.34);color:var(--text);padding:11px 13px;outline:none;box-shadow:inset 0 1px 0 rgba(255,255,255,.08);transition:.18s ease}html[data-theme="light"] input,html[data-theme="light"] textarea,html[data-theme="light"] select{background:rgba(255,255,255,.55)}input:focus,textarea:focus,select:focus{border-color:rgba(56,213,255,.55);box-shadow:0 0 0 4px rgba(56,213,255,.12),inset 0 1px 0 rgba(255,255,255,.10)}textarea{min-height:132px;resize:vertical;font-family:Consolas,JetBrains Mono,monospace}.json-area{min-height:420px}.switch{position:relative;width:58px;height:32px;flex:0 0 auto;border-radius:999px;background:rgba(100,116,139,.35);border:1px solid var(--line);cursor:pointer;box-shadow:inset 0 1px 3px rgba(0,0,0,.25)}.switch:after{content:"";position:absolute;top:4px;left:4px;width:22px;height:22px;border-radius:50%;background:#dbeafe;transition:.22s cubic-bezier(.2,.8,.2,1);box-shadow:0 5px 14px rgba(0,0,0,.25)}.switch.on{background:linear-gradient(135deg,var(--accent),var(--accent2))}.switch.on:after{left:30px;background:#fff}.feature-foot,.kv{display:grid;gap:9px 12px}.feature-foot{grid-template-columns:1fr auto;align-items:center}.kv{grid-template-columns:150px 1fr;font-size:13px}.kv div:nth-child(odd),.feature p,.stat span{color:var(--muted)}.stat b{display:block;font-size:24px;font-weight:950;background:linear-gradient(135deg,var(--text),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}pre.log{margin:0;white-space:pre-wrap;word-break:break-word;max-height:560px;overflow:auto;font-family:Consolas,JetBrains Mono,monospace;font-size:12px;line-height:1.55;background:rgba(0,0,0,.22);border:1px solid var(--line);border-radius:20px;padding:16px}pre.log.compact{max-height:320px;padding:8px 16px;line-height:1.28}.toast{position:fixed;right:24px;bottom:24px;max-width:440px;border:1px solid var(--line);background:linear-gradient(180deg,var(--glass),var(--glass2));backdrop-filter:blur(22px);border-radius:18px;padding:13px 15px;display:none;box-shadow:var(--shadow);z-index:20}.toast.show{display:block}.ok{color:var(--ok)}.bad{color:var(--bad)}.file-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}@media(max-width:980px){.app{grid-template-columns:1fr;padding:12px}.sidebar{position:relative;top:auto;height:auto}.main{min-height:70vh}.topbar{padding:14px}.half{grid-column:span 12}.kv{grid-template-columns:1fr}.grid{padding:14px}.card{padding:16px}}
+  </style>
+</head>
+<body><div class="app"><aside class="sidebar"><div class="brand"><div class="logo"><img src="/assets/icon.jpg" alt="XcBot"></div><div><h1 id="brandName">XcBot</h1><p>实时 Web 管理台</p></div></div><div class="nav-title">功能列表</div><nav id="nav" class="nav"></nav><div class="nav-title">OneBot / Hyper 连接状态</div><div id="connectionStatus" class="pill">加载中...</div><div id="connectionDetail" class="desc" style="margin:10px 12px 0 12px"></div></aside><main class="main"><div class="topbar"><div class="title"><h2 id="pageTitle">加载中...</h2><p id="pageDesc">正在连接 WebUI</p></div><div class="toolbar"><span id="saveState" class="pill">未加载</span><button class="btn" onclick="refreshAll(true)">立即同步</button><button class="btn" id="themeBtn" onclick="toggleTheme()">🌙 深色</button><button class="btn primary" onclick="saveAll()">保存设置</button></div></div><section id="content" class="grid"></section></main></div><div id="toast" class="toast"></div>
+<script>
+let state={bundle:null,current:localStorage.webuiPage||'welcome',dirty:false,saving:false,lastInputAt:0};
+const featureFieldMap={ai_chat:['Others.llm_split.enabled','Others.llm_split.mode','Others.llm_split.prompt_suffix','Others.llm_split.split_regex','Others.llm_split.filter_regex','Others.llm_split.max_chars_no_split'],emoji_plus_one:['Others.emoji_plus_one_cooldown_seconds'],poke_reply:['Others.poke_cooldown_seconds'],split_reply_quote:[],weak_blacklist:['Others.weak_blacklist_trigger_probability','Others.weak_blacklist_users'],summary:['Others.summary_per_day_limit','Others.summary_max_messages'],compression_commands:['Others.compression_threshold','Others.compression_keep_recent','Others.auto_compress_after_messages'],plugins_external:[]};
+const esc=s=>String(s??'').replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));
+const token=()=>new URLSearchParams(location.search).get('token')||localStorage.webuiToken||'';
+const el=id=>document.getElementById(id);
+const DRAFT_KEY='xcbotWebuiFormDraft';
+function loadDraft(){try{return JSON.parse(localStorage.getItem(DRAFT_KEY)||'null')||null}catch(e){return null}}
+function saveDraft(){try{if(state.bundle?.form_values)localStorage.setItem(DRAFT_KEY,JSON.stringify(state.bundle.form_values))}catch(e){}}
+function clearDraft(){try{localStorage.removeItem(DRAFT_KEY)}catch(e){}}
+function applyDraft(bundle){const draft=loadDraft();if(draft&&bundle?.form_values){bundle.form_values=Object.assign({},bundle.form_values,draft);state.dirty=true;state.lastInputAt=Date.now();const save=el('saveState');if(save)save.textContent='有未保存草稿'}}
+async function api(path,opt={}){opt.headers=Object.assign({'Content-Type':'application/json','X-WebUI-Token':token()},opt.headers||{});const r=await fetch(path,opt),j=await r.json();if(!j.ok)throw new Error(j.error||'请求失败');return j.data??j}
+function toast(msg,ok=true){const t=el('toast'),save=el('saveState');if(t){t.textContent=msg;t.className='toast show '+(ok?'ok':'bad');clearTimeout(t._timer);t._timer=setTimeout(()=>t.classList.remove('show'),2600)}if(save)save.textContent=msg}
+const pages=()=>state.bundle?.ui_schema||[];
+const meta=()=>pages().find(x=>x.key===state.current)||pages()[0]||{title:'WebUI',desc:''};
+function setTheme(t){document.documentElement.dataset.theme=t;localStorage.webuiTheme=t;const btn=el('themeBtn');if(btn)btn.textContent=t==='light'?'☀️ 浅色':'🌙 深色'}
+function toggleTheme(){setTheme((document.documentElement.dataset.theme||'dark')==='dark'?'light':'dark')}
+function gotoPage(k){if(!pages().some(p=>p.key===k))k='welcome';state.current=k;localStorage.webuiPage=k;render()}
+function renderNav(){const nav=el('nav');if(nav)nav.innerHTML=pages().map(p=>`<button class="${p.key===state.current?'active':''}" onclick="gotoPage('${p.key}')"><span>${p.icon||'•'}</span><span>${esc(p.title)}</span></button>`).join('')}
+function renderConnectionStatus(){const s=state.bundle?.status||{},cs=s.connection_status||{},cfg=s.connection||{};const statusEl=el('connectionStatus'),detailEl=el('connectionDetail');if(statusEl){const text=cs.text||'未知状态';statusEl.textContent=text;statusEl.className='pill '+((cs.state==='connected')?'ok':(cs.state==='failed'||cs.state==='disconnected'||cs.state==='stopped')?'bad':'')}if(detailEl){const lines=[];if(cs.detail)lines.push(cs.detail);const endpoint=[cfg.protocol,cfg.host&&cfg.port?`${cfg.host}:${cfg.port}`:''].filter(Boolean).join(' · ');if(endpoint)lines.push(endpoint);detailEl.textContent=lines.join(' | ')||'暂无连接详情'}}
+function render(){if(!state.bundle)return;const logScroll=captureLogScrollState();renderNav();renderConnectionStatus();const m=meta(),titleEl=el('pageTitle'),descEl=el('pageDesc'),brandEl=el('brandName'),contentEl=el('content');if(titleEl)titleEl.textContent=(m.icon?m.icon+' ':'')+m.title;if(descEl){const desc=Object.prototype.hasOwnProperty.call(m,'desc')?m.desc:'所有数值均可在此直接修改并保存';descEl.textContent=desc;descEl.style.display=desc?'':'none'}if(brandEl)brandEl.textContent=state.bundle.status?.project||'XcBot';if(contentEl)contentEl.innerHTML=state.current==='welcome'?renderWelcome():state.current==='features'?renderFeatures():state.current==='logs'?renderLogs():renderForm(m);if(state.current==='welcome'||state.current==='logs')scheduleLogScrollAfterRender(logScroll)}
+function renderWelcome(){const s=state.bundle.status||{},f=s.feature_switches||{},on=Object.values(f).filter(Boolean).length,total=Object.keys(f).length,cs=s.connection_status||{},cc=s.connection||{};return `<div class="card"><div class="section-head"><div><h3>运行概览</h3></div><span class="pill ${cs.state==='connected'?'ok':(cs.state==='failed'||cs.state==='disconnected'||cs.state==='stopped')?'bad':''}">${esc(cs.text||'未知状态')}</span></div><div class="mini-stats"><div class="stat"><b>${esc(s.pid)}</b><span>进程 PID</span></div><div class="stat"><b>${Math.floor((s.uptime_seconds||0)/60)}</b><span>已运行分钟</span></div><div class="stat"><b>${on}/${total}</b><span>已启用功能</span></div><div class="stat"><b>${esc(s.webui?.port||'')}</b><span>WebUI 端口</span></div></div></div><div class="card half"><div class="section-head"><div><h3>连接状态</h3><p>OneBot / Hyper 实时状态</p></div></div><div class="kv">${[['当前状态',cs.text||'未知状态'],['状态详情',cs.detail||'暂无'],['协议',cc.protocol||''],['连接地址',(cc.host&&cc.port)?`${cc.host}:${cc.port}`:''],['监听地址',(cc.listener_host&&cc.listener_port)?`${cc.listener_host}:${cc.listener_port}`:''],['连接模式',cc.mode||'']].map(r=>`<div>${esc(r[0])}</div><div>${esc(r[1])}</div>`).join('')}</div></div><div class="card half"><div class="section-head"><div><h3>详细信息</h3><p>环境与启动参数</p></div></div><div class="kv">${[['版本号',(s.project||'')+' '+(s.version||'')],['机器人名',s.bot_name],['运行目录',s.cwd],['Python',s.python],['平台',s.platform],['启动参数',JSON.stringify(s.argv||[])]].map(r=>`<div>${esc(r[0])}</div><div>${esc(r[1])}</div>`).join('')}</div></div><div class="card"><div class="section-head"><div><h3>最近日志</h3></div><div style="display:flex;gap:8px;flex-wrap:wrap">${renderAutoScrollToggle()}<button class="btn" onclick="gotoPage('logs')">查看全部</button></div></div>${renderLogPre(160,'recent')}</div>`}
+function renderForm(m){const v=state.bundle.form_values||{};return `<div class="card"><div class="section-head"><div><h3>${esc(m.title)}</h3><p>${esc(m.desc)}</p></div></div><div class="form-grid">${(m.fields||[]).map(f=>renderField(f,v[f.path])).join('')}</div></div>`}
+function renderField(f,v,compact=false){const id='f_'+f.path.replace(/[^a-zA-Z0-9]/g,'_');let input='';if(f.type==='bool')input=`<div class="switch ${v?'on':''}" onclick="setBool('${f.path}',this)"></div>`;else if(f.type==='select')input=`<select id="${id}" onchange="setValue('${f.path}',this.value)">${(f.options||[]).map(o=>`<option value="${esc(o)}" ${String(o)===String(v)?'selected':''}>${esc(o)}</option>`).join('')}</select>`;else if(f.type==='list')input=`<textarea ${compact?'style="min-height:84px"':''} id="${id}" oninput="setValue('${f.path}',this.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean))">${esc(Array.isArray(v)?v.join('\n'):(v??''))}</textarea>`;else if(f.type==='textarea')input=`<textarea ${compact?'style="min-height:84px"':'style="min-height:280px"'} id="${id}" oninput="setValue('${f.path}',this.value)">${esc(v??'')}</textarea>`;else if(f.type==='endpoints')input=renderEndpointsEditor(v||[]);else input=`<input id="${id}" type="${f.type==='password'?'password':f.type==='number'?'number':'text'}" step="any" value="${esc(v??'')}" oninput="setValue('${f.path}',${f.type==='number'?'num(this.value)':'this.value'})">`;return `<div class="field"><div class="label"><span>${esc(f.label)}</span>${f.type==='bool'?input:''}</div>${f.type==='bool'?'':input}<div class="desc">${esc(f.desc||f.path)}</div></div>`}
+const num=v=>{const n=Number(v);return Number.isFinite(n)?n:v};
+function setValue(path,value){state.bundle.form_values[path]=value;if(path==='manage_users'){state.bundle.manage_users=Array.isArray(value)?value:[];state.bundle.super_users=Array.isArray(value)?value:[]}if(path==='black_list'){state.bundle.blacklist_file=Array.isArray(value)?value:[]}state.dirty=true;state.lastInputAt=Date.now();saveDraft();const save=el('saveState');if(save)save.textContent='有未保存更改'}
+function syncCurrentPageFieldsFromDom(){if(!state.bundle)return;const page=meta();const values=state.bundle.form_values||{};(page.fields||[]).forEach(f=>{const id='f_'+f.path.replace(/[^a-zA-Z0-9]/g,'_');if(f.type==='bool'){return}if(f.type==='endpoints'){const arr=Array.isArray(values[f.path])?[...values[f.path]]:[];values[f.path]=arr.map((ep,i)=>{const base=document.getElementById('ep_base_'+i),model=document.getElementById('ep_model_'+i),keys=document.getElementById('ep_keys_'+i),mm=document.getElementById('ep_mm_'+i);return {base_url:base?base.value:(ep.base_url||''),model:model?model.value:(ep.model||''),supports_multimodal:mm?!!mm.checked:!!ep.supports_multimodal,keys:(keys?keys.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean):(Array.isArray(ep.keys)?ep.keys:[]))}});return}const el=document.getElementById(id);if(!el)return;if(f.type==='list')values[f.path]=el.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);else if(f.type==='textarea'||f.type==='text'||f.type==='password'||f.type==='select')values[f.path]=el.value;else if(f.type==='number')values[f.path]=num(el.value)});state.bundle.form_values=values;const manageUsers=values.manage_users;if(Array.isArray(manageUsers)){state.bundle.manage_users=manageUsers;state.bundle.super_users=manageUsers}const blackList=values.black_list;if(Array.isArray(blackList)){state.bundle.blacklist_file=blackList}}
+function setJsonValue(path,txt){try{setValue(path,JSON.parse(txt||'null'))}catch(e){state.dirty=true;const save=el('saveState');if(save)save.textContent='JSON 暂未通过校验'}}
+function setBool(path,el){const v=!el.classList.contains('on');el.classList.toggle('on',v);setValue(path,v)}
+function shouldAutoRefreshPage(){return state.current==='welcome'||state.current==='logs'}
+function renderFeatures(){const map=state.bundle.feature_switches||{},groups={};const fields=(state.bundle.ui_schema.find(x=>x.key==='features')||{}).fields||[];const fieldMap=Object.fromEntries(fields.map(f=>[f.path,f]));(state.bundle.feature_meta||[]).forEach(x=>(groups[x.group]||(groups[x.group]=[])).push(x));return Object.keys(groups).map(g=>`<div class="card"><div class="section-head"><div><h3>${esc(g)}</h3><p>功能配置</p></div><span class="pill">${groups[g].length} 项</span></div><div class="feature-grid">${groups[g].map(it=>{const rel=(featureFieldMap[it.key]||[]).map(p=>fieldMap[p]).filter(Boolean);return `<div class="feature"><h4>${esc(it.title)}</h4><p>${esc(it.desc)}</p><div class="feature-foot"><span class="pill">${esc(it.key)}</span><div class="switch ${map[it.key]?'on':''}" onclick="toggleFeature('${it.key}',this)"></div></div>${rel.length?`<div style="margin-top:12px;display:grid;gap:10px">${rel.map(f=>renderField(f,state.bundle.form_values[f.path],true)).join('')}</div>`:''}</div>`}).join('')}</div></div>`).join('')}
+async function toggleFeature(key,el){state.bundle.feature_switches[key]=!state.bundle.feature_switches[key];el.classList.toggle('on',state.bundle.feature_switches[key]);await saveAll(true)}
+function renderLogs(){return `<div class="card"><div class="section-head"><div><h3>实时日志</h3><p>自动异步刷新，可选择是否自动滚动到底部</p></div><div style="display:flex;gap:8px;flex-wrap:wrap">${renderAutoScrollToggle()}<a class="btn" href="/api/raw-log${token()?('?token='+encodeURIComponent(token())):''}" target="_blank">打开完整日志</a></div></div>${renderLogPre(500,'full')}</div>`}
+function renderLogPre(limit,name='main'){const logs=(state.bundle.logs||[]).slice(-limit);return `<pre id="log_${name}" class="log ${name==='recent'?'compact':''}">${esc(logs.map(x=>`[${x.time}] [${x.stream}] ${x.message}`).join('\n')||'暂无日志')}</pre>`}
+function renderAutoScrollToggle(){const on=localStorage.webuiAutoScroll!=='false';return `<button class="btn" type="button" onclick="toggleAutoScroll()">${on?'✅':'⬜'} 自动滚动</button>`}
+function toggleAutoScroll(){const on=!(localStorage.webuiAutoScroll!=='false');localStorage.webuiAutoScroll=String(on);render()}
+function captureLogScrollState(){const state={};document.querySelectorAll('pre.log').forEach(x=>{const remain=x.scrollHeight-x.scrollTop-x.clientHeight;state[x.id||'log']={top:x.scrollTop,height:x.scrollHeight,client:x.clientHeight,atBottom:remain<24}});return state}
+function restoreLogScrollState(prev={}){const logs=document.querySelectorAll('pre.log');logs.forEach(x=>{const old=prev[x.id||'log'];if(!old||old.atBottom){x.scrollTop=x.scrollHeight;x.scrollTo?.(0,x.scrollHeight)}else{x.scrollTop=Math.min(old.top,x.scrollHeight);x.scrollTo?.(0,Math.min(old.top,x.scrollHeight))}})}
+function scheduleLogScrollAfterRender(prev){requestAnimationFrame(()=>{if(localStorage.webuiAutoScroll==='false'){restoreLogScrollState(prev);setTimeout(()=>restoreLogScrollState(prev),80);return}scrollLogsToBottom();setTimeout(scrollLogsToBottom,80);setTimeout(scrollLogsToBottom,260)})}
+function scheduleLogAutoScroll(){scheduleLogScrollAfterRender(captureLogScrollState())}
+function scrollLogsToBottom(){if(localStorage.webuiAutoScroll==='false')return;const logs=document.querySelectorAll('pre.log');logs.forEach(x=>{x.scrollTop=x.scrollHeight;x.scrollTo?.(0,x.scrollHeight)});if(state.current==='logs'){const full=el('log_full');if(full){full.scrollTop=full.scrollHeight;full.scrollTo?.(0,full.scrollHeight)}const main=document.querySelector('.main');if(main){main.scrollTop=main.scrollHeight;main.scrollTo?.(0,main.scrollHeight)}window.scrollTo(0,Math.max(document.documentElement.scrollHeight,document.body.scrollHeight))}}
+function scrollRecentLogsToBottom(){scrollLogsToBottom()}
+function renderEndpointsEditor(list){const rows=(Array.isArray(list)?list:[]).map((ep,i)=>`<div class="field" style="padding:12px"><div class="label"><span>接口 #${i+1}</span><button class="btn" type="button" onclick="removeEndpoint(${i})">删除</button></div><input id="ep_base_${i}" placeholder="base_url" value="${esc(ep.base_url||'')}" oninput="updateEndpoint(${i},'base_url',this.value)"><div style="height:8px"></div><input id="ep_model_${i}" placeholder="model" value="${esc(ep.model||'')}" oninput="updateEndpoint(${i},'model',this.value)"><div style="height:8px"></div><label style="display:flex;align-items:center;gap:10px;margin:6px 0 10px 0"><input id="ep_mm_${i}" type="checkbox" ${ep.supports_multimodal?'checked':''} onchange="updateEndpoint(${i},'supports_multimodal',this.checked)"><span>支持多模态</span></label><textarea id="ep_keys_${i}" style="min-height:84px" placeholder="keys，一行一个" oninput="updateEndpoint(${i},'keys',this.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean))">${esc(Array.isArray(ep.keys)?ep.keys.join('\n'):'')}</textarea></div>`).join('');return `<div style="display:grid;gap:10px">${rows||'<div class="desc">暂无接口，点击下方按钮新增</div>'}<button class="btn" type="button" onclick="addEndpoint()">新增大模型接口</button></div>`}
+function updateEndpoint(index,key,value){const arr=Array.isArray(state.bundle.form_values['Others.llm_endpoints'])?[...state.bundle.form_values['Others.llm_endpoints']]:[];arr[index]=Object.assign({base_url:'',model:'',keys:[],supports_multimodal:false},arr[index]||{});arr[index][key]=value;setValue('Others.llm_endpoints',arr)}
+function addEndpoint(){const arr=Array.isArray(state.bundle.form_values['Others.llm_endpoints'])?[...state.bundle.form_values['Others.llm_endpoints']]:[];arr.push({base_url:'',model:'',keys:[],supports_multimodal:false});setValue('Others.llm_endpoints',arr);render()}
+function removeEndpoint(index){const arr=Array.isArray(state.bundle.form_values['Others.llm_endpoints'])?[...state.bundle.form_values['Others.llm_endpoints']]:[];arr.splice(index,1);setValue('Others.llm_endpoints',arr);render()}
+async function saveAll(silent=false){if(!state.bundle||state.saving)return;state.saving=true;const save=el('saveState');if(save)save.textContent='正在保存...';try{syncCurrentPageFieldsFromDom();saveDraft();const manageUsers=state.bundle.form_values?.manage_users??state.bundle.manage_users;const blackList=state.bundle.form_values?.black_list??state.bundle.blacklist_file;const saved=await api('/api/ui-state',{method:'POST',body:JSON.stringify({form_values:state.bundle.form_values||{},feature_switches:state.bundle.feature_switches||{},super_users:manageUsers,manage_users:manageUsers,blacklist_file:blackList,split_reply_quote:state.bundle.split_reply_quote})});clearDraft();state.bundle=saved;state.dirty=false;render();await refreshAll(true);if(!silent)toast('设置已保存并已从 config 重新同步',true)}catch(e){toast(e.message,false)}finally{state.saving=false}}
+function isEditingField(){const el=document.activeElement;return !!(el&&['INPUT','TEXTAREA','SELECT'].includes(el.tagName))}
+function shouldPauseAutoRefresh(){return !!(state.dirty||isEditingField()||(Date.now()-(state.lastInputAt||0)<15000))}
+async function refreshAll(force=false){if(!force&&!shouldAutoRefreshPage())return;if(shouldPauseAutoRefresh()&&!force)return;try{const data=await api('/api/ui-state');if(shouldPauseAutoRefresh()&&!force)return;state.bundle=data;applyDraft(state.bundle);render();const save=el('saveState');if(save&&!state.dirty)save.textContent='已同步 '+new Date().toLocaleTimeString()}catch(e){toast(e.message,false)}}
+setTheme(localStorage.webuiTheme||'dark');refreshAll(true);setInterval(()=>refreshAll(false),3000);setInterval(()=>{if(state.current==='welcome'||state.current==='logs')scrollLogsToBottom()},500);
+</script></body></html>'''
+
+
+if __name__ == "__main__":
+    if "--standalone" not in sys.argv:
+        print("⚠️ webui.py 不再默认独立运行。请通过 main.py 启动，这样主程序与 WebUI 会同时开启、同时关闭。")
+        print("如确实只想单独调试 WebUI，请手动使用：python webui.py --standalone")
+        sys.exit(0)
+
+    start_webui()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        stop_webui()
