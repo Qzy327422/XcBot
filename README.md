@@ -127,3 +127,7 @@ curl -o napcat.sh https://nclatest.znin.net/NapNeko/NapCat-Installer/main/script
 
 1.  `llm_endpoints` 配置是否正确
 2.  API Key 是否有效且有余额
+
+
+
+部分功能灵感来源于jianer
