@@ -29,7 +29,11 @@
     "_comment_protocol": "协议类型，默认 OneBot。",
     "Others": {
         "project_name": "XcBot",
+<<<<<<< HEAD
         "version_name": "v1.2",
+=======
+        "version_name": "1.0",
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
         "slogan": "✨ 忻城 ✨",
         "robot_name_triggers": [
             "忻城"
@@ -43,7 +47,11 @@
         "_comment_poke_reply_enabled": "是否开启拍一拍自动回复。",
         "poke_cooldown_seconds": 8,
         "_comment_poke_cooldown_seconds": "拍一拍回复防抖时间，单位秒。",
+<<<<<<< HEAD
         "api_request_timeout_seconds": 120,
+=======
+        "api_request_timeout_seconds": 60,
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
         "_comment_api_request_timeout_seconds": "LLM/API 请求超时时间，单位秒。",
         "summary_per_day_limit": 2,
         "_comment_summary_per_day_limit": "每个群每天允许总结的次数。",
@@ -55,12 +63,17 @@
         "_comment_compression_threshold": "消息达到多少条后，允许触发上下文压缩。",
         "compression_keep_recent": 20,
         "_comment_compression_keep_recent": "压缩时保留最近多少条消息不压缩。",
+<<<<<<< HEAD
         "auto_compress_after_messages": 44,
+=======
+        "auto_compress_after_messages": 40,
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
         "_comment_auto_compress_after_messages": "自动压缩触发阈值。",
         "weak_blacklist_trigger_probability": 0.3,
         "_comment_weak_blacklist_trigger_probability": "弱黑名单用户被拦截/特殊处理的概率，0 到 1。",
         "weak_blacklist_users": [],
         "_comment_weak_blacklist_users": "弱黑名单用户列表。",
+<<<<<<< HEAD
         "group_random_reply_probability": 0.01,
         "_comment_group_random_reply_probability": "普通群消息下机器人概率触发对话的概率。支持 0~1，也兼容 0~100；填 0 表示关闭。",
         "group_random_reply_quote": true,
@@ -71,6 +84,16 @@
                 "model": "",
                 "supports_multimodal": false,
                 "keys": []
+=======
+        "llm_endpoints": [
+            {
+                "base_url": "https://api.deepseek.com/v1",
+                "model": "deepseek-chat",
+                "supports_multimodal": false,
+                "keys": [
+                    "请输入api key"
+                ]
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
             }
         ],
         "_comment_llm_endpoints": "大模型接口列表。可配置多个 endpoint，每个 endpoint 下也可放多个 key，程序会自动切换/轮换。",
@@ -85,17 +108,26 @@
         "reminder": "/",
         "_comment_reminder": "命令前缀，例如 /帮助、/关于。",
         "api_failure_cooldown_seconds": 5,
+<<<<<<< HEAD
         "api_default_index": 6,
+=======
+        "api_default_index": 1,
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
         "api_default_model": "",
         "personality_prompt": "你是一只猫娘，基于XcBot",
         "llm_split": {
             "enabled": true,
+<<<<<<< HEAD
             "mode": "auto_prompt",
+=======
+            "mode": "regex",
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
             "prompt_suffix": "当你想回复第二句甚至更多句时，用 <split> 分隔符将两句话分开，以此类推，我会依次发送，但要保持多句话连贯。在用户要求（或你想）回复长段时不必遵守。",
             "split_regex": ".*?[。？！~。]+|.+$",
             "filter_regex": "\\n|\\r|<split>",
             "max_chars_no_split": 80
         },
+<<<<<<< HEAD
         "llm_reply_failover_keywords": [
             "抱歉，我不能",
             "sorry",
@@ -113,6 +145,10 @@
             "system：prompt=",
             "json=数据格式",
             "memory=记忆"
+=======
+        "sensitive_words": [
+            "prompt=人格"
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
         ]
     },
     "uin": 0,
@@ -139,5 +175,12 @@
         "weak_blacklist": true,
         "poke_reply": true,
         "plugins_external": true
+<<<<<<< HEAD
+=======
+    },
+    "split_reply_quote": {
+        "default_enabled": true,
+        "groups": {}
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
     }
 }

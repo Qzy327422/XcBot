@@ -14,19 +14,27 @@ import io
 import json
 import os
 import platform
+<<<<<<< HEAD
 import shutil
 import subprocess
 import sys
 import atexit
 import tempfile
+=======
+import sys
+import atexit
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 import threading
 import time
 import traceback
 import urllib.parse
+<<<<<<< HEAD
 import urllib.request
 import urllib.error
 import zipfile
 import re
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,6 +64,7 @@ _capture_stdout = None
 _capture_stderr = None
 _config_saved_callback = None
 _webui_reconfigure_lock = threading.RLock()
+<<<<<<< HEAD
 _update_cache_lock = threading.RLock()
 _update_cache = {"timestamp": 0.0, "data": None}
 _update_install_lock = threading.Lock()
@@ -65,13 +74,18 @@ _update_install_status = {
     "detail": "",
     "updated_at": int(time.time()),
 }
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 _connection_status = {
     "state": "starting",
     "text": "正在启动",
     "detail": "等待 OneBot / Hyper 连接",
     "updated_at": int(time.time()),
 }
+<<<<<<< HEAD
 GITHUB_REPO = "Qzy327422/XcBot"
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 
 
 FEATURE_META = [
@@ -83,7 +97,11 @@ FEATURE_META = [
     {"key": "summary", "title": "群聊总结", "desc": "总结群聊记录与数据看板", "group": "功能配置"},
     {"key": "compression_commands", "title": "记忆压缩", "desc": "自动压缩上下文，并允许使用压缩相关命令", "group": "功能配置"},
     {"key": "emoji_plus_one", "title": "表情 +1", "desc": "单个表情自动复读", "group": "功能配置"},
+<<<<<<< HEAD
     {"key": "split_reply_quote", "title": "分段首段引用", "desc": "开启后：仅多段回复默认首段引用发送者消息", "group": "功能配置"},
+=======
+    {"key": "split_reply_quote", "title": "回复引用", "desc": "开启后：回复引用发送者消息", "group": "功能配置"},
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
     {"key": "weak_blacklist", "title": "弱黑名单", "desc": "按概率拦截触发", "group": "功能配置"},
     {"key": "poke_reply", "title": "拍一拍回复", "desc": "收到拍一拍时自动回复", "group": "功能配置"},
     {"key": "plugins_external", "title": "外部插件加载", "desc": "是否继续加载 plugins 目录中的第三方插件", "group": "功能配置"},
@@ -352,6 +370,12 @@ def set_connection_status(state: str, text: str = "", detail: str = "") -> None:
 
 def collect_config_bundle() -> Dict[str, Any]:
     cfg = read_json(CONFIG_PATH, {})
+<<<<<<< HEAD
+=======
+    split_reply_quote = cfg.get("split_reply_quote", {"default_enabled": True, "groups": {}})
+    if not isinstance(split_reply_quote, dict):
+        split_reply_quote = {"default_enabled": True, "groups": {}}
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
     features = dict(DEFAULT_FEATURE_SWITCHES)
     raw_features = cfg.get("FeatureSwitches", {})
     if isinstance(raw_features, dict):
@@ -373,6 +397,10 @@ def collect_config_bundle() -> Dict[str, Any]:
         "super_users": super_users,
         "manage_users": manage_users,
         "blacklist_file": blacklist_file,
+<<<<<<< HEAD
+=======
+        "split_reply_quote": split_reply_quote,
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
         "paths": {
             "config_json": str(CONFIG_PATH),
             "runtime_log": str(LOG_FILE),
@@ -415,7 +443,12 @@ def save_config_bundle(data: Dict[str, Any]):
     if "blacklist_file" in data:
         cfg["black_list"] = normalize_string_list(data.get("blacklist_file", []))
 
+<<<<<<< HEAD
     cfg.pop("split_reply_quote", None)
+=======
+    if "split_reply_quote" in data and isinstance(data["split_reply_quote"], dict):
+        cfg["split_reply_quote"] = data["split_reply_quote"]
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 
     data["config_json"] = cfg
     write_json(CONFIG_PATH, cfg)
@@ -465,8 +498,12 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("Others.api_default_index", "默认 API 编号", "number", "填写聚合后的 API 编号（从 1 开始），留空则按默认模型或首个可用接口"),
             field("Others.api_default_model", "默认模型", "text", "填写后优先锁定到该模型；留空则按默认 API 编号或首个可用接口"),
             field("Others.llm_endpoints", "LLM 接口列表", "endpoints", "配置多个 OpenAI 兼容接口，并为每个接口设置是否支持多模态"),
+<<<<<<< HEAD
             field("Others.llm_reply_failover_keywords", "回复切换关键词", "list", "一行一个。若模型回复命中其中任一关键词，则丢弃该回复并按现有失败冷却逻辑自动切换到下一个 API"),
             field("Others.llm_split.enabled", "启用 LLM 分段回复", "bool", "仅对大模型生成结果生效，不影响普通群聊回复是否引用"),
+=======
+            field("Others.llm_split.enabled", "启用 LLM 分段回复", "bool", "仅对大模型生成结果生效"),
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
             field("Others.llm_split.mode", "LLM 分段模式", "select", "auto_prompt=大模型自主分段；regex=按正则切分模型输出", "auto_prompt", ["auto_prompt", "regex"]),
             field("Others.llm_split.prompt_suffix", "自主分段提示词", "textarea", "模式一使用。会自动追加到每次 LLM 用户消息后。建议保留 <split> 分隔符说明"),
             field("Others.llm_split.split_regex", "分段正则表达式", "textarea", "模式二使用。用于识别分段点。建议：.*?[。？！~]+|.+$"),
@@ -481,8 +518,11 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("Others.emoji_plus_one_cooldown_seconds", "表情 +1 冷却秒数", "number", "单个表情自动复读的防抖时间"),
             field("Others.weak_blacklist_trigger_probability", "弱黑名单回复概率", "number", "0 到 1 之间，越小越容易拦截"),
             field("Others.weak_blacklist_users", "弱黑名单用户", "list", "一行一个 QQ 号"),
+<<<<<<< HEAD
             field("Others.group_random_reply_probability", "群聊概率触发概率", "number", "普通群消息命中该概率时，机器人会主动接话。支持 0~1，也兼容 0~100；填 0 表示关闭"),
             field("Others.group_random_reply_quote", "群聊概率触发时引用消息", "bool", "开启后，概率触发的回复会引用原消息；关闭则直接发送"),
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
             field("Others.poke_cooldown_seconds", "拍一拍冷却秒数", "number", "拍一拍自动回复的防抖时间"),
             field("Others.summary_per_day_limit", "每日总结次数", "number", "每个群每天允许总结的次数"),
             field("Others.summary_max_messages", "每次最多总结消息数", "number", "单次群聊总结最多读取多少条消息"),
@@ -519,6 +559,12 @@ def get_ui_value(bundle: Dict[str, Any], path: str, default=None):
         return bundle.get("manage_users", [])
     if path == "black_list":
         return bundle.get("blacklist_file", deep_get(bundle.get("config_json", {}), path, default) or [])
+<<<<<<< HEAD
+=======
+    if path.startswith("split_reply_quote."):
+        split_cfg = bundle.get("split_reply_quote") or {}
+        return deep_get(split_cfg, path.split(".", 1)[1], default)
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
     return deep_get(bundle.get("config_json", {}), path, default)
 
 
@@ -531,6 +577,16 @@ def set_ui_value(payload: Dict[str, Any], path: str, value):
         payload["blacklist_file"] = value
         deep_set(payload.setdefault("config_json", {}), path, value)
         return
+<<<<<<< HEAD
+=======
+    if path.startswith("split_reply_quote."):
+        split_cfg = payload.get("split_reply_quote")
+        if not isinstance(split_cfg, dict):
+            split_cfg = {"default_enabled": True, "groups": {}}
+            payload["split_reply_quote"] = split_cfg
+        deep_set(split_cfg, path.split(".", 1)[1], value)
+        return
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
     deep_set(payload.setdefault("config_json", {}), path, value)
 
 
@@ -547,6 +603,10 @@ def save_ui_state(data: Dict[str, Any]):
     cfg = read_json(CONFIG_PATH, {})
     payload = {
         "config_json": cfg,
+<<<<<<< HEAD
+=======
+        "split_reply_quote": cfg.get("split_reply_quote", {"default_enabled": True, "groups": {}}),
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
     }
     values = data.get("form_values", {}) if isinstance(data, dict) else {}
     for path, value in values.items():
@@ -557,7 +617,11 @@ def save_ui_state(data: Dict[str, Any]):
     if isinstance(values, dict) and "black_list" in values:
         payload["blacklist_file"] = values.get("black_list") or []
     if isinstance(data, dict):
+<<<<<<< HEAD
         for key in ("feature_switches", "super_users", "manage_users", "blacklist_file"):
+=======
+        for key in ("feature_switches", "super_users", "manage_users", "blacklist_file", "split_reply_quote"):
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
             if key in data:
                 if key in {"super_users", "manage_users"} and isinstance(values, dict) and "manage_users" in values:
                     continue
@@ -580,6 +644,7 @@ def get_recent_logs(limit: int = 300) -> list[Dict[str, str]]:
     return []
 
 
+<<<<<<< HEAD
 def _parse_version_parts(value: str) -> list[Any]:
     text = str(value or "").strip()
     if not text:
@@ -839,6 +904,8 @@ def fetch_update_info(force: bool = False) -> Dict[str, Any]:
     return result
 
 
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 def get_status() -> Dict[str, Any]:
     cfg = read_json(CONFIG_PATH, {})
     connection_cfg = cfg.get("Connection", {}) if isinstance(cfg.get("Connection", {}), dict) else {}
@@ -862,8 +929,11 @@ def get_status() -> Dict[str, Any]:
             "listener_host": connection_cfg.get("listener_host", ""),
             "listener_port": connection_cfg.get("listener_port", ""),
         },
+<<<<<<< HEAD
         "update": fetch_update_info(),
         "update_install": dict(_update_install_status),
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
         "connection_status": dict(_connection_status),
         "feature_switches": collect_config_bundle().get("feature_switches", {}),
     }
@@ -871,6 +941,7 @@ def get_status() -> Dict[str, Any]:
 
 def _json_response(handler: BaseHTTPRequestHandler, data: Any, status: int = 200):
     body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+<<<<<<< HEAD
     try:
         handler.send_response(status)
         handler.send_header("Content-Type", "application/json; charset=utf-8")
@@ -880,10 +951,19 @@ def _json_response(handler: BaseHTTPRequestHandler, data: Any, status: int = 200
         handler.wfile.write(body)
     except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
         pass
+=======
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(body)
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 
 
 def _text_response(handler: BaseHTTPRequestHandler, text: str, content_type="text/html; charset=utf-8", status: int = 200):
     body = text.encode("utf-8")
+<<<<<<< HEAD
     try:
         handler.send_response(status)
         handler.send_header("Content-Type", content_type)
@@ -905,6 +985,23 @@ def _binary_response(handler: BaseHTTPRequestHandler, body: bytes, content_type=
         handler.wfile.write(body)
     except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
         pass
+=======
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _binary_response(handler: BaseHTTPRequestHandler, body: bytes, content_type="application/octet-stream", status: int = 200):
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "public, max-age=3600")
+    handler.end_headers()
+    handler.wfile.write(body)
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 
 
 class WebUIHandler(BaseHTTPRequestHandler):
@@ -970,8 +1067,11 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"ok": True, "data": {"feature_switches": bundle.get("feature_switches", {}), "feature_meta": bundle.get("feature_meta", FEATURE_META)}})
             elif parsed.path == "/api/ui-state":
                 _json_response(self, {"ok": True, "data": collect_ui_state()})
+<<<<<<< HEAD
             elif parsed.path == "/api/update/check":
                 _json_response(self, {"ok": True, "data": fetch_update_info(force=True)})
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
             elif parsed.path == "/api/raw-log":
                 text = LOG_FILE.read_text(encoding="utf-8", errors="replace") if LOG_FILE.exists() else ""
                 _text_response(self, text, "text/plain; charset=utf-8")
@@ -1024,11 +1124,14 @@ class WebUIHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/ui-state":
                 save_ui_state(data or {})
                 _json_response(self, {"ok": True, "message": "设置已保存并已尝试热应用。", "data": collect_ui_state()})
+<<<<<<< HEAD
             elif parsed.path == "/api/update/check":
                 _json_response(self, {"ok": True, "message": "已检查更新", "data": fetch_update_info(force=True)})
             elif parsed.path == "/api/update/install":
                 install_latest_update()
                 _json_response(self, {"ok": True, "message": "已开始安装更新", "data": {"install": dict(_update_install_status), "update": fetch_update_info()}})
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
             else:
                 _json_response(self, {"ok": False, "error": "Not Found"}, 404)
         except Exception as e:
@@ -1099,8 +1202,13 @@ INDEX_HTML = r'''<!doctype html>
 </head>
 <body><div class="app"><aside class="sidebar"><div class="brand"><div class="logo"><img src="/assets/icon.jpg" alt="XcBot"></div><div><h1 id="brandName">XcBot</h1><p>实时 Web 管理台</p></div></div><div class="nav-title">功能列表</div><nav id="nav" class="nav"></nav><div class="nav-title">OneBot / Hyper 连接状态</div><div id="connectionStatus" class="pill">加载中...</div><div id="connectionDetail" class="desc" style="margin:10px 12px 0 12px"></div></aside><main class="main"><div class="topbar"><div class="title"><h2 id="pageTitle">加载中...</h2><p id="pageDesc">正在连接 WebUI</p></div><div class="toolbar"><span id="saveState" class="pill">未加载</span><button class="btn" onclick="refreshAll(true)">立即同步</button><button class="btn" id="themeBtn" onclick="toggleTheme()">🌙 深色</button><button class="btn primary" onclick="saveAll()">保存设置</button></div></div><section id="content" class="grid"></section></main></div><div id="toast" class="toast"></div>
 <script>
+<<<<<<< HEAD
 let state={bundle:null,current:localStorage.webuiPage||'welcome',dirty:false,saving:false,lastInputAt:0,expectedReloadAfterUpdate:false,apiFailCount:0,reloadTimer:null};
 const featureFieldMap={ai_chat:['Others.llm_split.enabled','Others.llm_split.mode','Others.llm_split.prompt_suffix','Others.llm_split.split_regex','Others.llm_split.filter_regex','Others.llm_split.max_chars_no_split'],group_chat:['Others.group_random_reply_probability','Others.group_random_reply_quote'],emoji_plus_one:['Others.emoji_plus_one_cooldown_seconds'],poke_reply:['Others.poke_cooldown_seconds'],split_reply_quote:[],weak_blacklist:['Others.weak_blacklist_trigger_probability','Others.weak_blacklist_users'],summary:['Others.summary_per_day_limit','Others.summary_max_messages'],compression_commands:['Others.compression_threshold','Others.compression_keep_recent','Others.auto_compress_after_messages'],plugins_external:[]};
+=======
+let state={bundle:null,current:localStorage.webuiPage||'welcome',dirty:false,saving:false,lastInputAt:0};
+const featureFieldMap={ai_chat:['Others.llm_split.enabled','Others.llm_split.mode','Others.llm_split.prompt_suffix','Others.llm_split.split_regex','Others.llm_split.filter_regex','Others.llm_split.max_chars_no_split'],emoji_plus_one:['Others.emoji_plus_one_cooldown_seconds'],poke_reply:['Others.poke_cooldown_seconds'],split_reply_quote:[],weak_blacklist:['Others.weak_blacklist_trigger_probability','Others.weak_blacklist_users'],summary:['Others.summary_per_day_limit','Others.summary_max_messages'],compression_commands:['Others.compression_threshold','Others.compression_keep_recent','Others.auto_compress_after_messages'],plugins_external:[]};
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 const esc=s=>String(s??'').replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));
 const token=()=>new URLSearchParams(location.search).get('token')||localStorage.webuiToken||'';
 const el=id=>document.getElementById(id);
@@ -1119,7 +1227,11 @@ function gotoPage(k){if(!pages().some(p=>p.key===k))k='welcome';state.current=k;
 function renderNav(){const nav=el('nav');if(nav)nav.innerHTML=pages().map(p=>`<button class="${p.key===state.current?'active':''}" onclick="gotoPage('${p.key}')"><span>${p.icon||'•'}</span><span>${esc(p.title)}</span></button>`).join('')}
 function renderConnectionStatus(){const s=state.bundle?.status||{},cs=s.connection_status||{},cfg=s.connection||{};const statusEl=el('connectionStatus'),detailEl=el('connectionDetail');if(statusEl){const text=cs.text||'未知状态';statusEl.textContent=text;statusEl.className='pill '+((cs.state==='connected')?'ok':(cs.state==='failed'||cs.state==='disconnected'||cs.state==='stopped')?'bad':'')}if(detailEl){const lines=[];if(cs.detail)lines.push(cs.detail);const endpoint=[cfg.protocol,cfg.host&&cfg.port?`${cfg.host}:${cfg.port}`:''].filter(Boolean).join(' · ');if(endpoint)lines.push(endpoint);detailEl.textContent=lines.join(' | ')||'暂无连接详情'}}
 function render(){if(!state.bundle)return;const logScroll=captureLogScrollState();renderNav();renderConnectionStatus();const m=meta(),titleEl=el('pageTitle'),descEl=el('pageDesc'),brandEl=el('brandName'),contentEl=el('content');if(titleEl)titleEl.textContent=(m.icon?m.icon+' ':'')+m.title;if(descEl){const desc=Object.prototype.hasOwnProperty.call(m,'desc')?m.desc:'所有数值均可在此直接修改并保存';descEl.textContent=desc;descEl.style.display=desc?'':'none'}if(brandEl)brandEl.textContent=state.bundle.status?.project||'XcBot';if(contentEl)contentEl.innerHTML=state.current==='welcome'?renderWelcome():state.current==='features'?renderFeatures():state.current==='logs'?renderLogs():renderForm(m);if(state.current==='welcome'||state.current==='logs')scheduleLogScrollAfterRender(logScroll)}
+<<<<<<< HEAD
 function renderWelcome(){const s=state.bundle.status||{},u=s.update||{},ui=s.update_install||{},cs=s.connection_status||{},cc=s.connection||{},updateBusy=['downloading','extracting','installing','migrating','dependencies','restarting'].includes(ui.state),updatePillClass=u.status==='latest'?'ok':(u.status==='outdated'||u.status==='error'||ui.state==='error')?'bad':'';return `<div class="card"><div class="section-head"><div><h3>运行概览</h3></div><span class="pill ${cs.state==='connected'?'ok':(cs.state==='failed'||cs.state==='disconnected'||cs.state==='stopped')?'bad':''}">${esc(cs.text||'未知状态')}</span></div><div class="mini-stats"><div class="stat"><b>${Math.floor((s.uptime_seconds||0)/60)}</b><span>已运行分钟</span></div><div class="stat"><b>${esc(s.pid)}</b><span>进程 PID</span></div><div class="field" style="grid-column:span 2;min-height:auto;display:flex;flex-direction:column;justify-content:center"><div class="label" style="margin-bottom:6px"><span>获取更新</span><span class="pill ${updatePillClass}">${esc(ui.state&&ui.state!=='idle'?ui.text:(u.message||'暂未检查更新'))}</span></div><div class="desc" style="margin-top:0">当前 ${esc(s.version||'--')} / 最新 ${esc(u.latest_version||'--')}</div><div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px"><button class="btn" ${updateBusy?'disabled':''} onclick="checkUpdate()">检查更新</button><button class="btn primary" ${(updateBusy||!u.has_update)?'disabled':''} onclick="installUpdate()">安装更新</button></div><div class="desc">${esc(ui.detail||u.detail||u.release_name||'安装更新会自动下载、覆盖程序、迁移配置并重启。安装后需手动刷新页面。')}</div></div></div></div><div class="card half"><div class="section-head"><div><h3>详细信息</h3><p>环境与启动参数</p></div></div><div class="kv">${[['版本号',(s.project||'')+' '+(s.version||'')],['机器人名',s.bot_name],['运行目录',s.cwd],['Python',s.python],['平台',s.platform],['启动参数',JSON.stringify(s.argv||[])]].map(r=>`<div>${esc(r[0])}</div><div>${esc(r[1])}</div>`).join('')}</div></div><div class="card half"><div class="section-head"><div><h3>连接状态</h3><p>OneBot / Hyper 实时状态</p></div></div><div class="kv">${[['当前状态',cs.text||'未知状态'],['状态详情',cs.detail||'暂无'],['协议',cc.protocol||''],['连接地址',(cc.host&&cc.port)?`${cc.host}:${cc.port}`:''],['监听地址',(cc.listener_host&&cc.listener_port)?`${cc.listener_host}:${cc.listener_port}`:''],['连接模式',cc.mode||'']].map(r=>`<div>${esc(r[0])}</div><div>${esc(r[1])}</div>`).join('')}</div></div><div class="card"><div class="section-head"><div><h3>最近日志</h3></div><div style="display:flex;gap:8px;flex-wrap:wrap">${renderAutoScrollToggle()}<button class="btn" onclick="gotoPage('logs')">查看全部</button></div></div>${renderLogPre(160,'recent')}</div>`}
+=======
+function renderWelcome(){const s=state.bundle.status||{},f=s.feature_switches||{},on=Object.values(f).filter(Boolean).length,total=Object.keys(f).length,cs=s.connection_status||{},cc=s.connection||{};return `<div class="card"><div class="section-head"><div><h3>运行概览</h3></div><span class="pill ${cs.state==='connected'?'ok':(cs.state==='failed'||cs.state==='disconnected'||cs.state==='stopped')?'bad':''}">${esc(cs.text||'未知状态')}</span></div><div class="mini-stats"><div class="stat"><b>${esc(s.pid)}</b><span>进程 PID</span></div><div class="stat"><b>${Math.floor((s.uptime_seconds||0)/60)}</b><span>已运行分钟</span></div><div class="stat"><b>${on}/${total}</b><span>已启用功能</span></div><div class="stat"><b>${esc(s.webui?.port||'')}</b><span>WebUI 端口</span></div></div></div><div class="card half"><div class="section-head"><div><h3>连接状态</h3><p>OneBot / Hyper 实时状态</p></div></div><div class="kv">${[['当前状态',cs.text||'未知状态'],['状态详情',cs.detail||'暂无'],['协议',cc.protocol||''],['连接地址',(cc.host&&cc.port)?`${cc.host}:${cc.port}`:''],['监听地址',(cc.listener_host&&cc.listener_port)?`${cc.listener_host}:${cc.listener_port}`:''],['连接模式',cc.mode||'']].map(r=>`<div>${esc(r[0])}</div><div>${esc(r[1])}</div>`).join('')}</div></div><div class="card half"><div class="section-head"><div><h3>详细信息</h3><p>环境与启动参数</p></div></div><div class="kv">${[['版本号',(s.project||'')+' '+(s.version||'')],['机器人名',s.bot_name],['运行目录',s.cwd],['Python',s.python],['平台',s.platform],['启动参数',JSON.stringify(s.argv||[])]].map(r=>`<div>${esc(r[0])}</div><div>${esc(r[1])}</div>`).join('')}</div></div><div class="card"><div class="section-head"><div><h3>最近日志</h3></div><div style="display:flex;gap:8px;flex-wrap:wrap">${renderAutoScrollToggle()}<button class="btn" onclick="gotoPage('logs')">查看全部</button></div></div>${renderLogPre(160,'recent')}</div>`}
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 function renderForm(m){const v=state.bundle.form_values||{};return `<div class="card"><div class="section-head"><div><h3>${esc(m.title)}</h3><p>${esc(m.desc)}</p></div></div><div class="form-grid">${(m.fields||[]).map(f=>renderField(f,v[f.path])).join('')}</div></div>`}
 function renderField(f,v,compact=false){const id='f_'+f.path.replace(/[^a-zA-Z0-9]/g,'_');let input='';if(f.type==='bool')input=`<div class="switch ${v?'on':''}" onclick="setBool('${f.path}',this)"></div>`;else if(f.type==='select')input=`<select id="${id}" onchange="setValue('${f.path}',this.value)">${(f.options||[]).map(o=>`<option value="${esc(o)}" ${String(o)===String(v)?'selected':''}>${esc(o)}</option>`).join('')}</select>`;else if(f.type==='list')input=`<textarea ${compact?'style="min-height:84px"':''} id="${id}" oninput="setValue('${f.path}',this.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean))">${esc(Array.isArray(v)?v.join('\n'):(v??''))}</textarea>`;else if(f.type==='textarea')input=`<textarea ${compact?'style="min-height:84px"':'style="min-height:280px"'} id="${id}" oninput="setValue('${f.path}',this.value)">${esc(v??'')}</textarea>`;else if(f.type==='endpoints')input=renderEndpointsEditor(v||[]);else input=`<input id="${id}" type="${f.type==='password'?'password':f.type==='number'?'number':'text'}" step="any" value="${esc(v??'')}" oninput="setValue('${f.path}',${f.type==='number'?'num(this.value)':'this.value'})">`;return `<div class="field"><div class="label"><span>${esc(f.label)}</span>${f.type==='bool'?input:''}</div>${f.type==='bool'?'':input}<div class="desc">${esc(f.desc||f.path)}</div></div>`}
 const num=v=>{const n=Number(v);return Number.isFinite(n)?n:v};
@@ -1130,10 +1242,14 @@ function setBool(path,el){const v=!el.classList.contains('on');el.classList.togg
 function shouldAutoRefreshPage(){return state.current==='welcome'||state.current==='logs'}
 function renderFeatures(){const map=state.bundle.feature_switches||{},groups={};const fields=(state.bundle.ui_schema.find(x=>x.key==='features')||{}).fields||[];const fieldMap=Object.fromEntries(fields.map(f=>[f.path,f]));(state.bundle.feature_meta||[]).forEach(x=>(groups[x.group]||(groups[x.group]=[])).push(x));return Object.keys(groups).map(g=>`<div class="card"><div class="section-head"><div><h3>${esc(g)}</h3><p>功能配置</p></div><span class="pill">${groups[g].length} 项</span></div><div class="feature-grid">${groups[g].map(it=>{const rel=(featureFieldMap[it.key]||[]).map(p=>fieldMap[p]).filter(Boolean);return `<div class="feature"><h4>${esc(it.title)}</h4><p>${esc(it.desc)}</p><div class="feature-foot"><span class="pill">${esc(it.key)}</span><div class="switch ${map[it.key]?'on':''}" onclick="toggleFeature('${it.key}',this)"></div></div>${rel.length?`<div style="margin-top:12px;display:grid;gap:10px">${rel.map(f=>renderField(f,state.bundle.form_values[f.path],true)).join('')}</div>`:''}</div>`}).join('')}</div></div>`).join('')}
 async function toggleFeature(key,el){state.bundle.feature_switches[key]=!state.bundle.feature_switches[key];el.classList.toggle('on',state.bundle.feature_switches[key]);await saveAll(true)}
+<<<<<<< HEAD
 async function checkUpdate(){try{const data=await api('/api/update/check',{method:'POST',body:'{}'});if(state.bundle?.status)state.bundle.status.update=data;render();toast(data.message||'已检查更新',true);await refreshAll(true)}catch(e){toast(e.message,false)}}
 function scheduleReloadAfterUpdate(){if(state.reloadTimer)return;state.expectedReloadAfterUpdate=true;state.reloadTimer=setInterval(async()=>{try{const r=await fetch('/api/ui-state',{headers:{'X-WebUI-Token':token()},cache:'no-store'});if(!r.ok)return;clearInterval(state.reloadTimer);state.reloadTimer=null;location.reload()}catch(e){}} ,1500)}
 async function installUpdate(){if(!confirm('将自动下载并安装最新版本，随后迁移配置并重启，是否继续？'))return;try{const data=await api('/api/update/install',{method:'POST',body:'{}'});if(state.bundle?.status){state.bundle.status.update=data.update||state.bundle.status.update;state.bundle.status.update_install=data.install||state.bundle.status.update_install}state.expectedReloadAfterUpdate=true;render();toast('已开始安装更新，请稍后手动刷新页面',true)}catch(e){toast(e.message,false)}}
 function renderLogs(){return `<div class="card"><div class="section-head"><div><h3>实时日志</h3><p>查看实时日志</p></div><div style="display:flex;gap:8px;flex-wrap:wrap">${renderAutoScrollToggle()}<a class="btn" href="/api/raw-log${token()?('?token='+encodeURIComponent(token())):''}" target="_blank">打开完整日志</a></div></div>${renderLogPre(500,'full')}</div>`}
+=======
+function renderLogs(){return `<div class="card"><div class="section-head"><div><h3>实时日志</h3><p>自动异步刷新，可选择是否自动滚动到底部</p></div><div style="display:flex;gap:8px;flex-wrap:wrap">${renderAutoScrollToggle()}<a class="btn" href="/api/raw-log${token()?('?token='+encodeURIComponent(token())):''}" target="_blank">打开完整日志</a></div></div>${renderLogPre(500,'full')}</div>`}
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 function renderLogPre(limit,name='main'){const logs=(state.bundle.logs||[]).slice(-limit);return `<pre id="log_${name}" class="log ${name==='recent'?'compact':''}">${esc(logs.map(x=>`[${x.time}] [${x.stream}] ${x.message}`).join('\n')||'暂无日志')}</pre>`}
 function renderAutoScrollToggle(){const on=localStorage.webuiAutoScroll!=='false';return `<button class="btn" type="button" onclick="toggleAutoScroll()">${on?'✅':'⬜'} 自动滚动</button>`}
 function toggleAutoScroll(){const on=!(localStorage.webuiAutoScroll!=='false');localStorage.webuiAutoScroll=String(on);render()}
@@ -1147,10 +1263,17 @@ function renderEndpointsEditor(list){const rows=(Array.isArray(list)?list:[]).ma
 function updateEndpoint(index,key,value){const arr=Array.isArray(state.bundle.form_values['Others.llm_endpoints'])?[...state.bundle.form_values['Others.llm_endpoints']]:[];arr[index]=Object.assign({base_url:'',model:'',keys:[],supports_multimodal:false},arr[index]||{});arr[index][key]=value;setValue('Others.llm_endpoints',arr)}
 function addEndpoint(){const arr=Array.isArray(state.bundle.form_values['Others.llm_endpoints'])?[...state.bundle.form_values['Others.llm_endpoints']]:[];arr.push({base_url:'',model:'',keys:[],supports_multimodal:false});setValue('Others.llm_endpoints',arr);render()}
 function removeEndpoint(index){const arr=Array.isArray(state.bundle.form_values['Others.llm_endpoints'])?[...state.bundle.form_values['Others.llm_endpoints']]:[];arr.splice(index,1);setValue('Others.llm_endpoints',arr);render()}
+<<<<<<< HEAD
 async function saveAll(silent=false){if(!state.bundle||state.saving)return;state.saving=true;const save=el('saveState');if(save)save.textContent='正在保存...';try{syncCurrentPageFieldsFromDom();saveDraft();const manageUsers=state.bundle.form_values?.manage_users??state.bundle.manage_users;const blackList=state.bundle.form_values?.black_list??state.bundle.blacklist_file;const saved=await api('/api/ui-state',{method:'POST',body:JSON.stringify({form_values:state.bundle.form_values||{},feature_switches:state.bundle.feature_switches||{},super_users:manageUsers,manage_users:manageUsers,blacklist_file:blackList})});clearDraft();state.bundle=saved;state.dirty=false;render();await refreshAll(true);if(!silent)toast('设置已保存并已从 config 重新同步',true)}catch(e){toast(e.message,false)}finally{state.saving=false}}
 function isEditingField(){const el=document.activeElement;return !!(el&&['INPUT','TEXTAREA','SELECT'].includes(el.tagName))}
 function shouldPauseAutoRefresh(){return !!(state.dirty||isEditingField()||(Date.now()-(state.lastInputAt||0)<15000))}
 async function refreshAll(force=false){if(!force&&!shouldAutoRefreshPage())return;if(shouldPauseAutoRefresh()&&!force)return;try{const data=await api('/api/ui-state');state.apiFailCount=0;if(shouldPauseAutoRefresh()&&!force)return;state.bundle=data;applyDraft(state.bundle);const installState=data?.status?.update_install?.state||'';if(['restarting','idle'].includes(installState)&&state.expectedReloadAfterUpdate){scheduleReloadAfterUpdate()}render();const save=el('saveState');if(save&&!state.dirty)save.textContent='已同步 '+new Date().toLocaleTimeString()}catch(e){state.apiFailCount=(state.apiFailCount||0)+1;if(state.expectedReloadAfterUpdate&&state.apiFailCount>=2)scheduleReloadAfterUpdate();if(!state.expectedReloadAfterUpdate)toast(e.message,false)}}
+=======
+async function saveAll(silent=false){if(!state.bundle||state.saving)return;state.saving=true;const save=el('saveState');if(save)save.textContent='正在保存...';try{syncCurrentPageFieldsFromDom();saveDraft();const manageUsers=state.bundle.form_values?.manage_users??state.bundle.manage_users;const blackList=state.bundle.form_values?.black_list??state.bundle.blacklist_file;const saved=await api('/api/ui-state',{method:'POST',body:JSON.stringify({form_values:state.bundle.form_values||{},feature_switches:state.bundle.feature_switches||{},super_users:manageUsers,manage_users:manageUsers,blacklist_file:blackList,split_reply_quote:state.bundle.split_reply_quote})});clearDraft();state.bundle=saved;state.dirty=false;render();await refreshAll(true);if(!silent)toast('设置已保存并已从 config 重新同步',true)}catch(e){toast(e.message,false)}finally{state.saving=false}}
+function isEditingField(){const el=document.activeElement;return !!(el&&['INPUT','TEXTAREA','SELECT'].includes(el.tagName))}
+function shouldPauseAutoRefresh(){return !!(state.dirty||isEditingField()||(Date.now()-(state.lastInputAt||0)<15000))}
+async function refreshAll(force=false){if(!force&&!shouldAutoRefreshPage())return;if(shouldPauseAutoRefresh()&&!force)return;try{const data=await api('/api/ui-state');if(shouldPauseAutoRefresh()&&!force)return;state.bundle=data;applyDraft(state.bundle);render();const save=el('saveState');if(save&&!state.dirty)save.textContent='已同步 '+new Date().toLocaleTimeString()}catch(e){toast(e.message,false)}}
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 setTheme(localStorage.webuiTheme||'dark');refreshAll(true);setInterval(()=>refreshAll(false),3000);setInterval(()=>{if(state.current==='welcome'||state.current==='logs')scrollLogsToBottom()},500);
 </script></body></html>'''
 

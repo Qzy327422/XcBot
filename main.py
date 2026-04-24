@@ -101,15 +101,21 @@ def load_user_cfg() -> dict:
         "auto_compress_after_messages": others.get("auto_compress_after_messages", 40),
         "weak_blacklist_trigger_probability": others.get("weak_blacklist_trigger_probability", 0.3),
         "weak_blacklist_users": others.get("weak_blacklist_users", []),
+<<<<<<< HEAD
         "group_random_reply_probability": others.get("group_random_reply_probability", 0),
         "group_random_reply_quote": others.get("group_random_reply_quote", False),
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
         "llm_endpoints": others.get("llm_endpoints", []),
         "api_failure_cooldown_seconds": others.get("api_failure_cooldown_seconds", 5),
         "api_default_index": others.get("api_default_index", 1),
         "api_default_model": others.get("api_default_model", ""),
         "personality_prompt": others.get("personality_prompt", ""),
         "sensitive_words": others.get("sensitive_words", []),
+<<<<<<< HEAD
         "llm_reply_failover_keywords": others.get("llm_reply_failover_keywords", []),
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
     }
     return defaults
 
@@ -187,6 +193,7 @@ def get_sensitive_words_mapping() -> dict[str, str]:
     return mapping
 
 
+<<<<<<< HEAD
 def get_llm_reply_failover_keywords() -> list[str]:
     raw_items = get_runtime_others().get(
         "llm_reply_failover_keywords",
@@ -217,6 +224,8 @@ def find_llm_reply_failover_keyword(text: str) -> str:
     return ""
 
 
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 def get_runtime_setting(path: str, default=None):
     current = read_runtime_config()
     for part in path.split("."):
@@ -231,17 +240,25 @@ def get_llm_split_config() -> dict:
     cfg = others.get("llm_split", {})
     if not isinstance(cfg, dict):
         cfg = {}
+<<<<<<< HEAD
     enabled = normalize_bool_config(cfg.get("enabled", False), default=False)
     mode = str(cfg.get("mode", "auto_prompt") or "auto_prompt").strip() or "auto_prompt"
     if mode not in {"auto_prompt", "regex"}:
         mode = "auto_prompt"
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
     try:
         max_chars_no_split = int(cfg.get("max_chars_no_split", 0) or 0)
     except (TypeError, ValueError):
         max_chars_no_split = 0
     return {
+<<<<<<< HEAD
         "enabled": enabled,
         "mode": mode,
+=======
+        "enabled": bool(cfg.get("enabled", False)),
+        "mode": str(cfg.get("mode", "auto_prompt") or "auto_prompt").strip() or "auto_prompt",
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
         "prompt_suffix": str(cfg.get("prompt_suffix", "") or "").strip(),
         "split_regex": str(cfg.get("split_regex", r".*?[。？！~]+|.+$") or r".*?[。？！~]+|.+$").strip(),
         "filter_regex": str(cfg.get("filter_regex", r"\n|\r") or r"\n|\r").strip(),
@@ -250,6 +267,7 @@ def get_llm_split_config() -> dict:
 
 
 def build_llm_user_message(message: str) -> str:
+<<<<<<< HEAD
     return str(message or "")
 
 
@@ -266,6 +284,18 @@ def build_llm_system_prompt(system_prompt: str) -> str:
     if not prompt:
         return suffix
     return f"{prompt}\n\n{suffix}"
+=======
+    text = str(message or "")
+    cfg = get_llm_split_config()
+    if not cfg.get("enabled"):
+        return text
+    if cfg.get("mode") != "auto_prompt":
+        return text
+    suffix = cfg.get("prompt_suffix", "").strip()
+    if not suffix:
+        return text
+    return f"{text}\n\n{suffix}"
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 
 
 def split_llm_reply_for_send(ai_reply: str) -> list[str]:
@@ -275,11 +305,17 @@ def split_llm_reply_for_send(ai_reply: str) -> list[str]:
     mode = cfg.get("mode", "auto_prompt")
     filter_regex = cfg.get("filter_regex", r"\n|\r")
     max_chars_no_split = int(cfg.get("max_chars_no_split", 0) or 0)
+<<<<<<< HEAD
     split_marker_pattern = r'<\s*split\s*>'
 
     def _clean_reply_part(part: str) -> str:
         cleaned = str(part or "")
         cleaned = re.sub(split_marker_pattern, "", cleaned, flags=re.IGNORECASE)
+=======
+
+    def _clean_reply_part(part: str) -> str:
+        cleaned = str(part or "")
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
         if filter_regex:
             try:
                 cleaned = re.sub(filter_regex, "", cleaned)
@@ -287,6 +323,7 @@ def split_llm_reply_for_send(ai_reply: str) -> list[str]:
                 print(f"[LLM Split] 过滤正则配置无效，已跳过过滤: {e}")
         return cleaned.strip()
 
+<<<<<<< HEAD
     ai_reply_cleaned = re.sub(split_marker_pattern, '<split>', text, flags=re.IGNORECASE)
     split_marker = "<split>"
     single_text = _clean_reply_part(ai_reply_cleaned)
@@ -304,16 +341,39 @@ def split_llm_reply_for_send(ai_reply: str) -> list[str]:
 
     # 自动提示词分段：仅当模型实际输出 <split> 时按 <split> 分段。
     if mode == "auto_prompt" and split_marker in ai_reply_cleaned:
+=======
+    ai_reply_cleaned = re.sub(r'<\s*split\s*>', '<split>', text, flags=re.IGNORECASE)
+    split_marker = "<split>"
+
+    # 当整条消息长度超过阈值时，直接作为单条发送，不做分段。
+    # 长度按过滤换行等清理后的最终文本计算，避免 <split> 标记影响判断。
+    whole_text = _clean_reply_part(ai_reply_cleaned.replace(split_marker, ""))
+    if max_chars_no_split > 0 and len(whole_text) > max_chars_no_split:
+        return [whole_text] if whole_text else []
+
+    if not enabled:
+        single = whole_text
+        return [single] if single else []
+
+    if split_marker in ai_reply_cleaned:
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
         parts = [p for p in (_clean_reply_part(x) for x in ai_reply_cleaned.split(split_marker)) if p]
         if parts:
             return parts
 
+<<<<<<< HEAD
     # 正则分段：忽略 <split> 的语义，只把它当作需过滤的脏标记。
     if mode == "regex":
         split_regex = cfg.get("split_regex", r".*?[。？！~]+|.+$")
         try:
             regex_source = re.sub(split_marker_pattern, "", text, flags=re.IGNORECASE)
             raw_parts = re.findall(split_regex, regex_source, flags=re.S)
+=======
+    if enabled and mode == "regex":
+        split_regex = cfg.get("split_regex", r".*?[。？！~]+|.+$")
+        try:
+            raw_parts = re.findall(split_regex, text, flags=re.S)
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
             parts = []
             for item in raw_parts:
                 part = _clean_reply_part(item)
@@ -322,9 +382,15 @@ def split_llm_reply_for_send(ai_reply: str) -> list[str]:
             if parts:
                 return parts
         except re.error as e:
+<<<<<<< HEAD
             print(f"[LLM Split] 正则分段配置无效，已回退到单条发送: {e}")
 
     single = single_text
+=======
+            print(f"[LLM Split] 正则分段配置无效，已回退到 <split> 模式: {e}")
+
+    single = _clean_reply_part(ai_reply_cleaned)
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
     return [single] if single else []
 
 
@@ -1044,6 +1110,7 @@ def load_split_reply_quote_settings() -> dict:
 
 
 def is_split_reply_quote_enabled(group_id: int = None) -> bool:
+<<<<<<< HEAD
     """检查是否启用“多段回复首段引用触发者”功能。
 
     优先读取 FeatureSwitches.split_reply_quote。
@@ -1056,6 +1123,15 @@ def is_split_reply_quote_enabled(group_id: int = None) -> bool:
 
     legacy_settings = load_split_reply_quote_settings()
     return normalize_bool_config(legacy_settings.get("default_enabled", True), default=True)
+=======
+    """检查是否启用“分段首段引用触发者”功能。
+
+    现在只保留 WebUI 中的一个总开关：
+    - 开启：包含 <split> 的多段回复默认第一段引用；未分段时按正常引用逻辑。
+    - 关闭：分段/未分段都不强制引用。
+    """
+    return is_feature_enabled("split_reply_quote", True)
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 
 def filter_sensitive_content(text: str) -> str:
     if not text:
@@ -1414,6 +1490,7 @@ def log_api_failure(scene: str, model: str, current_key: str, error):
     log_console("API", f"{scene} xx {model} key={key_mask} err={_short_text(error, 90)}")
 
 
+<<<<<<< HEAD
 def ensure_llm_reply_passes_failover_check(reply_text: str):
     """当回复命中配置关键词时，抛出异常触发自动切换下一个 API。"""
     keyword = find_llm_reply_failover_keyword(reply_text)
@@ -1423,6 +1500,8 @@ def ensure_llm_reply_passes_failover_check(reply_text: str):
     raise Exception(f"LLM 回复命中切换关键词: {keyword}")
 
 
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 class LoggedActions:
     def __init__(self, actions):
         self._actions = actions
@@ -1497,6 +1576,7 @@ def should_block_by_weak_blacklist(event, user_id=None, user_message: str = "", 
     return True
 
 
+<<<<<<< HEAD
 def should_trigger_random_group_chat(user_message: str = "") -> bool:
     """按配置概率让机器人在普通群消息下主动参与对话。"""
     if not is_feature_enabled("group_chat", True):
@@ -1526,6 +1606,8 @@ def is_group_random_reply_quote_enabled() -> bool:
     )
 
 
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 async def handle_check_account_command(event, actions, order, is_group=True):
     if not is_feature_enabled("check_account", True):
         return False
@@ -1944,7 +2026,11 @@ class LimitedDeepSeekContext:
         1. system_prompt 永远只作为唯一 system 消息
         2. history 仅包含 user / assistant 消息
         """
+<<<<<<< HEAD
         messages = [{"role": "system", "content": build_llm_system_prompt(self.system_prompt)}]
+=======
+        messages = [{"role": "system", "content": self.system_prompt}]
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 
         for msg in self.history:
             role = msg.get("role", "user")
@@ -2039,7 +2125,10 @@ class LimitedDeepSeekContext:
 
                 result = response.choices[0].message.content or ""
                 result = result.rstrip("\n")
+<<<<<<< HEAD
                 ensure_llm_reply_passes_failover_check(result)
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 
                 usage = getattr(response, "usage", None)
                 total_tokens = getattr(usage, "total_tokens", 0) if usage else 0
@@ -2098,6 +2187,7 @@ class LimitedDeepSeekContext:
                     key_manager.mark_failure(current_key, reason=str(e), cooldown_seconds=get_api_failure_cooldown_seconds())
                     last_error = e
                     continue
+<<<<<<< HEAD
                 elif "llm 回复命中切换关键词" in str(e).lower():
                     print(f"[LLM Failover] 回复命中关键词，切换下一个 API: model={model}, keyword={str(e)}")
                     key_manager.mark_failure(
@@ -2107,6 +2197,8 @@ class LimitedDeepSeekContext:
                     )
                     last_error = e
                     continue
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
                 else:
                     key_manager.mark_failure(current_key, reason=str(e), cooldown_seconds=get_api_failure_cooldown_seconds())
                     last_error = e
@@ -2775,7 +2867,10 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
 
                 result = response.choices[0].message.content or ""
                 result = result.rstrip("\n")
+<<<<<<< HEAD
                 ensure_llm_reply_passes_failover_check(result)
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 
                 usage = getattr(response, "usage", None)
                 total_tokens = getattr(usage, "total_tokens", 0) if usage else 0
@@ -2877,6 +2972,7 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                     key_manager.mark_failure(current_key, reason=str(e), cooldown_seconds=get_api_failure_cooldown_seconds())
                     last_error = e
                     continue
+<<<<<<< HEAD
                 elif "llm 回复命中切换关键词" in str(e).lower():
                     print(f"[LLM Failover] 回复命中关键词，切换下一个 API: model={model}, keyword={str(e)}")
                     key_manager.mark_failure(
@@ -2886,6 +2982,8 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                     )
                     last_error = e
                     continue
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
                 else:
                     key_manager.mark_failure(current_key, reason=str(e), cooldown_seconds=get_api_failure_cooldown_seconds())
                     last_error = e
@@ -4119,15 +4217,19 @@ async def process_and_send(actions, event, ai_reply: str, is_group: bool, reply_
     parts = split_llm_reply_for_send(ai_reply)
     log_console("SEND", f"准备发送 {'群' if is_group else '私聊'} {len(parts)}段 {_short_text(ai_reply, 70)}")
 
+<<<<<<< HEAD
     if not parts:
         return
 
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
     # 群聊中如果启用了 <split> 分段首段引用功能，则第一段自动引用触发者消息。
     # 但只有当前事件本身带有 message_id（普通消息事件）时才允许引用，
     # 避免在 NotifyEvent（如拍一拍）等无 message_id 的事件中触发异常。
     split_quote_enabled = is_split_reply_quote_enabled(event.group_id) if is_group else False
     event_message_id = getattr(event, "message_id", None)
     can_reply_message = bool(is_group and event_message_id)
+<<<<<<< HEAD
     # 普通回复引用仍由调用方的 reply_to_first 决定。
     # split_reply_quote 只额外控制“多段回复时默认首段引用”，避免误伤单段回复逻辑。
     should_reply_first = can_reply_message and bool(reply_to_first)
@@ -4138,6 +4240,21 @@ async def process_and_send(actions, event, ai_reply: str, is_group: bool, reply_
 
         if is_group:
             if should_reply_current:
+=======
+    # 最终逻辑：群聊里的引用回复统一受 split_reply_quote 插件开关控制。
+    # - 开启：允许按原有 reply_to_first 规则引用；若为 <split> 多段，也默认首段可引用
+    # - 关闭：无论单段还是多段，都不引用触发者消息
+    should_reply_first = can_reply_message and split_quote_enabled and (
+        reply_to_first or len(parts) > 1
+    )
+
+    for idx, text in enumerate(parts):
+        if not text:
+            continue
+
+        if is_group:
+            if idx == 0 and should_reply_first:
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
                 msg = Manager.Message(Segments.Reply(event_message_id), Segments.Text(text))
             else:
                 msg = Manager.Message(Segments.Text(text))
@@ -5354,7 +5471,10 @@ async def handler(event: Events.Event, actions: Listener.Actions) -> None:
         is_image_generation = False
         is_wangkai_trigger = False
         is_at_trigger = False
+<<<<<<< HEAD
         is_random_trigger = False
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 
         if user_message.startswith(reminder):
             order_i = user_message.find(reminder)
@@ -5392,10 +5512,13 @@ async def handler(event: Events.Event, actions: Listener.Actions) -> None:
                     order = text_content.strip()
                     should_trigger = True
                     is_wangkai_trigger = True
+<<<<<<< HEAD
             elif should_trigger_random_group_chat(user_message):
                 order = user_message.strip()
                 should_trigger = True
                 is_random_trigger = True
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
 
         if is_feature_enabled("compression_commands", True) and await handle_compression_commands(event, actions, is_group=True, order=order):
             nike = await get_nickname_by_userid(event.user_id, Manager, actions, event.group_id)
@@ -5933,7 +6056,10 @@ Rebuilt from HypeR
                 "is_group": True,
                 "is_at_trigger": is_at_trigger,
                 "is_wangkai_trigger": is_wangkai_trigger,
+<<<<<<< HEAD
                 "is_random_trigger": is_random_trigger,
+=======
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
             })
             if is_feature_enabled("plugins_external", False) and await execute_plugins(False, **plugin_context):
                 return
@@ -5964,7 +6090,11 @@ Rebuilt from HypeR
                 # 开启群聊 AI 回复首条引用：普通命令、@触发、机器人名字触发均引用触发消息。
                 # process_and_send 内部仍会检查：仅群聊普通消息且存在 message_id 时才真正引用，
                 # 拍一拍等 NotifyEvent 不会引用，避免无 message_id 报错。
+<<<<<<< HEAD
                 reply_to_first = is_group_random_reply_quote_enabled() if is_random_trigger else True
+=======
+                reply_to_first = True
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
                 await process_and_send(actions, event, result, is_group=True, reply_to_first=reply_to_first)
 
 
@@ -5975,7 +6105,11 @@ Rebuilt from HypeR
                     event,
                     e,
                     is_group=True,
+<<<<<<< HEAD
                     reply=not (is_wangkai_trigger or is_at_trigger or is_random_trigger),
+=======
+                    reply=not (is_wangkai_trigger or is_at_trigger),
+>>>>>>> 569acaa5a1cb9bf053af2ffcc70793f9971b1bf1
                     error_type="ai"
                 )
             return
