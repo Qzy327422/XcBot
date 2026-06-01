@@ -1,0 +1,38 @@
+# Runtime data
+/data/
+/temps/
+/update_backup/
+/config_backup/
+/my_bot.lock
+*.lock
+
+# Local/user configuration backups
+*.bak
+*.backup
+config-old.json
+config-local.json
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local tooling
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
