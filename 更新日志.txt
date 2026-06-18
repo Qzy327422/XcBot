@@ -1,0 +1,11 @@
+v1.5.1
+- 更改了Linux下的更新重启逻辑
+- 修复 NapCat 掉线后 clean 断开导致零延迟无限重连，内存耗尽直至崩溃
+- 修复 connect_time 未初始化，极端情况下 NameError 导致异常死循环
+- 修复 OpenAI client 每次 API 调用都新建（_client_pool key 含 thread_id），大量 client 堆积内存泄漏
+- 修复每个群/私聊 context 各持有独立 client pool，150个会话 × 3-5MB = 数百MB浪费（改为类级别共享）
+- 修复对话轮数计数显示为实际值的2倍（一问一答应为1轮，实际计为2条）
+
+性能优化：
+- WebUI 页面加载慢：psutil.net_connections() 每次请求都枚举所有网络连接（耗时100-500ms），改为缓存10秒
+- 修复 /api/status 接口重复调用 _get_resource_usage()（直接调用一次 + debug snapshot 内再调用一次）
