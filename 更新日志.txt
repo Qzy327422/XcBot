@@ -1,0 +1,24 @@
+v1.5.2
+修复频繁重连导致内存/CPU持续增长问题：
+
+- [严重] 修复 Hyper 框架 KeyQueue.get 纯忙等待缺陷
+  原实现 while 1 空转，NapCat 断线时等待响应的线程永久 100% CPU 空转且永不退出
+  修复：sleep(0.01) 轮询 + 60秒超时自动退出 + pop 消费后删除条目
+
+- [严重] 修复 KeyQueue.contents 只增不减内存泄漏
+  所有历史 API 响应永久堆积在字典中，修复为 pop 消费，响应后立即释放
+
+- [严重] 修复重连后 reports 字典残留悬空 key
+  断线时未收到响应的 echo key 永久存在，现在每次重连前自动 clear
+
+- [中] 修复 ContextCompressor._client_pool 以 thread_id 为 key
+  每条消息在独立线程执行，thread_id 不复用，OpenAI client 随重连次数线性堆积
+  修复：key 改为 base_url+api_key，数量与 API key 数绑定
+
+- [中] 修复 EnhancedContextManager 会话对象无上限无淘汰
+  private_chats/groups 永不释放，692个会话常驻内存
+  修复：OrderedDict + LRU 淘汰（私聊≤200，群聊≤300），淘汰前自动持久化
+
+- [低] 修复 history 中 base64 图片数据常驻内存
+  单张图 500KB~1MB，_enforce_message_limit 时自动替换为 [图片] 占位符
+口重复调用 _get_resource_usage()（直接调用一次 + debug snapshot 内再调用一次）
