@@ -1,0 +1,32 @@
+v2.0
+WebUI 重构与内存优化：
+
+- [新增] WebUI 静态资源（CSS/JS）提取为独立文件 static/app.css / app.js / login.js，webui.py 体积从 245KB 降至 138KB，减少 44%
+- [新增] WebUI 主题色系统，支持 aurora / ocean / violet / rose / gold / mono 多套配色
+- [新增] 仿苹果液态玻璃 UI 模式（liquid glass），启用后卡片使用 SVG 液态折射效果
+- [新增] 可自定义 WebUI 背景壁纸
+- [新增] 管理员可直接在QQ调整参数，无需WebUI。'/帮助' 查看命令
+- [新增] 新增插件市场，用户可自行上传插件
+
+- [微调] 日志按日期分文件（runtime-YYYY-MM-DD.log）
+- [微调] 命令可通过 @bot 命令 触发
+
+- [严重] 修复 gc.get_objects() 每3秒被调用导致内存临时飙升数百MB
+  改为 sum(gc.get_count()) 替代，不再分配临时对象列表
+- [严重] 修复 collect_statistics() 每3秒读取40000行日志做正则解析
+  加入60秒缓存，运行越久日志越大的性能退化问题彻底解决
+
+- [中] 修复 open_files() 无缓存每3秒调用
+  加入10秒缓存与 net_connections 对齐
+- [中] 修复 TokenStats 四个 dict 无界增长
+  加入每日自动重置，防止长时间运行内存线性膨胀
+- [中] chat_db 每群 history deque maxlen 从1000降至300
+  总结功能只用200条，原1000条约占30MB/群
+- [中] nickname_cache 上限从5000降至1000
+
+- [优化] 静态文件添加 Cache-Control: public, max-age=3600
+  浏览器缓存 CSS/JS
+
+- [低] GPUtil 改为懒加载，进程启动不再预占内存
+
+
