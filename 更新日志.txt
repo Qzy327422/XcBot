@@ -1,0 +1,136 @@
+v2.1
+稳定性 / 安全 / 主流程修复：
+
+- [严重] 修复 WebUI 切页动画连播 / 被掐断
+  根因：切页后 refreshAll 在 page-anim 未结束时整页替换，CSS 动画重播或提前中断
+  现仅真正切页播一次动画；动画进行中跳过同页整页刷新，时长与交错 delay 恢复正常手感
+- [严重] 修复 app.js 语法错误导致 WebUI 卡在「加载中」
+  render() 内容区分支多余 }，浏览器解析失败、脚本中断
+- [严重] 修复聊天室默认无会话、点新建却出现两个
+  根因：bootstrap 与 chatNew 互相 await 形成死锁；并发创建无服务端兜底
+  现 /api/chat/sessions 空目录原子创建「默认会话」；前端拆出 chatCreateSession，进页只打开默认会话
+- [严重] 修复 key_manager 轮换下标错位
+  mark_success / mark_failure / disable_key / get_status_list / is_default_key
+  原先把 rotation_index（原始 endpoints 下标，含空洞）当 model_slots 下标用
+  现统一映射到真实槽位，失败后按列表顺序往后切
+- [严重] 修复 OpenAI client 类级共享池被会话 clear/LRU 误关
+  LimitedDeepSeekContext / ContextCompressor 实例关闭改为 no-op，避免并发会话互相踢连接
+- [严重] 修复「引用聊天记录总结」temp_db 写死 key "0"
+  handle_node_messages 现按真实 group_id 写入，与总结读取一致
+- [严重] 修复 WebUI「拍一拍」功能开关无效
+  处理链路补 is_feature_enabled("poke_reply")
+- [严重] 修复私聊 Any 插件双执行
+  handle_private_message 去掉重复 execute_plugins(True)
+- [严重] 修复插件商店/上传路径穿越与 XSS 面
+  zip 成员统一安全相对路径校验；上传 startswith 绕过修复；esc 转义单引号；
+  商店按钮改 data-* + dataset；插件包约 12MB 上限；前端分块 base64
+- [严重] 修复更新包 extractall 无成员路径过滤
+- [严重] 修复 collect_statistics 缓存写在 return 后导致永不生效
+
+- [中] 修复未保存离开确认 hash 字段不一致
+- [中] 修复配置升级 version_name 不写回；CURRENT_CONFIG_VERSION=3
+- [中] 修复调试页 resource_usage 缺失与数据过少；聊天室目录路径写错
+- [中] 修复热更新不刷新已有会话人设/上下文上限/自动压缩阈值
+- [中] 修复群黑名单群号不生效
+- [中] 修复同会话 agen_content 无锁并发（asyncio.Lock）
+- [中] 修复非 Any 插件异常静默吞掉后续处理
+- [中] 修复 deep_merge 空列表被模板盖回
+- [中] 修复表情 +1 对复合 emoji 不触发
+- [中] 修复 Token 日切不重置 total_tokens；上下文 get_stats 恒 0
+- [中] 请求体 Content-Length 增加约 20MB 上限
+
+- [优化] 静态资源缓存破坏改为版本号 + 文件内容 hash
+- [优化] WebUI 默认视觉密度（去掉不稳定 zoom 方案）
+
+- [自检] main/webui/config_migrate/key_manager/app.js 语法通过；关键路径抽检通过
+
+
+- [严重] 修复同 Key 多渠道故障转移失败
+  同一 API Key 配给多个渠道/模型时，首渠道 403/余额不足后系统误认为
+  Key 已试过，直接报"所有模型均失败"，不再尝试其他渠道。
+  根因：tried_keys 用裸 Key 标识，无法区分同 Key 不同渠道。
+  修复：改用 (base_url, model, key) 三元组；重试次数改为组合数；
+        失败/冷却标记按三元组精确定位；主对话/转述/压缩摘要全路径一致。
+
+- [严重] 修复切换日志显示纯数字（"自动 11 -> 1"）
+  日志 from/to 改为"渠道ID/模型名"（如 1314mc/deepseek-v4-flash）；
+  失败原因改为中文可读格式。
+
+- [严重] 修复群总结历史数据分裂导致总结失效
+  chat_db 加载时群号为字符串（JSON键），运行时用整数写入，
+  形成两套键；落盘覆盖旧数据，/总结 读不到历史。
+  修复：GroupKeyedChatDB 统一归一化为字符串，全链路透明。
+
+- [严重] 修复 WebUI 聊天室并发乱序 + 断线残留消息
+  同会话并发：History 可能 UserA/UserB/AssistantB/AssistantA。
+  断线残留：用户消息已写盘但 LLM 未返回，留下孤立 user turn。
+  修复：每个会话分配独立 RLock 保证事务串行；
+        user 消息带 request_id，断线时精确回滚。
+
+- [严重] 修复聊天室切换模型刷新失效
+  前端只改内存对象，刷新页面恢复旧模型。
+  修复：新增 POST /api/chat/model 接口落盘，前端 chatPickModel 改为
+        async 异步调用；不可用模型拒绝并回滚下拉框。
+
+- [中高] 修复 weather/quote/生图/查资料 开关永远无法关闭
+  FEATURE_META 缺少这四个键，WebUI 开关页不显示、保存时被抹掉。
+  修复：补齐四个键到 FEATURE_META 和 DEFAULT_FEATURE_SWITCHES。
+
+- [中高] 修复配置字符串布尔 "false"/"0"/"关闭" 被当成 True
+  poke_reply_enabled / emoji_plus_one_enabled / split_reply_quote
+  首次启动用 bool(str) 解析；热加载却用正确解析，状态不一致。
+  修复：统一改为 normalize_bool_config。
+
+- [中高] 修复 /名言 非项目目录启动必然找不到资源
+  assets/t.ttf、./temps 依赖 cwd；从服务/计划任务启动即 FileNotFoundError。
+  修复：Quote.py 改为基于 __file__ 的绝对路径。
+  同修：data/sum_up / ai_memory / compression / temps 全部改为 BASE_DIR 绝对路径。
+
+- [中高] 修复 /名言 和多模态图片下载安全边界
+  无大小限制（可撑爆内存）；多模态关闭 TLS 校验；可访问内网（SSRF）。
+  修复：限制 8MB 流式读取；移除 ssl=False；
+        拦截非 http/https scheme 及内网/loopback/link-local 地址。
+
+- [中] 修复持久化非原子写（进程崩溃留下空/半截文件）
+  AI 记忆、总结记录、压缩统计、重启状态、WebUI 聊天会话均直接覆盖写。
+  修复：统一改为 .tmp + os.fsync + os.replace 原子写。
+
+- [中] 修复转发消息总结超长提示算错库
+  "最多可总结 N 条"从全局 chat_db 计算，而实际是 temp_db（转发消息）。
+  修复：max_summarizable_msgs 增加 db 参数，调用时传 db=db_to_use。
+
+- [中] 修复配置迁移双重非法 timeout 导致迁移崩溃
+  endpoint 和全局 timeout 同时非法时，回退转换再次抛 ValueError。
+  修复：嵌套 try/except，任意阶段失败回退 60。
+  同修：备份名加微秒防同秒多次迁移互相覆盖。
+
+- [中] 修复重复渠道 ID / 重复模型名静默覆盖
+  provider_map 后写覆盖前写，配置有两个同名渠道时只剩最后一个。
+  修复：保存时拦截重复 ID/模型名并报错；运行时保留第一个，打印警告。
+
+- [中] 修复表情 +1 冷却全局串台
+  emoji_send_count 为全局单一时间戳，一个用户触发后全部用户进入冷却。
+  修复：改为字典，按 user_id 独立冷却。
+
+- [中] 修复群总结并发绕过每日次数限制
+  两条 /总结 并发均可通过 can_summary_today，实际执行两次。
+  修复：增加 _summary_inflight_lock + inflight 集合，同群同时只跑一个。
+
+- [中] 修复 LLM 热更新不关旧 client 池
+  WebUI 修改 API/超时后旧 OpenAI client 池未清空，仍可能复用旧连接。
+  修复：close_runtime_llm_clients 真正清空并 close 两个类级共享池。
+
+- [低] 修复退出/重启不保存已加载 AI 会话记忆
+  退出日志打"所有记忆已保存"但实际未遍历保存 LLM 上下文。
+  修复：增加 save_all_ai_memories()，信号退出/重启/异常退出/atexit 均调用。
+
+- [优化] 切换日志内部文案改为中文（"按轮换顺序切换模型"等）
+- [优化] WebUI 聊天室删除会话时清理对应 session lock 防内存泄漏
+- [优化] config_migrate.write_json 改为原子写
+
+- [已知不改] 生图搜索 API ssl=False：用户本地部署、外部图床场景，保留
+- [用户要求] WebUI 强制 Token 校验已移除（本地部署无需）
+
+- [自检] 上述全部修复静态核对通过；故障转移/chat_db/原子写/迁移timeout
+  运行回归通过；main/Quote/webui/key_manager/config_migrate 编译通过；
+  app.js 语法检查通过。
