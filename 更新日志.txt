@@ -1,0 +1,78 @@
+v2.2
+架构重构 / Token 统计 / 模型配置统一 / 稳定性加固：
+
+- [架构] 拆分 main.py 超大文件，抽出 bot 包
+  bot/estimate.py      Token 估算
+  bot/io_json.py       原子写 JSON
+  bot/memory.py        私聊/群聊记忆持久化
+  bot/token_stats.py   全局 Token 统计
+  bot/llm_config.py    提供商/轮换归一化
+  bot/paths.py         项目根路径
+  行为保持兼容，main 仅保留启动与事件入口。
+
+- [架构] 拆分 webui.py，抽出 webui_core 包
+  webui_core/features.py    功能开关元数据
+  webui_core/resources.py   进程资源采样
+  webui_core/versioning.py  版本比较
+  webui_core/json_io.py     WebUI JSON 读写
+  webui.py 继续作为兼容门面，main 的 from webui import ... 无需改动。
+
+- [严重] 修复 asyncio.Lock 跨事件循环崩溃
+  现象：RuntimeError: Lock is bound to a different event loop
+  根因：上下文在 __init__ 创建 asyncio.Lock，Listener 重连后 loop 已切换
+  修复：懒加载锁；记录 _lock_loop；loop 变化时重建；
+        双重检查 + threading.Lock 防止并发首次初始化生成多把锁。
+
+- [严重] Token 统计改为滚动过去 24 小时
+  旧实现按自然日清零，跨日/重启语义不清晰，且易丢窗口数据。
+  现以 detailed_stats 时间戳为唯一真相源：
+  - 自动裁掉 24h 外明细
+  - 聚合值（全局/用户/群/会话）从窗口重建
+  - 持久化格式 version=2，重启不丢
+  - 取消每会话 500 条硬上限，避免高频群少算
+  - 读取/保存路径强制 prune，避免 total 漂移
+  命令文案明确区分：
+  - 本次对话累计 = 会话生命周期
+  - 全局/群/用户 = 过去 24 小时
+
+- [严重] 统一 LLM 双配置体系
+  llm_providers + llm_rotation 成为运行时唯一来源；
+  llm_endpoints 仅作兼容缓存/旧配置回退。
+  main 与 webui 统一走 bot.llm_config：
+  - 旧 endpoints 自动合并为 providers
+  - 禁用模型不进入轮换
+  - providers 优先于 stale endpoints
+  - 热刷新入口统一，减少双实现漂移
+
+- [中] WebUI 保存 provider 放宽自由度
+  空白模型占位行不再拦截保存，自动忽略；
+  完全空白渠道自动移除；
+  有实际配置时才要求渠道 ID；
+  重复模型名/渠道 ID 仍拦截。
+
+- [中] 修复 API Key 占位符误杀
+  旧逻辑用 "api_key" 子串匹配，可能误丢真实 key。
+  现改为精确匹配 + 明确占位文案；
+  “请输入”仅在占位提示形态时拦截。
+
+- [中] 修复重复渠道 ID 静默覆盖
+  运行时只保留第一个同名渠道并打印警告，
+  避免后写覆盖前写导致模型轮换异常。
+
+- [中] ChatMemoryManager 独立可用
+  初始化时自动创建 data/ai_memory 目录，
+  避免脱离 main 启动流程时保存失败。
+
+- [优化] WebUI 统计环形图中心透明
+  深/浅色主题下中心数值可读；
+  中心挖空透出卡片真实背景，不再写死深色底。
+
+- [优化] 新增固定回归脚本
+  python tools/audit_refactor.py
+  覆盖：模块拆分完整性、24h Token、并发写入、
+        跨 loop 锁、LLM legacy 兼容、空白模型保存、
+        donut 透明中心等，当前 63/63 通过。
+
+- [自检] main/webui/bot/webui_core 编译通过；
+  tools/audit_refactor.py 全量通过；
+  app.js 语法检查通过。
