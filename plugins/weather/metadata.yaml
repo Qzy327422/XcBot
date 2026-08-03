@@ -1,0 +1,6 @@
+name: weather
+version: 1.0.0
+description: 天气查询（/天气 [城市]），数据源 open-meteo，无需 API Key
+author: XcBot
+entry: setup.py
+min_xcbot_version: v2.4

@@ -1,0 +1,6 @@
+name: image_search
+version: 1.0.0
+description: 生图/搜图（/生图 [搜索词]），图源 lolicon + yuanxiapi，18 秒个人冷却
+author: XcBot
+entry: setup.py
+min_xcbot_version: v2.4
