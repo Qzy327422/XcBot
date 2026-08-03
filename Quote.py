@@ -1,0 +1,194 @@
+from Hyper import Segments
+from Hyper.Events import gen_message
+from PIL import Image, ImageDraw, ImageFont
+import os
+import uuid
+import asyncio
+import urllib.parse
+from io import BytesIO
+from pathlib import Path
+import httpx
+import emoji as emoji_lib
+
+# 基于源码目录，避免从非项目 cwd 启动时找不到 assets/temps
+_QUOTE_ROOT = Path(__file__).resolve().parent
+TEMP_DIR = str(_QUOTE_ROOT / "temps")
+ASSETS_DIR = _QUOTE_ROOT / "assets"
+SPECIAL_MASK_UIDS = {1348472639}
+
+
+async def fetch_image_bytes(url: str) -> bytes:
+    allowed_schemes = {"http", "https"}
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        raise ValueError("无效的图片 URL")
+    if parsed.scheme not in allowed_schemes:
+        raise ValueError("仅支持 http/https 图片链接")
+    host = (parsed.hostname or "").strip()
+    if not host:
+        raise ValueError("无效的图片 URL")
+    if host.lower() in {"localhost", "ip6-localhost", "ip6-loopback"}:
+        raise ValueError("禁止访问本地地址")
+    # 主机名要先解析成 IP 再判断：只对字面量 IP 做检查的话，
+    # 一个解析到 127.0.0.1 的域名照样能过。所有解析结果都必须干净。
+    import ipaddress
+    import socket
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as e:
+        raise ValueError(f"主机名无法解析：{e}")
+    for info in infos:
+        ip = info[4][0]
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            raise ValueError("禁止访问无法识别的地址")
+        mapped = getattr(addr, "ipv4_mapped", None)
+        if mapped is not None:
+            addr = mapped
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            raise ValueError(f"禁止访问内网地址（{ip}）")
+
+    max_bytes = 8 * 1024 * 1024
+    # 必须用 stream：client.get 会先把整个响应体读进内存，
+    # 之后再数字节数已经太晚了——超大响应在计数前就已经吃掉内存。
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        async with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            declared = resp.headers.get("Content-Length")
+            if declared and declared.isdigit() and int(declared) > max_bytes:
+                raise ValueError("图片过大（超过 8MB）")
+            chunks = []
+            size = 0
+            async for chunk in resp.aiter_bytes():
+                size += len(chunk)
+                if size > max_bytes:
+                    raise ValueError("图片过大（超过 8MB）")
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+
+async def open_image_from_url(url: str) -> Image.Image:
+    data = await fetch_image_bytes(url)
+    return Image.open(BytesIO(data))
+
+
+def square_scale(image: Image.Image, height: int) -> Image.Image:
+    old_width, old_height = image.size
+    if old_height <= 0:
+        return image
+    ratio = height / old_height
+    width = max(1, int(old_width * ratio))
+    return image.resize((width, height))
+
+
+def _is_emoji_char(char: str) -> bool:
+    if not char:
+        return False
+    if char in emoji_lib.EMOJI_DATA:
+        return True
+    code = ord(char)
+    emoji_ranges = (
+        (0x1F300, 0x1F5FF),
+        (0x1F600, 0x1F64F),
+        (0x1F680, 0x1F6FF),
+        (0x1F700, 0x1F77F),
+        (0x1F900, 0x1F9FF),
+        (0x1FA70, 0x1FAFF),
+        (0x2600, 0x26FF),
+        (0x2700, 0x27BF),
+    )
+    return any(lo <= code <= hi for lo, hi in emoji_ranges)
+
+
+def _select_font(char, fonts):
+    if char.isdigit() or char == '.':
+        return fonts["digit"], (255, 0, 0)
+    if _is_emoji_char(char):
+        return fonts["emoji"], (255, 255, 255)
+    return fonts["title"], (255, 255, 255)
+
+
+def _render_to_file(quote, head_img, name, uin, out_path):
+    mask_name = "maskrbc.png" if uin in SPECIAL_MASK_UIDS else "mask.png"
+    mask_path = ASSETS_DIR / "quote" / mask_name
+
+    mask = Image.open(mask_path).convert("RGBA")
+    background = Image.new('RGBA', mask.size, (255, 255, 255, 255))
+    head = head_img.convert("RGBA")
+
+    fonts = {
+        "title": ImageFont.truetype(str(ASSETS_DIR / "t.ttf"), size=36),
+        "desc": ImageFont.truetype(str(ASSETS_DIR / "n.ttf"), size=30),
+        "digit": ImageFont.truetype(str(ASSETS_DIR / "sz.ttf"), size=36),
+        "emoji": ImageFont.truetype(str(ASSETS_DIR / "e.ttf"), size=36),
+    }
+
+    background.paste(square_scale(head, 640), (0, 0))
+    background.paste(mask, (0, 0), mask)
+
+    draw = ImageDraw.Draw(background)
+
+    text_left = 640
+    text_right = mask.size[0] - 20
+    available_width = max(100, text_right - text_left)
+
+    x_offset = text_left
+    y_offset = 165
+    line_height = 40
+
+    for char in quote:
+        if char in ("\n", "\r"):
+            x_offset = text_left
+            y_offset += line_height
+            continue
+
+        font, fill_color = _select_font(char, fonts)
+        try:
+            char_width = font.getlength(char)
+        except Exception:
+            char_width = font.size
+
+        if x_offset + char_width > text_left + available_width:
+            x_offset = text_left
+            y_offset += line_height
+
+        draw.text((x_offset, y_offset), char, font=font, fill=fill_color)
+        x_offset += char_width
+
+    name_x = 862 if len(name) >= 7 else 1000
+    draw.text((name_x, 465), f"——{name}", font=fonts["desc"], fill=(112, 112, 112))
+
+    nbg = Image.new('RGB', mask.size, (0, 0, 0))
+    nbg.paste(background, (0, 0))
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    nbg.save(out_path)
+
+
+async def get_image(quote, ava_url, name, uin, out_path):
+    head_img = await open_image_from_url(ava_url)
+    await asyncio.to_thread(_render_to_file, quote, head_img, name, uin, out_path)
+
+
+async def handle(message, actions, images=None):
+    if not message or not isinstance(message[0], Segments.Reply):
+        return None
+
+    msg_id = message[0].id
+    content = await actions.get_msg(msg_id)
+    sender = content.data["sender"]
+    name = sender.get("card") or sender.get("nickname") or str(sender.get("user_id", ""))
+    uin = sender["user_id"]
+
+    raw_message = content.data["message"]
+    message_obj = gen_message({"message": raw_message})
+    text = str(message_obj).replace("[图片]", "")
+
+    ava_url = images if images else f"http://q2.qlogo.cn/headimg_dl?dst_uin={uin}&spec=640"
+
+    out_path = os.path.join(TEMP_DIR, f"quote_{uuid.uuid4().hex}.png")
+    await get_image(text, ava_url, name, uin, out_path)
+
+    return Segments.Image(f"file://{os.path.abspath(out_path)}")
