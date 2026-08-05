@@ -1,0 +1,27 @@
+asyncio
+datetime
+emoji
+openai>=1.35.12
+requests
+aiohttp
+psutil
+pillow
+google-generativeai==0.7.2
+httpx
+hyper-bot==0.78.2
+flask
+flask-sock
+websocket-client
+paramiko>=3.5.1
+edge_tts
+pyGithub
+pynvml
+flask-cors
+flask-socketio
+playwright
+pymysql
+cryptography
+pycryptodome
+GPUtil
+# Agent 的 MCP 客户端依赖。不装也能用，只是 WebUI 的 MCP 功能会提示未安装。
+mcp>=1.2.0

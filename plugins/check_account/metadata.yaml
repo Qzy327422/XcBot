@@ -1,0 +1,6 @@
+name: check_account
+version: 1.0.0
+description: QQ 资料查询（/开 [QQ号]），支持群聊与私聊，通过 OneBot WebSocket 取资料
+author: XcBot
+entry: setup.py
+min_xcbot_version: v2.4
