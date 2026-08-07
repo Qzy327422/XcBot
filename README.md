@@ -2,7 +2,6 @@
   <img src="https://img.shields.io/badge/Python-3.12+-blue?logo=python&logoColor=white" alt="Python Version">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
   <img src="https://img.shields.io/badge/Framework-Hyper-red" alt="Framework">
-  <img src="https://img.shields.io/badge/QQ_Group-1009790417-12B7F5?logo=tencentqq&logoColor=white" alt="QQ Group">
 </p>
 
 
@@ -15,7 +14,6 @@ XcBot 是一款基于 NapCat + OneBot + hyper-bot 的 QQ 机器人。除了 AI �
 AI 会自己判断要不要联网搜索、调用插件、操作 QQ、读写文件、执行代码，
 不需要用户先记住命令。
 
-**官方 QQ 群：** 1009790417
 
 ## 核心特性
 
