@@ -302,6 +302,26 @@ class AgentContext:
                 pass
 
 
+async def _emit_user_progress(ctx: AgentContext, content: str) -> None:
+    """把模型在工具调用前写出的说明交给当前对话渠道。"""
+    text = str(content or "").strip()
+    if not text:
+        return
+    delivered = ctx.extra.setdefault("user_progress_messages", [])
+    if text in delivered:
+        return
+    delivered.append(text)
+    callback = ctx.extra.get("progress_callback")
+    if not callable(callback):
+        return
+    try:
+        outcome = callback(text)
+        if hasattr(outcome, "__await__"):
+            await outcome
+    except Exception as e:
+        ctx.say(f"发送 Agent 工具前说明失败：{e}", "AGENT")
+
+
 class ToolRegistry:
     """全局工具注册表。单一注册表 + 单一权限模型，不区分内置与插件工具。
 
@@ -1015,6 +1035,7 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
             # 已经拔掉 tools 了还在要求调用工具，说明模型不配合，直接用它的文本
             return content, usages, tool_calls_done
 
+        await _emit_user_progress(ctx, content)
         ctx.say(f"第 {round_index + 1} 轮请求 {len(raw_calls)} 个工具: "
                 f"{[getattr(c.function, 'name', '?') for c in raw_calls]}", "AGENT")
 

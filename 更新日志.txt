@@ -1,6 +1,9 @@
 v3.4
 - 完整更新日志已迁移到 CHANGELOG.md。
 - 本版本包括 Agent 工具链持久化、Follow-Up/中断/并发修复、Trace JSON+SQLite 存储、WebUI Agent 聊天室、OneBot Token 和 README 徽章。
+- [WebUI 聊天室] 用户消息改为纯文本逐行渲染，保留手动换行，不再被 Markdown 段落合并。
+- [Agent] 模型在调用工具前返回的说明文字会先发送给 QQ 用户；WebUI 聊天室同步显示并保存为独立助手消息。
+- [WebUI 聊天室] Agent 调用改为支持 token 级流式：参考 AstrBot 使用 OpenAI SDK 的 ChatCompletionStreamState 聚合增量 tool_calls 参数，文本 delta 实时推送到页面；关闭流式时仍会显示工具前进度消息。
 - 专项 Agent 历史设计记录见 CHANGELOG_agent_history_persistence.md。
 - OneBot/NapCat 真实认证参数名和 WebSocket Path 仍需以实际服务器握手结果为准。
 

@@ -822,18 +822,52 @@ def _chatroom_prepare_user_message(session_id: str, model: str, text: str, attac
     return obj, text
 
 
+def _chatroom_progress_messages(agent_state: Optional[Dict[str, Any]]) -> list[str]:
+    """收集本轮 Agent 调工具前的助手说明，兼容 SSE 事件未及时到达。"""
+    if not isinstance(agent_state, dict):
+        return []
+    messages = []
+    for text in agent_state.get("progress_messages") or []:
+        text = str(text or "").strip()
+        if text and text not in messages:
+            messages.append(text)
+
+    # progress 回调仅用于即时显示；真正可靠的来源是本轮保留下来的工具链。
+    # 只查看最后一条用户消息之后，避免重新显示旧对话中的工具前说明。
+    history = agent_state.get("history")
+    if isinstance(history, list):
+        last_user = max((
+            index for index, item in enumerate(history)
+            if isinstance(item, dict) and item.get("role") == "user"
+        ), default=-1)
+        for item in history[last_user + 1:]:
+            if not isinstance(item, dict) or item.get("role") != "assistant" or not item.get("tool_calls"):
+                continue
+            text = str(item.get("content") or "").strip()
+            if text and text not in messages:
+                messages.append(text)
+    return messages
+
+
 def _chatroom_append_assistant(obj: Dict[str, Any], reply: str,
-                               agent_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                               agent_state: Optional[Dict[str, Any]] = None,
+                               progress_messages: Optional[list[str]] = None) -> Dict[str, Any]:
     with _chatroom_lock:
         fresh = _chatroom_load(obj.get("id", "")) or obj
+        request_id = next((
+            m.get("request_id") for m in reversed(fresh.get("messages", []))
+            if m.get("role") == "user" and m.get("request_id")
+        ), "")
+        for content in progress_messages or []:
+            content = str(content or "").strip()
+            if content:
+                fresh.setdefault("messages", []).append({
+                    "role": "assistant", "content": content, "ts": int(time.time()),
+                    "request_id": request_id,
+                })
         fresh.setdefault("messages", []).append({
-            "role": "assistant",
-            "content": reply,
-            "ts": int(time.time()),
-            "request_id": next((
-                m.get("request_id") for m in reversed(fresh["messages"])
-                if m.get("role") == "user" and m.get("request_id")
-            ), ""),
+            "role": "assistant", "content": reply, "ts": int(time.time()),
+            "request_id": request_id,
         })
         if isinstance(agent_state, dict):
             history = agent_state.get("history")
@@ -898,7 +932,10 @@ def _chatroom_send(session_id: str, model: str, text: str,
             # 否则下一次请求会把一条永远没有 assistant 的消息带进上下文。
             _chatroom_remove_pending_user(session_id, request_id)
             raise
-        obj = _chatroom_append_assistant(obj, reply, agent_state=agent_state)
+        obj = _chatroom_append_assistant(
+            obj, reply, agent_state=agent_state,
+            progress_messages=_chatroom_progress_messages(agent_state),
+        )
         return {"reply": reply, "session": _chatroom_public(obj)}
 
 def normalize_string_list(values: Any) -> list[str]:
@@ -3644,6 +3681,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 model = str(payload.get("model", "") or "")
                 text = str(payload.get("text", "") or "")
                 attachments = payload.get("attachments") if isinstance(payload.get("attachments"), list) else []
+                stream_reply = bool(payload.get("stream", True))
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
@@ -3664,6 +3702,14 @@ class WebUIHandler(BaseHTTPRequestHandler):
                             reply_parts.append(hint)
                             _sse("delta", {"text": hint})
                         elif callable(_chatroom_agent_callback):
+                            progress_messages = []
+
+                            def _emit_progress(progress: str):
+                                progress = str(progress or "").strip()
+                                if progress:
+                                    progress_messages.append(progress)
+                                    _sse("progress", {"text": progress})
+
                             result = _chatroom_agent_callback({
                                 "id": sid,
                                 "model": obj.get("model") or model,
@@ -3673,6 +3719,9 @@ class WebUIHandler(BaseHTTPRequestHandler):
                                 "total_tokens": obj.get("_agent_total_tokens") or 0,
                                 "total_calls": obj.get("_agent_total_calls") or 0,
                                 "admin": bool(str(get_webui_config().get("access_token", "") or "").strip()),
+                                "stream": stream_reply,
+                                "progress_callback": _emit_progress,
+                                "stream_callback": lambda chunk: _sse("delta", {"text": str(chunk or "")}),
                             })
                             if not isinstance(result, dict):
                                 raise RuntimeError("聊天室 Agent 回调返回格式无效")
@@ -3680,11 +3729,17 @@ class WebUIHandler(BaseHTTPRequestHandler):
                             agent_state = result
                         else:
                             llm_messages = _chatroom_build_llm_messages(obj, obj.get("model") or model)
-                            for part in _chatroom_stream_complete(obj.get("model") or model, llm_messages):
-                                reply_parts.append(part)
-                                _sse("delta", {"text": part})
+                            if stream_reply:
+                                for part in _chatroom_stream_complete(obj.get("model") or model, llm_messages):
+                                    reply_parts.append(part)
+                                    _sse("delta", {"text": part})
+                            else:
+                                reply = _chatroom_complete(obj.get("model") or model, llm_messages)
+                                reply_parts.append(reply)
+                                _sse("delta", {"text": reply})
                         fresh = _chatroom_append_assistant(
-                            obj, "".join(reply_parts), agent_state=agent_state
+                            obj, "".join(reply_parts), agent_state=agent_state,
+                            progress_messages=_chatroom_progress_messages(agent_state),
                         )
                         _sse("done", {"session": _chatroom_public(fresh)})
                 except (BrokenPipeError, ConnectionResetError):

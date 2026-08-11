@@ -5076,6 +5076,7 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
             # 权限降为普通用户），也不能张冠李戴。
             agent_meta = agent_meta if isinstance(agent_meta, dict) else {}
             preferred_model = str(agent_meta.get("preferred_model") or "").strip()
+            stream_callback = agent_meta.get("stream_callback")
             try:
                 if is_agent_enabled_for(self.context_type == "group", self.chat_id):
                     candidate = get_agent_settings()
@@ -5090,6 +5091,19 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                     forced_level = str(agent_meta.get("user_level") or "").strip()
                     if forced_level in ("user", "admin"):
                         agent_ctx.user_level = forced_level
+                    progress_callback = agent_meta.get("progress_callback")
+                    if callable(progress_callback):
+                        agent_ctx.extra["progress_callback"] = progress_callback
+                    elif agent_ctx.actions is not None and agent_ctx.event is not None:
+                        async def _send_agent_progress(text: str):
+                            await process_and_send(
+                                agent_ctx.actions,
+                                agent_ctx.event,
+                                filter_sensitive_content(text),
+                                is_group=agent_ctx.is_group,
+                                reply_to_first=False,
+                            )
+                        agent_ctx.extra["progress_callback"] = _send_agent_progress
                     # 工作区按会话隔离，只能在拿到 ctx 之后才知道具体路径
                     candidate.workspace = _agent_fs_tools.primary_root(agent_ctx)
                     # 该用户权限下一个工具都没开，就没必要走循环，省掉 tools 参数的 prompt 开销
@@ -5254,7 +5268,7 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
 
                     try:
                         async def _complete(msgs, tools):
-                            """单次 chat.completions 调用。tools 为 None 时与改动前完全一致。"""
+                            """单次 chat.completions 调用；聊天室可逐 token 转发文本增量。"""
                             kwargs = {
                                 "model": model,
                                 "messages": msgs,
@@ -5264,10 +5278,50 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                             if tools:
                                 kwargs["tools"] = tools
                                 kwargs["tool_choice"] = "auto"
-                            resp = await asyncio.wait_for(
-                                asyncio.to_thread(client.chat.completions.create, **kwargs),
-                                timeout=timeout_seconds,
-                            )
+
+                            if callable(stream_callback):
+                                def _stream_completion():
+                                    # 参考 AstrBot：SDK 状态机负责合并 tool_calls 的分片参数，
+                                    # 我们仅把可见文本 delta 立即交给 WebUI。
+                                    from openai.lib.streaming.chat._completions import ChatCompletionStreamState
+
+                                    stream_kwargs = dict(kwargs)
+                                    stream_kwargs["stream"] = True
+                                    stream = client.chat.completions.create(**stream_kwargs)
+                                    state = ChatCompletionStreamState()
+                                    for chunk in stream:
+                                        choice = chunk.choices[0] if getattr(chunk, "choices", None) else None
+                                        delta = getattr(choice, "delta", None) if choice else None
+                                        if delta is not None or getattr(chunk, "usage", None):
+                                            # 少数兼容接口漏掉 tool_call.index；SDK 需要它来合并分片。
+                                            for index, tool_call in enumerate(getattr(delta, "tool_calls", None) or []):
+                                                if getattr(tool_call, "index", None) is None:
+                                                    try:
+                                                        tool_call.index = index
+                                                    except Exception:
+                                                        pass
+                                            state.handle_chunk(chunk)
+
+                                        content = getattr(delta, "content", None) if delta else None
+                                        if isinstance(content, str) and content:
+                                            stream_callback(content)
+                                        elif isinstance(content, list):
+                                            text = "".join(
+                                                str(item.get("text", "") or "")
+                                                for item in content if isinstance(item, dict)
+                                            )
+                                            if text:
+                                                stream_callback(text)
+                                    return state.get_final_completion()
+
+                                resp = await asyncio.wait_for(
+                                    asyncio.to_thread(_stream_completion), timeout=timeout_seconds,
+                                )
+                            else:
+                                resp = await asyncio.wait_for(
+                                    asyncio.to_thread(client.chat.completions.create, **kwargs),
+                                    timeout=timeout_seconds,
+                                )
                             if resp is None:
                                 raise Exception("API 返回空响应")
                             if not getattr(resp, "choices", None):
@@ -8928,6 +8982,18 @@ def handle_webui_chatroom_agent(payload: dict) -> dict:
         and str(item.get("data") or "").startswith("data:image/")
     ]
     message = {"text": str(payload.get("text") or ""), "image_urls": image_urls}
+    progress_messages = []
+    downstream_progress = payload.get("progress_callback")
+    downstream_stream = payload.get("stream_callback") if bool(payload.get("stream", True)) else None
+
+    def _record_progress(text: str):
+        text = str(text or "").strip()
+        if not text or text in progress_messages:
+            return
+        progress_messages.append(text)
+        if callable(downstream_progress):
+            return downstream_progress(text)
+
     result, _, _, _ = asyncio.run(ctx.agen_content(
         message,
         agent_meta={
@@ -8937,10 +9003,13 @@ def handle_webui_chatroom_agent(payload: dict) -> dict:
             "disable_global_actions": True,
             "actions": None,
             "event": None,
+            "progress_callback": _record_progress,
+            "stream_callback": downstream_stream if callable(downstream_stream) else None,
         },
     ))
     return {
         "reply": result,
+        "progress_messages": progress_messages,
         "history": fix_messages(list(ctx.history)),
         "total_tokens": int(ctx.total_tokens or 0),
         "total_calls": int(ctx.total_calls or 0),
