@@ -1,3 +1,9 @@
+v3.4
+- 完整更新日志已迁移到 CHANGELOG.md。
+- 本版本包括 Agent 工具链持久化、Follow-Up/中断/并发修复、Trace JSON+SQLite 存储、WebUI Agent 聊天室、OneBot Token 和 README 徽章。
+- 专项 Agent 历史设计记录见 CHANGELOG_agent_history_persistence.md。
+- OneBot/NapCat 真实认证参数名和 WebSocket Path 仍需以实际服务器握手结果为准。
+
 v3.3
 - [群聊] 群聊上下文感知（移植 AstrBot group_icl，最小集）
   旁听群内普通消息到内存环形缓冲，触发 AI 时把「上次回复之后、当前触发之前」

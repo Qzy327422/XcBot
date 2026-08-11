@@ -1,13 +1,32 @@
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.12+-blue?logo=python&logoColor=white" alt="Python Version">
-  <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
-  <img src="https://img.shields.io/badge/Framework-Hyper-red" alt="Framework">
-</p>
+<div align="center">
 
+<img src="./assets/icon.jpg" width="104" height="104" alt="XcBot Logo" />
+
+# XcBot v3.4
+
+**具备自主工具调用、上下文记忆与可视化追踪能力的 QQ Bot**
+
+[![Python](https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![OneBot](https://img.shields.io/badge/OneBot-11-111827)](https://github.com/botuniverse/onebot-11)
+[![Framework](https://img.shields.io/badge/Framework-Hyper-EF4444)](https://pypi.org/project/hyper-bot/)
+[![Agent](https://img.shields.io/badge/Agent-Tool%20Calling-8B5CF6)](#agent-能力)
+[![Version](https://img.shields.io/badge/Version-v3.4-0EA5E9?logo=semanticrelease&logoColor=white)](https://github.com/Qzy327422/XcBot)
+[![GitHub Stars](https://img.shields.io/github/stars/Qzy327422/XcBot?style=flat&logo=github&label=Stars)](https://github.com/Qzy327422/XcBot/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/Qzy327422/XcBot?style=flat&logo=github&label=Forks)](https://github.com/Qzy327422/XcBot/network/members)
+[![GitHub Issues](https://img.shields.io/github/issues/Qzy327422/XcBot?logo=github&label=Issues)](https://github.com/Qzy327422/XcBot/issues)
+[![Repo Size](https://img.shields.io/github/repo-size/Qzy327422/XcBot?logo=github&label=Repo%20Size)](https://github.com/Qzy327422/XcBot)
+[![Last Commit](https://img.shields.io/github/last-commit/Qzy327422/XcBot?logo=github&label=Last%20Commit)](https://github.com/Qzy327422/XcBot/commits)
+
+[项目主页](https://qzy327422.github.io/XcBot/) ·
+[快速开始](#快速开始) ·
+[Agent 能力](#agent-能力) ·
+[插件开发](./插件开发指南.md) ·
+[更新日志](./更新日志.txt) ·
+[问题反馈](https://github.com/Qzy327422/XcBot/issues)
+
+</div>
 
 <img src="https://picui.ogmua.cn/s1/2026/08/03/6a70b19af2774.webp" alt="XcBot WebUI" />
-
-# XcBot
 
 XcBot 是一款基于 NapCat + OneBot + hyper-bot 的 QQ 机器人。除了 AI 对话、
 多模型切换、WebUI 管理和插件热加载之外，v3.0 起内置了 **Agent 能力**——

@@ -10,6 +10,7 @@ from typing import Dict
 
 from bot.io_json import atomic_write_json
 from bot.paths import BASE_DIR
+from bot.rounds import fix_messages
 
 
 class ChatMemoryManager:
@@ -49,13 +50,13 @@ class ChatMemoryManager:
         """保存私聊记忆"""
         try:
             file_path = self._get_private_filename(user_id)
-            clean_history = [msg for msg in history if msg.get("role") in ["user", "assistant"]]
+            clean_history = [msg for msg in history if msg.get("role") in ["user", "assistant", "tool"]]
             data = {
                 "user_id": user_id,
                 "history": clean_history,
                 "token_counter": token_counter,
                 "save_time": time.time(),
-                "version": "2.1",
+                "version": "2.2",
             }
             with self._file_lock(file_path):
                 # 拿到文件锁之后再确认一次「这份数据还该写吗」。
@@ -78,7 +79,8 @@ class ChatMemoryManager:
                 with open(file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
             history = data.get("history", [])
-            history = [msg for msg in history if msg.get("role") in ["user", "assistant"]]
+            history = [msg for msg in history if msg.get("role") in ["user", "assistant", "tool"]]
+            history = fix_messages(history)
             token_counter = data.get("token_counter", 0)
             return history, token_counter
         except Exception:
@@ -90,14 +92,14 @@ class ChatMemoryManager:
         """保存群聊记忆"""
         try:
             file_path = self._get_group_filename(group_id)
-            clean_history = [msg for msg in history if msg.get("role") in ["user", "assistant"]]
+            clean_history = [msg for msg in history if msg.get("role") in ["user", "assistant", "tool"]]
             data = {
                 "group_id": group_id,
                 "history": clean_history,
                 "token_counter": token_counter,
                 "group_roles": group_roles or {},
                 "save_time": time.time(),
-                "version": "2.1",
+                "version": "2.2",
             }
             with self._file_lock(file_path):
                 if callable(should_write) and not should_write():
@@ -117,7 +119,8 @@ class ChatMemoryManager:
                 with open(file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
             history = data.get("history", [])
-            history = [msg for msg in history if msg.get("role") in ["user", "assistant"]]
+            history = [msg for msg in history if msg.get("role") in ["user", "assistant", "tool"]]
+            history = fix_messages(history)
             token_counter = data.get("token_counter", 0)
             group_roles = data.get("group_roles", {})
             return history, token_counter, group_roles

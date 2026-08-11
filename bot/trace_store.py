@@ -1,27 +1,26 @@
 # -*- coding: utf-8 -*-
-"""AI 对话追踪记录（JSON 持久化，固定条数环形缓冲）。
+"""AI 对话追踪记录（JSON 摘要索引 + SQLite 详情，固定条数环形缓冲）。
 
 只记录 AI 对话的调用链路，用于在 WebUI 追踪页排查：
 消息发送链路、模型调用链路（含失败重试）、当次系统提示词、
 Agent 工具调用历史（工具名/参数/结果）、单条 token 统计。
 
-体积控制思路（照 AstrBot 的轻量化设计）：
-- 只有一个维度：记录条数上限（默认 100 条，WebUI 可调）。超出即丢最旧的。
-  不再有 24 小时窗口，也不再有去重池字节预算——那两个维度需要频繁全量扫描
-  才能维护，是低配机上的 CPU 大头，而条数上限本身已经足够控制体积。
-- 正文直接内联存在记录里，不走内容哈希去重池。去重省下的空间远不值得每次
-  写入都做哈希 + 每次淘汰都做全量引用扫描（O(记录数 × 每条引用数)）。
-- 每类文本各有截断上限，超出即截断，单条记录的体积因此是有界的。
+体积与内存控制：
+- 记录条数上限默认 100 条，WebUI 可调，超出即淘汰最旧记录。
+- 内存只常驻列表摘要；完整详情暂存在待写队列，后台批量写入单个 SQLite 文件。
+- JSON 只保存 WebUI 列表所需的摘要，详情页按 trace id 从 SQLite 读取全文。
+- 每类文本仍有截断上限，单条记录的磁盘体积有明确上界。
 
 隐私说明：这里**会**持久化对话原文——系统提示词、用户消息、模型回复、上下文
 历史和工具调用参数/结果都能在追踪页完整查看。默认关闭；开启后 data/ 目录下的
-追踪文件包含聊天内容，分享日志或备份前请注意。
+追踪 JSON 与 SQLite 文件包含聊天内容，分享日志或备份前请注意。
 """
 from __future__ import annotations
 
 import atexit
 import copy
 import json
+import sqlite3
 import threading
 import time
 import uuid
@@ -77,13 +76,18 @@ class TraceStore:
     LIMIT_MAX_RECORDS = 1000
     # 单条记录最多保留的重试链路条数
     MAX_ATTEMPTS = 20
+    # 新增详情达到此数量时提前唤醒后台线程，限制 30 秒窗口内的内存峰值。
+    PENDING_FLUSH_THRESHOLD = 20
+    # v4 起：JSON 仅存列表摘要，完整详情放单个 SQLite 文件。
+    # 相比每条一个 JSON 文件，SQLite 可在一次事务中批量写入，避免大量 fsync/小文件。
+    DETAIL_DB_SUFFIX = "_details.sqlite3"
 
     SYSTEM_PROMPT_MAX = 6000
     TEXT_MAX = 4000
     ERROR_MAX = 400
     PREVIEW_MAX = 80
     # 历史条目：条数与单条长度都比当前消息收得更紧。
-    # 取消去重池后正文内联存储，历史是最容易膨胀的部分（每条记录都带一份完整
+    # 详情改存 SQLite 后磁盘仍需控制单条体积；历史会让每条记录携带一份完整
     # 上下文），而排查时看历史只需要知道大概说了什么，不需要全文。
     HISTORY_ITEMS_MAX = 30
     HISTORY_TEXT_MAX = 1500
@@ -100,15 +104,27 @@ class TraceStore:
         self.path = Path(path) if path else self.SAVE_PATH
         # 默认关闭：避免升级后静默开始落盘用户对话内容
         self._enabled = False
+        self._max_records_explicit = max_records is not None
         self._max_records = self._clamp_max_records(max_records)
-        # deque(maxlen) 自动挤掉最旧的，不需要任何裁剪逻辑
+        # v4 起 records 只保存 WebUI 列表所需的摘要，完整正文进 SQLite。
         self.records: deque = deque(maxlen=self._max_records)
+        self.detail_db_path = self.path.with_name(self.path.stem + self.DETAIL_DB_SUFFIX)
+        # 30 秒后台 flush 前的新增/回填详情；落盘后立即清空，常驻内存不随总记录数增长。
+        self._pending_details: dict[str, dict] = {}
+        # 索引已淘汰、待从 SQLite 删除的记录 id。删除在索引成功写入之后执行，
+        # 崩溃时最多留下孤儿行，不会让索引指向已删除详情。
+        self._pending_deletes: set[str] = set()
         self.last_update = time.time()
         self._dirty = False
+        # 每次内存状态变更递增；用于识别磁盘提交期间发生的新修改。
+        self._state_version = 0
         self._last_save = 0.0
         self._lock = threading.RLock()
+        # 磁盘提交独立串行；提交期间不占状态锁，避免慢磁盘堵住 Agent 新 trace 写入。
+        self._save_lock = threading.Lock()
         self._flush_thread: Optional[threading.Thread] = None
         self._stop_flush = threading.Event()
+        self._flush_wakeup = threading.Event()
         self.load()
 
     @classmethod
@@ -134,9 +150,11 @@ class TraceStore:
         with self._lock:
             self._enabled = bool(value)
             self.last_update = time.time()
+            self._state_version += 1
             self._dirty = True
-            self._maybe_save_locked(force=True)
-            return self._enabled
+            enabled = self._enabled
+        self.save(force=True)
+        return enabled
 
     def set_max_records(self, value: Any) -> int:
         """调整条数上限。deque 换新的，超出部分自动丢最旧的。"""
@@ -144,12 +162,20 @@ class TraceStore:
         with self._lock:
             if new_max == self._max_records:
                 return self._max_records
+            old_ids = {str(r.get("id") or "") for r in self.records}
             self._max_records = new_max
             self.records = deque(self.records, maxlen=new_max)
+            kept_ids = {str(r.get("id") or "") for r in self.records}
+            for rid in old_ids - kept_ids:
+                if rid:
+                    self._pending_details.pop(rid, None)
+                    self._pending_deletes.add(rid)
             self.last_update = time.time()
+            self._state_version += 1
             self._dirty = True
-            self._maybe_save_locked(force=True)
-            return self._max_records
+            result = self._max_records
+        self.save(force=True)
+        return result
 
     # ==================== 写入 ====================
 
@@ -163,11 +189,29 @@ class TraceStore:
             return ""
         with self._lock:
             entry = self._sanitize_record(record)
-            # deque(maxlen) 满了会自动弹出最左侧（最旧）的，无需裁剪
-            self.records.append(entry)
+            rid = str(entry.get("id") or "")
+            # trace id 理论上唯一；若调用方重用，先移除旧摘要，避免一个 id 对应两行。
+            if rid:
+                self.records = deque(
+                    (item for item in self.records if str(item.get("id") or "") != rid),
+                    maxlen=self._max_records,
+                )
+            evicted_id = ""
+            if len(self.records) >= self._max_records and self.records:
+                evicted_id = str(self.records[0].get("id") or "")
+            self.records.append(self._summary(entry))
+            self._pending_details[rid] = entry
+            # 同一个 id 可能被调用方重用；新详情优先，不能再被旧的淘汰任务删除。
+            self._pending_deletes.discard(rid)
+            if evicted_id and evicted_id != rid:
+                self._pending_details.pop(evicted_id, None)
+                self._pending_deletes.add(evicted_id)
             self.last_update = time.time()
+            self._state_version += 1
             self._dirty = True
-            return str(entry.get("id") or "")
+            if len(self._pending_details) >= self.PENDING_FLUSH_THRESHOLD:
+                self._flush_wakeup.set()
+            return rid
 
     def attach_send(self, trace_id: str, parts: int, message_ids: Optional[list] = None) -> bool:
         """回填分段发送结果。记录已被窗口裁掉时返回 False。"""
@@ -175,21 +219,41 @@ class TraceStore:
         if not key:
             return False
         with self._lock:
-            for entry in reversed(self.records):
-                if entry.get("id") != key:
-                    continue
-                ids = []
-                for mid in (message_ids or [])[:20]:
-                    if mid is not None:
-                        ids.append(mid)
+            if not any(e.get("id") == key for e in reversed(self.records)):
+                return False
+            pending = self._pending_details.get(key)
+            entry = copy.deepcopy(pending) if pending is not None else None
+
+        # SQLite 读取不占状态锁，慢磁盘不会阻塞 add_record/list_records。
+        if entry is None:
+            entry = self._read_detail_db(key)
+
+        ids = [mid for mid in (message_ids or [])[:20] if mid is not None]
+        parts_value = max(0, int(parts or 0))
+        with self._lock:
+            summary = next((e for e in reversed(self.records) if e.get("id") == key), None)
+            if summary is None:
+                return False
+            # 读库期间若出现了更新，以内存中的最新版本为准。
+            current = self._pending_details.get(key)
+            if current is not None:
+                entry = copy.deepcopy(current)
+            if entry is not None:
                 entry["send"] = {
-                    "parts": max(0, int(parts or 0)),
+                    "parts": parts_value,
                     "message_ids": ids,
                     "time": time.time(),
                 }
-                self._dirty = True
-                return True
-            return False
+                # 用新对象替换，后台 save 可用对象身份判断旧快照是否仍是最新版。
+                self._pending_details[key] = entry
+                self._pending_deletes.discard(key)
+                if len(self._pending_details) >= self.PENDING_FLUSH_THRESHOLD:
+                    self._flush_wakeup.set()
+            # 详情损坏/缺失时仍更新列表摘要，但不拿摘要覆盖 SQLite 中的残存数据。
+            summary["send_parts"] = parts_value
+            self._state_version += 1
+            self._dirty = True
+            return True
 
     # ==================== 读取（供 WebUI） ====================
 
@@ -201,8 +265,8 @@ class TraceStore:
             except (TypeError, ValueError):
                 count = self._max_records
             count = max(1, min(count, self._max_records))
-            # deque 不支持负索引切片，转 list 再切
-            rows = [self._summary(e) for e in list(self.records)[-count:]]
+            # records 已是摘要；深拷贝避免调用方修改内部对象。
+            rows = [copy.deepcopy(e) for e in list(self.records)[-count:]]
             rows.reverse()  # 最新在前
             span_hours = 0.0
             if self.records:
@@ -218,15 +282,28 @@ class TraceStore:
             }
 
     def get_record(self, trace_id: str) -> Optional[dict]:
-        """返回完整记录。正文内联存储，直接深拷贝返回。"""
+        """返回完整记录。优先读尚未 flush 的内存详情，否则按 id 查询 SQLite。"""
         key = str(trace_id or "")
         if not key:
             return None
         with self._lock:
-            for entry in reversed(self.records):
-                if entry.get("id") == key:
-                    return copy.deepcopy(entry)
-            return None
+            summary = next((e for e in reversed(self.records) if e.get("id") == key), None)
+            if summary is None:
+                return None
+            pending = self._pending_details.get(key)
+            if pending is not None:
+                return copy.deepcopy(pending)
+            summary_copy = copy.deepcopy(summary)
+
+        # 详情页读库不占状态锁；读完再检查一次，避免返回并发回填前的旧版本。
+        full = self._read_detail_db(key)
+        with self._lock:
+            if not any(e.get("id") == key for e in reversed(self.records)):
+                return None
+            pending = self._pending_details.get(key)
+            if pending is not None:
+                return copy.deepcopy(pending)
+        return copy.deepcopy(full if full is not None else summary_copy)
 
     def stats(self) -> dict:
         with self._lock:
@@ -241,10 +318,15 @@ class TraceStore:
 
     def clear(self) -> None:
         with self._lock:
+            ids = {str(r.get("id") or "") for r in self.records}
+            ids.update(self._pending_details)
             self.records.clear()
+            self._pending_details.clear()
+            self._pending_deletes.update(rid for rid in ids if rid)
             self.last_update = time.time()
+            self._state_version += 1
             self._dirty = True
-            self._maybe_save_locked(force=True)
+        self.save(force=True)
 
     # ==================== 内部 ====================
 
@@ -485,11 +567,78 @@ class TraceStore:
 
     # ==================== 持久化 ====================
 
-    def load(self) -> bool:
-        """从 JSON 恢复。文件不存在或损坏时静默从零开始。
+    @staticmethod
+    def _is_full_record(record: dict) -> bool:
+        """判断 JSON 中的是旧版完整记录，而不是 v4 摘要。"""
+        return any(key in record for key in (
+            "system_prompt", "user_message", "reply", "history_overview",
+            "tool_calls", "attempts", "follow_ups",
+        ))
 
-        兼容旧版 v2 格式（带 texts 去重池 + *_ref 引用）：加载时把引用展开成内联
-        正文，之后就再也不需要那套机制了。
+    @staticmethod
+    def _ensure_detail_schema(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS trace_details ("
+            "id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at REAL NOT NULL)"
+        )
+
+    def _connect_detail_db(self) -> sqlite3.Connection:
+        self.detail_db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self.detail_db_path), timeout=5.0)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        self._ensure_detail_schema(conn)
+        return conn
+
+    def _write_details_db(self, details: dict[str, dict]) -> None:
+        if not details:
+            return
+        rows = [
+            (
+                str(trace_id),
+                json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+                time.time(),
+            )
+            for trace_id, record in details.items()
+            if trace_id
+        ]
+        if not rows:
+            return
+        with self._connect_detail_db() as conn:
+            conn.executemany(
+                "INSERT INTO trace_details(id, payload, updated_at) VALUES(?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "payload=excluded.payload, updated_at=excluded.updated_at",
+                rows,
+            )
+
+    def _delete_details_db(self, trace_ids: set[str]) -> None:
+        ids = [(str(trace_id),) for trace_id in trace_ids if trace_id]
+        if not ids or not self.detail_db_path.exists():
+            return
+        with self._connect_detail_db() as conn:
+            conn.executemany("DELETE FROM trace_details WHERE id = ?", ids)
+
+    def _read_detail_db(self, trace_id: str) -> Optional[dict]:
+        if not trace_id or not self.detail_db_path.exists():
+            return None
+        try:
+            with self._connect_detail_db() as conn:
+                row = conn.execute(
+                    "SELECT payload FROM trace_details WHERE id = ?", (trace_id,)
+                ).fetchone()
+            if not row:
+                return None
+            value = json.loads(row[0])
+            return value if isinstance(value, dict) else None
+        except Exception as e:
+            print(f"读取 AI 追踪详情失败（{trace_id}）: {e}")
+            return None
+
+    def load(self) -> bool:
+        """从 JSON 恢复摘要索引。文件不存在或损坏时静默从零开始。
+
+        兼容旧版 v2 格式（带 texts 去重池 + *_ref 引用），也兼容旧版 v3 的内联全文。
+        v3 全文会在下次保存时迁移进 SQLite。
         """
         try:
             if not self.path.exists() or self.path.stat().st_size <= 0:
@@ -508,23 +657,50 @@ class TraceStore:
                             if isinstance(legacy_texts, dict) else {})
             if legacy_texts:
                 raw_records = [self._migrate_v2_record(r, legacy_texts) for r in raw_records]
+            summaries: list[dict] = []
+            migrated_details: dict[str, dict] = {}
+            for raw_record in raw_records:
+                if self._is_full_record(raw_record):
+                    full = self._sanitize_record(raw_record)
+                    rid = str(full.get("id") or "")
+                    summaries.append(self._summary(full))
+                    if rid:
+                        migrated_details[rid] = full
+                else:
+                    summaries.append(dict(raw_record))
             try:
                 last_update = float(data.get("last_update") or time.time())
             except (TypeError, ValueError):
                 last_update = time.time()
             with self._lock:
                 self._enabled = enabled
-                # 文件里存过上限就沿用；构造时显式传了非默认值则以构造参数为准
-                if saved_max is not None and self._max_records == self.DEFAULT_MAX_RECORDS:
+                # 构造时未显式传上限才沿用文件值；显式传 100 也必须覆盖旧文件的 1000。
+                if saved_max is not None and not self._max_records_explicit:
                     self._max_records = self._clamp_max_records(saved_max)
-                self.records = deque(raw_records, maxlen=self._max_records)
+                self.records = deque(summaries, maxlen=self._max_records)
+                kept_ids = {str(r.get("id") or "") for r in self.records if r.get("id")}
+                self._pending_details = {
+                    rid: detail for rid, detail in migrated_details.items() if rid in kept_ids
+                }
+                # 清理上次崩溃留下的孤儿详情，也清理因新上限缩小而被裁掉的旧详情。
+                if self.detail_db_path.exists():
+                    try:
+                        with self._connect_detail_db() as conn:
+                            db_ids = {str(row[0]) for row in conn.execute("SELECT id FROM trace_details")}
+                        self._pending_deletes.update(db_ids - kept_ids)
+                    except Exception as e:
+                        print(f"检查 AI 追踪孤儿详情失败，将保留并稍后重试: {e}")
                 self.last_update = last_update
+                self._dirty = bool(self._pending_details or self._pending_deletes)
             return True
         except Exception as e:
             print(f"加载 AI 追踪记录失败，将从零开始: {e}")
             with self._lock:
                 self._enabled = False
                 self.records = deque(maxlen=self._max_records)
+                self._pending_details.clear()
+                self._pending_deletes.clear()
+                self._dirty = False
             return False
 
     def _migrate_v2_record(self, entry: dict, texts: dict) -> dict:
@@ -549,43 +725,67 @@ class TraceStore:
         return out
 
     def save(self, force: bool = True) -> bool:
-        with self._lock:
-            return self._maybe_save_locked(force=force)
+        """提交快照。磁盘 IO 不持有状态锁，新 trace 可并发进入内存队列。"""
+        with self._save_lock:
+            now = time.time()
+            with self._lock:
+                if not self._dirty and not force:
+                    return True
+                if not force and (now - self._last_save) < self.SAVE_INTERVAL_SECONDS:
+                    return True
+                snapshot_version = self._state_version
+                pending_details = dict(self._pending_details)
+                current_ids = {str(r.get("id") or "") for r in self.records}
+                pending_deletes = set(self._pending_deletes) - current_ids
+                payload = {
+                    "version": 4,
+                    "enabled": bool(self._enabled),
+                    "max_records": self._max_records,
+                    "records": copy.deepcopy(list(self.records)),
+                    "last_update": float(self.last_update or now),
+                }
 
-    def _maybe_save_locked(self, force: bool = False) -> bool:
-        """调用方需持有 self._lock。"""
-        if not self._dirty and not force:
+            try:
+                # 先保证索引将引用的详情已经存在。若随后写索引失败，重复 upsert 是安全的。
+                self._write_details_db(pending_details)
+                # 机器读的调试文件，不缩进：省约 10% 体积和序列化时间
+                atomic_write_json(self.path, payload)
+                # 索引成功落盘后再删淘汰详情；崩溃最多留下无害孤儿行。
+                self._delete_details_db(pending_deletes)
+            except Exception as e:
+                print(f"保存 AI 追踪记录失败: {e}")
+                return False
+
+            with self._lock:
+                # 只删除本次快照实际提交的版本；提交期间同 id 被更新时必须保留新值。
+                for trace_id, detail in pending_details.items():
+                    if self._pending_details.get(trace_id) is detail:
+                        self._pending_details.pop(trace_id, None)
+                self._pending_deletes.difference_update(pending_deletes)
+                live_ids = {str(r.get("id") or "") for r in self.records}
+                self._pending_deletes.difference_update(live_ids)
+                self._dirty = bool(
+                    self._state_version != snapshot_version
+                    or self._pending_details
+                    or self._pending_deletes
+                )
+                self._last_save = now
+                # 提交期间若来了新修改，立即安排下一批，不必再等完整时间窗。
+                if self._dirty:
+                    self._flush_wakeup.set()
             return True
-        now = time.time()
-        if not force and (now - self._last_save) < self.SAVE_INTERVAL_SECONDS:
-            return True
-        try:
-            payload = {
-                "version": 3,
-                "enabled": bool(self._enabled),
-                "max_records": self._max_records,
-                "records": list(self.records),
-                "last_update": float(self.last_update or now),
-            }
-            # 机器读的调试文件，不缩进：省约 10% 体积和序列化时间
-            atomic_write_json(self.path, payload)
-            self._dirty = False
-            self._last_save = now
-            return True
-        except Exception as e:
-            print(f"保存 AI 追踪记录失败: {e}")
-            return False
 
     def _flush_loop(self) -> None:
-        """后台落盘线程：把 fsync 从事件循环线程挪走。"""
-        while not self._stop_flush.wait(self.SAVE_INTERVAL_SECONDS):
+        """后台落盘线程：定时 flush，也支持积压过多时提前唤醒。"""
+        while not self._stop_flush.is_set():
+            self._flush_wakeup.wait(self.SAVE_INTERVAL_SECONDS)
+            self._flush_wakeup.clear()
+            if self._stop_flush.is_set():
+                break
             try:
-                with self._lock:
-                    if not self._dirty:
-                        continue
-                    self._maybe_save_locked(force=True)
-            except Exception:
-                pass
+                self.save(force=True)
+            except Exception as e:
+                print(f"AI 追踪后台落盘线程异常，将继续重试: {e}")
 
     def start_flush_thread(self) -> None:
         with self._lock:
@@ -597,6 +797,7 @@ class TraceStore:
 
     def stop_flush_thread(self) -> None:
         self._stop_flush.set()
+        self._flush_wakeup.set()
 
 
 def create_trace_store(path: Optional[Path] = None, register_atexit: bool = True,

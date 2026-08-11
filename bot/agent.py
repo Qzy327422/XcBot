@@ -14,9 +14,9 @@
 6. 工具结果过长时落盘到 overflow 文件，只回灌预览 + 文件路径，让模型自己决定
    要不要用 file_read 去读全文。
 
-与 AstrBot 的一处有意分歧：工具中间消息（assistant.tool_calls / role=tool）
-只存在于单次请求的局部 messages 里，不写入会话持久化历史。XcBot 的
-_build_messages 只认 user/assistant，落库会破坏既有的记忆压缩逻辑。
+与 AstrBot 一样，工具中间消息（assistant.tool_calls / role=tool）会在
+agent 循环成功结束后写入会话持久化历史；单次循环期间仍只操作局部 messages，
+由调用方在拿到最终回复后把完整工具链作为当前对话轮的一部分落盘。
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ import platform
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable
 
@@ -35,6 +36,14 @@ from typing import Any, Awaitable, Callable
 # Manage_User 统一成同一份名单），再造一档 root 只会给出虚假的安全感。
 LEVELS = ("user", "admin")
 _LEVEL_RANK = {"user": 0, "admin": 1}
+
+# ==================== 同步工具的执行线程池 ====================
+# 同步 handler 不能走 asyncio.to_thread：它用的是事件循环的默认
+# ThreadPoolExecutor（容量 min(32, cpu_count+4)）。而 wait_for 超时只取消
+# future、杀不掉已经在跑的线程——一个卡住的同步工具会永久占掉一个 worker。
+# 默认池同时还承载 LLM 请求、QQ 回执抓取等调用，被占满就是全局停摆。
+# 因此单独开池，把「工具卡住」的影响限制在工具执行上。
+_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=32, thread_name_prefix="agenttool")
 
 # MCP 工具动态注册，不进 AGENT_TOOL_META；开关与权限统一走 mcp_tools 这一项。
 MCP_PREFIX = "mcp__"
@@ -108,10 +117,30 @@ def has_active_session(session_id: str) -> bool:
         return session_id in _ACTIVE_SESSIONS
 
 
-def follow_up_session(session_id: str, text: str) -> bool:
+def session_user_level(session_id: str) -> str | None:
+    """取活跃会话持有者的权限等级。会话不存在时返回 None。
+
+    群聊 follow-up 是按群号匹配的，任何群成员的消息都可能落进别人的循环。
+    注入前必须比对等级，否则普通成员的话会以会话持有者（可能是管理员）的
+    白名单执行——白名单在循环开始时算一次就固定了，不会因注入者而收窄。
+    """
+    if not session_id:
+        return None
+    with _ACTIVE_SESSIONS_LOCK:
+        state = _ACTIVE_SESSIONS.get(session_id)
+        if state is None:
+            return None
+        return str(state.get("_owner_level") or "user")
+
+
+def follow_up_session(session_id: str, text: str,
+                      sender_level: str | None = None) -> bool:
     """向活跃的 Agent 会话注入一条 follow-up 消息。
 
-    返回是否成功注入。失败时（会话不存在或已结束）返回 False。
+    返回是否成功注入。失败时（会话不存在、已结束、或注入者权限低于会话
+    持有者）返回 False，调用方应回退到正常 AI 请求。
+
+    sender_level 为 None 表示跳过等级校验（私聊：会话持有者就是发送者本人）。
     """
     if not session_id or not text:
         return False
@@ -119,6 +148,10 @@ def follow_up_session(session_id: str, text: str) -> bool:
         state = _ACTIVE_SESSIONS.get(session_id)
         if state is None:
             return False
+        if sender_level is not None:
+            owner_level = str(state.get("_owner_level") or "user")
+            if _LEVEL_RANK.get(str(sender_level), 0) < _LEVEL_RANK.get(owner_level, 0):
+                return False
         seq = state.get("_follow_up_seq", 0)
         state["_follow_up_seq"] = seq + 1
         ticket = FollowUpTicket(seq=seq, text=text)
@@ -135,6 +168,11 @@ def _consume_follow_up_detail(state: dict) -> tuple[str, list[str]]:
     """消费队列中的 follow-up 消息。
 
     返回 (SYSTEM NOTICE 文本, 被消费的原始文本列表)。后者供追踪记录用。
+
+    同时把原文累加进 state["_delivered"]：这些话真正进了模型上下文，所以
+    应当写入会话历史。写历史不能由消息线程自己做——agen_content 全程持有
+    _history_lock，插话的线程抢不到，会一直阻塞到整个循环跑完。改由
+    agen_content 在释放锁之前统一写入。
     """
     state_lock = state.get("_lock")
     if state_lock:
@@ -149,6 +187,7 @@ def _consume_follow_up_detail(state: dict) -> tuple[str, list[str]]:
     for ticket in pending:
         ticket.consumed = True
     texts = [t.text for t in pending]
+    state.setdefault("_delivered", []).extend(texts)
     lines = "\n".join(f"{idx}. {t}" for idx, t in enumerate(texts, start=1))
     return FOLLOW_UP_NOTICE_TEMPLATE.format(follow_up_lines=lines), texts
 
@@ -555,13 +594,19 @@ async def _exec_one(spec: ToolSpec, args: dict, ctx: AgentContext,
             # 直接 await 的话它在事件循环线程里一口气跑完，wait_for 拿不到
             # 控制权，声明的超时和 /停止 全都失效——用户提交一个指数塔表达式
             # 或灾难性回溯正则就能把机器人卡死。
+            _loop = asyncio.get_running_loop()
             result = await asyncio.wait_for(
-                asyncio.to_thread(spec.handler_sync, args, ctx), timeout=timeout
+                _loop.run_in_executor(
+                    _TOOL_EXECUTOR, lambda: spec.handler_sync(args, ctx)
+                ),
+                timeout=timeout,
             )
         else:
             result = await asyncio.wait_for(spec.handler(args, ctx), timeout=timeout)
     except asyncio.TimeoutError:
         # 用 %g 而不是 %.0f：0.1 秒会被 .0f 显示成「0 秒」，看起来像配置坏了
+        # 同步工具超时后线程仍在后台跑（wait_for 杀不掉线程），只是结果被丢弃。
+        # 走专用池所以不会拖垮默认池，但该 worker 在函数返回前无法复用。
         return f"error: 工具 {spec.name} 执行超过 {timeout:g} 秒未返回，已放弃。"
     except Exception as e:
         return f"error: 工具 {spec.name} 执行失败：{type(e).__name__}: {e}"
@@ -733,7 +778,8 @@ class AgentSettings:
 
 async def run_tool_loop(complete, messages: list[dict], ctx: AgentContext,
                         settings: AgentSettings,
-                        abort: "threading.Event | None" = None) -> tuple[str, list[dict], int]:
+                        abort: "threading.Event | None" = None,
+                        session_id: str = "") -> tuple[str, list[dict], int]:
     """执行 ReAct 工具循环。对内部实现包一层 try/finally 保证追踪数据一定写回。
 
     内部有十来个退出点（正常收尾、中断、降级、超轮数、以及向外抛异常让上层换
@@ -742,11 +788,16 @@ async def run_tool_loop(complete, messages: list[dict], ctx: AgentContext,
 
     多次调用会累加：外层的 API Key 重试循环会把整个工具循环重跑一遍，
     追踪要看到每一次尝试，而不是被最后一次覆盖。
+
+    session_id 必须由调用方给出，且与它注册到中断表（AGENT_ABORTS）用的是
+    同一个值。这里不再自己拼——原先内部按 ctx 重算，会话对象走降级路径时
+    session_id 带 _fallback 后缀，两套 key 对不上，/停止 和 /reset 会静默失效。
+    留空时退回按 ctx 推导，只为兼容不关心中断的调用方。
     """
     # 本次调用的采集容器，由内部实现就地填充
     collected: dict = {"calls": [], "llm_attempts": 0, "follow_ups": []}
-    # 构造会话 ID，用于 Follow-Up 注册
-    _session_id = f"group_{ctx.group_id}" if ctx.is_group else f"private_{ctx.user_id}"
+    _session_id = str(session_id or "") or (
+        f"group_{ctx.group_id}" if ctx.is_group else f"private_{ctx.user_id}")
     # 内部实现把 follow_up_state 挂在这里，finally 里要取未送达的残留
     fu_holder: dict = {}
     try:
@@ -754,8 +805,18 @@ async def run_tool_loop(complete, messages: list[dict], ctx: AgentContext,
                                          collected, _session_id, fu_holder)
     finally:
         unregister_session(_session_id)
+        _fu_state = fu_holder.get("state") or {}
+        # 真正进过模型上下文的 follow-up 交给调用方写入会话历史。
+        # 只登记已送达的：入队但没赶上任何一轮的不能写，否则历史里会留下
+        # 一条没有对应回复、模型也从没见过的孤立 user 消息。
+        delivered = _fu_state.get("_delivered")
+        if delivered:
+            prev_delivered = ctx.extra.get("follow_ups_delivered")
+            if not isinstance(prev_delivered, list):
+                prev_delivered = []
+            ctx.extra["follow_ups_delivered"] = prev_delivered + list(delivered)
         # 循环结束时队列里还剩的 follow-up 没能送到模型，也要记进追踪
-        undelivered = (fu_holder.get("state") or {}).get("_undelivered")
+        undelivered = _fu_state.get("_undelivered")
         if undelivered:
             collected["follow_ups"].append({
                 "round": 0,
@@ -819,8 +880,16 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
     fired_side_effects: set[str] = set()
     # 已完成工具的结果摘要，用于模型失败时给用户一个降级回答
     tool_digest: list[tuple[str, str]] = []
-    # Follow-Up 状态
-    follow_up_state = {"_pending_follow_ups": [], "_follow_up_seq": 0, "_lock": threading.Lock()}
+    # Follow-Up 状态。_owner_level 是发起这次循环的用户等级，供注入前比对：
+    # 本轮白名单（上面的 allowed）按它算出来后就固定了，注入者权限更低时
+    # 不能让它的指令借这份白名单执行。
+    follow_up_state = {
+        "_pending_follow_ups": [],
+        "_follow_up_seq": 0,
+        "_lock": threading.Lock(),
+        "_owner_level": str(ctx.user_level or "user"),
+        "_delivered": [],
+    }
     # Follow-Up 注入明细，供追踪页展示「哪一轮插了什么话」。
     # 用 collected 里的同一个列表，异常路径退出时外层 finally 也能拿到。
     follow_ups_trace: list[dict] = collected["follow_ups"]

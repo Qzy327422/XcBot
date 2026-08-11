@@ -21,6 +21,8 @@
         "_comment_listener_port": "监听端口。",
         "retries": 5,
         "_comment_retries": "连接失败后的重试次数。",
+        "access_token": "",
+        "_comment_access_token": "OneBot / NapCat WebSocket Token；protocol=OneBot 时使用，留空表示不发送。",
         "satori_token": "",
         "_comment_satori_token": "Satori Token，不用就留空。"
     },
@@ -30,7 +32,7 @@
     "_comment_protocol": "协议类型，默认 OneBot。",
     "Others": {
         "project_name": "XcBot",
-        "version_name": "v3.3",
+        "version_name": "v3.4",
         "slogan": "✨ 忻城 ✨",
         "robot_name_triggers": [
             "忻城"

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Runtime / generated data
+config.json
+*.log
+logs/
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.jsonl
+.trace_store.py.bak*
+trace_store.db*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Backups / temp
+*.bak
+*.tmp
+*.orig

@@ -342,6 +342,37 @@ class SiliconFlowKeyManager:
                     return self._result_tuple(item)
             return None
 
+    def get_preferred_for_request(self, preferred_model: str, tried_keys: set[str] = None,
+                                  include_cooldown: bool = True,
+                                  require_multimodal: bool = False) -> Optional[Tuple[str, str, str, bool, int, str]]:
+        """优先从指定模型取一个可用 Key，不改变全局默认轮换起点。"""
+        preferred_model = str(preferred_model or "").strip()
+        if not preferred_model:
+            return self.get_next_for_request(
+                tried_keys=tried_keys,
+                include_cooldown=include_cooldown,
+                require_multimodal=require_multimodal,
+            )
+        with self._lock:
+            tried_keys = tried_keys or set()
+            for slot in self.model_slots:
+                if preferred_model not in {slot.get("model"), slot.get("display_model")}:
+                    continue
+                idx = self._pick_from_slot(slot, tried_keys, include_cooldown, require_multimodal)
+                if idx is None and require_multimodal:
+                    idx = self._pick_from_slot(slot, tried_keys, include_cooldown, False)
+                if idx is not None:
+                    item = self.key_list[idx]
+                    item["last_used_at"] = self._now()
+                    self.last_selected_index = idx
+                    return self._result_tuple(item)
+                break
+        return self.get_next_for_request(
+            tried_keys=tried_keys,
+            include_cooldown=include_cooldown,
+            require_multimodal=require_multimodal,
+        )
+
     def get_next_for_request(self, tried_keys: set[str] = None, include_cooldown: bool = True,
                              require_multimodal: bool = False) -> Optional[Tuple[str, str, str, bool, int, str]]:
         with self._lock:

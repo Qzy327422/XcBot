@@ -26,9 +26,11 @@ import threading
 import platform
 import psutil
 import logging
+import hashlib
 # ponytail: GPUtil 只在 get_system_resource_info 里用一次，改为懒加载
 from typing import Set, Dict, Optional
 from collections import defaultdict, deque, Counter, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
 from datetime import date
 import atexit
@@ -104,10 +106,18 @@ def global_exception_handler(exc_type, exc_value, exc_traceback):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
 
-    logger.critical(
-        "未捕获的异常",
-        exc_info=(exc_type, exc_value, exc_traceback)
-    )
+    # 不能直接用 logger：模块下方（main.py:1093）会把它重新绑定成
+    # Hyper.Logger.Logger，那个对象只有 log/set_level，没有 critical。
+    # 之前这里调 logger.critical 会让异常处理器自己抛 AttributeError，
+    # 结果是任何未捕获异常都丢失堆栈，error.log 里什么都没有。
+    _crit = getattr(logger, "critical", None)
+    if callable(_crit):
+        _crit("未捕获的异常", exc_info=(exc_type, exc_value, exc_traceback))
+    else:
+        logging.getLogger("XcBot").critical(
+            "未捕获的异常",
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
     print(f"\n❌ 程序遇到严重错误，详情已记录到 {LOG_DIR / 'error.log'}")
     print(f"错误类型: {exc_type.__name__}")
     print(f"错误信息: {exc_value}")
@@ -170,6 +180,10 @@ try:
     from webui import set_debug_self_message_callback as _set_debug_self_message_callback
 except Exception:
     _set_debug_self_message_callback = None
+try:
+    from webui import set_chatroom_agent_callbacks as _set_chatroom_agent_callbacks
+except Exception:
+    _set_chatroom_agent_callbacks = None
 try:
     from webui import set_mcp_reload_hook as _set_mcp_reload_hook
 except Exception:
@@ -873,6 +887,8 @@ def get_connection_signature(cfg=None) -> dict:
             "listener_host": str(connection_cfg.get("listener_host", "") or ""),
             "listener_port": str(connection_cfg.get("listener_port", "") or ""),
             "retries": str(connection_cfg.get("retries", "") or ""),
+            # 只保存指纹：这个字典会被调试页和配置变更日志读取，不能把 OneBot Token 写进日志。
+            "access_token_fingerprint": _connection_token_fingerprint(connection_cfg.get("access_token", "")),
         }
 
     cfg = cfg or config
@@ -885,7 +901,80 @@ def get_connection_signature(cfg=None) -> dict:
         "listener_host": str(getattr(connection_cfg, "listener_host", "") or ""),
         "listener_port": str(getattr(connection_cfg, "listener_port", "") or ""),
         "retries": str(getattr(connection_cfg, "retries", "") or ""),
+        "access_token_fingerprint": _connection_token_fingerprint(getattr(connection_cfg, "access_token", "")),
     }
+
+
+def _connection_token_fingerprint(value: object) -> str:
+    """返回稳定的 Token 指纹，仅用于判断连接配置是否变化和诊断展示。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return "unset"
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _onebot_ws_url_with_auth(url: object, connection_cfg: dict) -> str:
+    """给 OneBot FWS URL 补认证 Token；已有参数时不重复追加。"""
+    raw_url = str(url or "")
+    token = str((connection_cfg or {}).get("access_token", "") or "").strip()
+    if not token or not raw_url.lower().startswith(("ws://", "wss://")):
+        return raw_url
+    try:
+        parts = urllib.parse.urlsplit(raw_url)
+        query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        names = {str(k).lower() for k, _ in query}
+        # NapCat OneBot WebSocket 使用 access_token；兼容现场已有的 token 参数，避免重复认证参数。
+        if "access_token" not in names and "token" not in names:
+            query.append(("access_token", token))
+        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path or "/", urllib.parse.urlencode(query), parts.fragment))
+    except Exception:
+        return raw_url + ("&" if "?" in raw_url else "?") + urllib.parse.urlencode({"access_token": token})
+
+
+def _redact_connection_secrets(value: object) -> str:
+    """清理异常/诊断文本中的 OneBot Token，避免 websocket 库把完整 URL 带进日志。"""
+    text = str(value or "")
+    try:
+        text = re.sub(r"([?&](?:access_token|token)=)[^&\s,)]+", r"\1<redacted>", text, flags=re.I)
+        text = re.sub(r"(Bearer\s+)[^\s,;)]+", r"\1<redacted>", text, flags=re.I)
+    except Exception:
+        pass
+    return text
+
+
+def install_onebot_ws_auth_patch(adapter_module=None) -> bool:
+    """在项目进程内给 Hyper OneBot 的 WebsocketConnection 加 Token。
+
+    不修改 site-packages；包装器每次创建连接时读取最新 config.json，
+    因而断线重连和配置重启都使用 WebUI 保存的 Token。
+    """
+    try:
+        if adapter_module is None:
+            adapter_name = getattr(Listener.run, "__module__", "Hyper.Adapters.OneBot")
+            adapter_module = sys.modules.get(adapter_name) or importlib.import_module(adapter_name)
+        if getattr(adapter_module, "__name__", "").endswith(".Satori"):
+            return False
+        network = getattr(adapter_module, "Network", None)
+        constructor = getattr(network, "WebsocketConnection", None)
+        if constructor is None:
+            return False
+        if getattr(constructor, "_xcbot_access_token_patch", False):
+            return True
+
+        def _wrapped_ws_connection(url, *args, **kwargs):
+            runtime = read_runtime_config()
+            connection_cfg = runtime.get("Connection", {}) if isinstance(runtime, dict) else {}
+            if not isinstance(connection_cfg, dict):
+                connection_cfg = {}
+            return constructor(_onebot_ws_url_with_auth(url, connection_cfg), *args, **kwargs)
+
+        _wrapped_ws_connection._xcbot_access_token_patch = True
+        _wrapped_ws_connection._xcbot_original = constructor
+        network.WebsocketConnection = _wrapped_ws_connection
+        return True
+    except Exception as exc:
+        print(f"OneBot WebSocket Token 兼容补丁安装失败（将按 Hyper 原始方式连接）: {exc}")
+        return False
 
 
 RUNTIME_CONNECTION_SNAPSHOT = get_connection_signature(read_runtime_config())
@@ -1040,9 +1129,11 @@ def apply_runtime_config() -> bool:
                         else:
                             prompt = prompt.replace("{user_name}", "群聊会话")
                         ctx.system_prompt = filter_sensitive_content(prompt)
+                    ctx.max_rounds = new_max_messages
                     ctx.max_messages = new_max_messages
                     if hasattr(ctx, "compress_after_messages"):
                         ctx.compress_after_messages = new_auto_compress
+                        ctx.compress_after_rounds = new_auto_compress
                     if hasattr(ctx, "_enforce_message_limit"):
                         ctx._enforce_message_limit()
                 except Exception:
@@ -2584,16 +2675,14 @@ def _merge_extra_user_suffix(user_text: str, extra_user_suffix: str | None) -> s
     return f"{base}\n\n{suffix}" if base else suffix
 
 
-async def append_follow_up_history(context, content: str) -> None:
-    """按正常会话锁协议记录已成功入队的 Follow-Up。"""
-    await asyncio.to_thread(context._history_lock.acquire)
-    try:
-        context.history.append({
-            "role": "user",
-            "content": filter_sensitive_content(content),
-        })
-    finally:
-        context._history_lock.release()
+def agent_session_id_of(context) -> str:
+    """取会话对象注册到中断表/Follow-Up 表时用的 key。
+
+    必须读 context.session_id 本身，不能按 group_id / user_id 重新拼：
+    get_context 走异常降级时会写成 f"private_{uin}_fallback"，重新拼出来的
+    值与实际注册的对不上，follow-up 检查会永远判定「没有活跃会话」。
+    """
+    return str(getattr(context, "session_id", "") or "")
 
 
 # ==================== 重启状态持久化工具 ====================
@@ -2712,6 +2801,39 @@ async def send_error_detail(actions, event, error: Exception, is_group: bool, re
 API_REQUEST_TIMEOUT_SECONDS = int(user_cfg.get("api_request_timeout_seconds", 60))
 
 
+# ==================== 会话锁的等待线程池 ====================
+# asyncio.to_thread 走的是 loop 的默认 ThreadPoolExecutor，容量只有
+# min(32, cpu_count + 4)。而 agen_content 会持 _history_lock 跑完整个 agent
+# 循环（最坏 max_rounds x 工具超时，可达几十分钟），同一会话的后续消息全部
+# 堵在 acquire 上，每个等待者占住一个 worker 且无法被 cancel 回收——池一旦
+# 打满，**所有** to_thread 调用都拿不到线程：LLM 请求、QQ 回执抓取、文件
+# 清理一起停摆，表现就是日志整片卡住、连别的群也不响应。
+#
+# 所以「等锁」这件事单独用一个池，与默认池隔离；再配上超时，抢不到就如实
+# 告诉用户，而不是无限排队。
+_HISTORY_LOCK_EXECUTOR = ThreadPoolExecutor(
+    max_workers=64, thread_name_prefix="histlock"
+)
+# 单条消息等待同会话前一条处理完的上限。一次 agent 循环正常在十几秒内结束，
+# 超过 3 分钟基本可判定前一条已经卡住，与其陪着一起卡死不如放弃并提示。
+_HISTORY_LOCK_TIMEOUT = float(user_cfg.get("history_lock_timeout_seconds", 180))
+
+
+async def acquire_history_lock(lock, timeout: "float | None" = None) -> bool:
+    """带超时地抢会话历史锁，返回是否抢到。
+
+    不要直接 await asyncio.to_thread(lock.acquire)：那样既没有超时，又会占用
+    默认线程池的 worker（见 _HISTORY_LOCK_EXECUTOR 的说明）。
+    """
+    wait = _HISTORY_LOCK_TIMEOUT if timeout is None else float(timeout)
+    loop = asyncio.get_running_loop()
+    if wait <= 0:
+        return await loop.run_in_executor(_HISTORY_LOCK_EXECUTOR, lock.acquire)
+    return await loop.run_in_executor(
+        _HISTORY_LOCK_EXECUTOR, lambda: lock.acquire(True, wait)
+    )
+
+
 # ==================== 用户昵称获取函数 ====================
 nickname_cache = OrderedDict()
 MAX_NICKNAME_CACHE = 1000  # ponytail: 5000条昵称约占50MB，1000条够用
@@ -2784,8 +2906,14 @@ class LimitedDeepSeekContext:
 
     def __init__(self, system_prompt: str):
         self.system_prompt = filter_sensitive_content(system_prompt)
-        self.max_messages = int(user_cfg.get("context_max_messages", 60))
-        self.history = []       # 这里只存 user/assistant 类型历史，不存系统提示词
+        self.max_rounds = max(1, int(user_cfg.get("context_max_messages", 60)))
+        # 配置键保留旧名以兼容现有配置；值的语义改为完整对话轮数。
+        self.max_messages = self.max_rounds
+        # 总 token 预算，默认 0 表示不启用。启用后会优先保留最近完整轮次。
+        self.max_context_tokens = int(user_cfg.get("max_context_tokens", 0))
+        # 只存 user/assistant/tool 三类对话消息，不存系统提示词。
+        # tool 与带 tool_calls 的 assistant 必须成对存在，裁剪/加载都过 fix_messages。
+        self.history: list[dict] = []
         # 基类目前只被 /总结 用（每次新建、用完即弃，不跨消息共享），所以无竞争。
         # 但锁定义在基类可以保证：将来若有人缓存复用基类实例，或给 compress_context
         # 传入基类对象，加锁路径都已就位，不会静默地退回无锁状态。
@@ -2857,19 +2985,23 @@ class LimitedDeepSeekContext:
         """
         构建完整消息列表：
         1. system_prompt 永远只作为唯一 system 消息
-        2. history 仅包含 user / assistant 消息
+        2. history 包含完整的 user / assistant / tool 对话轮次
         """
         messages = [{"role": "system", "content": build_llm_system_prompt(self.system_prompt)}]
 
+        history_messages = []
         for msg in self.history:
             role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role not in ("user", "assistant"):
+            if role not in ("user", "assistant", "tool"):
                 role = "assistant"
-            messages.append({
-                "role": role,
-                "content": content
-            })
+            item = {"role": role, "content": msg.get("content")}
+            if role == "assistant" and msg.get("tool_calls"):
+                item["tool_calls"] = msg["tool_calls"]
+            if role == "tool":
+                item["tool_call_id"] = str(msg.get("tool_call_id") or "")
+                item["content"] = msg.get("content") or ""
+            history_messages.append(item)
+        messages.extend(fix_messages(history_messages))
 
         if current_message is not None:
             text_content = self._extract_text_from_message(current_message)
@@ -2888,7 +3020,7 @@ class LimitedDeepSeekContext:
         return content
 
     def _enforce_message_limit(self):
-        """强制执行消息数量限制，仅裁剪普通历史，并清理 base64 图片数据"""
+        """清理内容并保留最近的完整对话轮次。"""
         try:
             for msg in self.history:
                 content = msg.get("content")
@@ -2896,10 +3028,46 @@ class LimitedDeepSeekContext:
                     cleaned = self._clean_content(content)
                     if cleaned is not content:
                         msg["content"] = cleaned
-            if len(self.history) > self.max_messages:
-                self.history = self.history[-self.max_messages:]
-        except Exception:
-            pass
+            if len(split_into_rounds(self.history)) > self.max_rounds:
+                self.history = keep_recent_rounds(self.history, self.max_rounds)
+
+            # 总 token 预算守卫（可选）
+            if self.max_context_tokens > 0:
+                self._enforce_token_budget()
+        except Exception as e:
+            # 这里静默会让历史无限增长，只表现为内存慢涨，很难定位到裁剪失败。
+            print(f"[Context] 裁剪历史失败，本轮跳过: {e}")
+
+    def _enforce_token_budget(self):
+        """当总 token 超过上限时，按轮丢弃最旧的完整轮次。
+
+        计量走 rounds.message_tokens：assistant 发起工具调用时 content 常是 None，
+        真正占额度的是 tool_calls[].function.arguments，只算 content 会把一条 8KB
+        的工具入参记成 0，预算守卫等于失效。
+        """
+        try:
+            if self.max_context_tokens <= 0:
+                return
+            total = sum(message_tokens(m) for m in self.history)
+            if total <= self.max_context_tokens:
+                return
+            rounds = split_into_rounds(self.history)
+            # 摘要单独摘出来，别让它排在"最旧"的位置被第一个丢掉——
+            # 它代表的是已经被压缩掉的一大段历史，价值高于任意一个普通轮次。
+            leading_summary: list[dict] = []
+            if rounds and rounds[0] and is_summary_message(rounds[0][0]):
+                first = rounds[0]
+                if len(first) == 1:
+                    leading_summary = rounds.pop(0)
+                else:
+                    leading_summary = [first[0]]
+                    rounds[0] = first[1:]
+            while total > self.max_context_tokens and len(rounds) > 1:
+                dropped = rounds.pop(0)
+                total -= sum(message_tokens(m) for m in dropped)
+            self.history = leading_summary + fix_messages([m for r in rounds for m in r])
+        except Exception as e:
+            print(f"[Context] token 预算裁剪失败，本轮跳过: {e}")
 
     async def agen_content(self, message) -> tuple[str, int, int, int]:
         max_retries = key_manager.get_attempt_count() or 1
@@ -3104,15 +3272,19 @@ class LimitedDeepSeekContext:
         """清除上下文（不关闭共享 OpenAI client 池）"""
         self.history.clear()
 
-    def add_message(self, role: str, content: str):
-        """添加消息到历史，仅允许 user / assistant"""
-        content = filter_sensitive_content(content)
-        if role in ["user", "assistant"]:
-            self.history.append({"role": role, "content": content})
+    def add_message(self, role: str, content: str, **fields):
+        """添加历史消息，允许构成完整 tool-call 配对的消息。"""
+        content = filter_sensitive_content(content) if role != "tool" else content
+        if role in ("user", "assistant", "tool"):
+            message = {"role": role, "content": content}
+            for key in ("tool_calls", "tool_call_id"):
+                if fields.get(key) is not None:
+                    message[key] = fields[key]
+            self.history.append(message)
         self._enforce_message_limit()
 
     def get_message_count(self):
-        return len(self.history) // 2
+        return len(split_into_rounds(self.history))
 
     def get_stats(self) -> dict:
         return {
@@ -3134,7 +3306,8 @@ class ContextCompressor:
 
     def __init__(self, compression_threshold: int = 40):
         self.compression_threshold = compression_threshold
-        self.keep_recent = int(user_cfg.get("compression_keep_recent", 20))
+        self.keep_recent = max(1, int(user_cfg.get("compression_keep_recent", 20)))
+        # compression_keep_recent 的值表示完整对话轮数。
         self.compression_count = {}
         self.last_compression_time = {}
         self.max_sessions = 1000
@@ -3187,11 +3360,31 @@ class ContextCompressor:
         history_lock = getattr(context, "_history_lock", None)
         if already_locked or history_lock is None:
             return await self._compress_locked(context, session_id, context_type)
-        await asyncio.to_thread(history_lock.acquire)
+        # 带超时：手动 /立即压缩 若撞上正在跑的 agent 循环，无超时地等下去会
+        # 一直占着线程池的 worker（见 _HISTORY_LOCK_EXECUTOR），压缩本身也不是
+        # 非做不可的操作，抢不到就跳过这轮。
+        if not await acquire_history_lock(history_lock):
+            print(f"[压缩] 会话 {session_id} 等待历史锁超过 "
+                  f"{_HISTORY_LOCK_TIMEOUT:g} 秒，跳过本次压缩")
+            return False
         try:
             return await self._compress_locked(context, session_id, context_type)
         finally:
             history_lock.release()
+
+    def _effective_keep_recent(self, context) -> int:
+        """保留轮数不能顶满上下文预算，否则摘要没有落脚的位置。
+
+        keep_recent 与 context_max_messages 在 WebUI 里各自独立可调，没有联动校验。
+        一旦 keep_recent >= max_rounds，压缩刚写进去的摘要会在紧随其后的
+        _enforce_message_limit 里被挤掉——LLM 摘要调用白花，历史照旧丢。
+        这里给摘要留一轮：keep_recent 最多是 max_rounds - 1。
+        """
+        keep = max(1, int(self.keep_recent))
+        max_rounds = int(getattr(context, "max_rounds", 0) or 0)
+        if max_rounds > 1:
+            keep = min(keep, max_rounds - 1)
+        return max(1, keep)
 
     async def _compress_locked(self, context, session_id: str, context_type: str = "group") -> bool:
         try:
@@ -3205,18 +3398,15 @@ class ContextCompressor:
                 return False
 
             history = list(context.history)
-            if len(history) < self.keep_recent + 6:
+            rounds = split_into_rounds(history)
+            keep_recent = self._effective_keep_recent(context)
+            if len(rounds) < keep_recent + 3:
                 return False
 
-            if len(history) <= self.keep_recent:
-                return False
-
-            to_compress = history[:-self.keep_recent]
-            recent_messages = history[-self.keep_recent:]
-
-            # 只压缩 user / assistant
-            to_compress = [msg for msg in to_compress if msg.get("role") in ("user", "assistant")]
-            if len(to_compress) < 6:
+            old_rounds = rounds[:-keep_recent]
+            recent_messages = [msg for group in rounds[-keep_recent:] for msg in group]
+            to_compress = [msg for group in old_rounds for msg in group]
+            if len(old_rounds) < 3:
                 return False
 
             summary = await self._generate_summary(to_compress, context_type)
@@ -3227,10 +3417,12 @@ class ContextCompressor:
             if summary:
                 new_history.append({
                     "role": "assistant",
-                    "content": f"[历史摘要，压缩了{len(to_compress)}条消息] {summary}"
+                    # 前缀走 rounds.SUMMARY_PREFIX：裁剪端靠它识别并保住摘要，
+                    # 两边硬编码同一串文本迟早会改歪一处。
+                    "content": f"{SUMMARY_PREFIX}{len(old_rounds)}轮消息] {summary}"
                 })
 
-            new_history.extend(recent_messages)
+            new_history.extend(fix_messages(recent_messages))
             context.history = new_history
             context._enforce_message_limit()
 
@@ -3252,20 +3444,15 @@ class ContextCompressor:
         try:
             cleaned = []
             for msg in messages:
-                role = msg.get("role", "user")
-                content = str(msg.get("content", "")).strip()
-                if not content:
-                    continue
-
-                if content.startswith("[历史摘要，压缩了") or content.startswith("[系统自动压缩了"):
+                content = describe_message(msg, 100)
+                if content.startswith("用户: [历史摘要") or content.startswith("助手: [历史摘要"):
                     continue
 
                 content = re.sub(r'\s+', ' ', content)
                 if len(content) > 50:
                     content = content[:50] + "..."
 
-                prefix = "用户" if role == "user" else "助手"
-                cleaned.append(f"{prefix}：{content}")
+                cleaned.append(content)
 
             if not cleaned:
                 return "历史对话已压缩，早期内容主要为连续交流记录。"
@@ -3280,16 +3467,12 @@ class ContextCompressor:
         try:
             message_texts = []
             for msg in messages[-100:]:
-                role = msg.get('role', 'user')
-                content = msg.get('content', '')
-                if not content:
+                text = describe_message(msg, 300)
+                if not text:
                     continue
-                if str(content).startswith("[历史摘要，压缩了") or str(content).startswith("[系统自动压缩了"):
+                if "[历史摘要，压缩了" in text or "[系统自动压缩了" in text:
                     continue
-                if len(content) > 300:
-                    content = content[:300] + "..."
-                prefix = "用户" if role == "user" else "助手"
-                message_texts.append(f"{prefix}: {content}")
+                message_texts.append(text)
 
             if len(message_texts) < 5:
                 return ""
@@ -3489,12 +3672,12 @@ def add_trace_record(record: dict) -> str:
 
 
 def attach_trace_send(trace_id: str, parts: int, message_ids=None) -> None:
-    """回填分段发送结果，失败静默忽略。"""
+    """回填分段发送结果；失败只记录，不影响消息发送。"""
     try:
         if trace_id:
             trace_store.attach_send(trace_id, parts, message_ids)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Trace] 发送结果回填失败（忽略）: {e}")
 
 
 from bot.agent import (
@@ -3506,11 +3689,24 @@ from bot.agent import (
     tool as agent_tool,
     has_active_session as _has_active_session,
     follow_up_session as _follow_up_session,
+    session_user_level as _session_user_level,
+    _LEVEL_RANK as _LEVEL_RANK_MAIN,
 )
 import bot.agent_tools as _agent_builtin_tools
 import bot.agent_fs as _agent_fs_tools
 import bot.agent_tasks as agent_tasks
 import bot.agent_mcp as agent_mcp
+from bot.rounds import (
+    SUMMARY_PREFIX,
+    describe_message,
+    extract_agent_trail,
+    fix_messages,
+    is_summary_message,
+    keep_recent_rounds,
+    message_tokens,
+    split_into_rounds,
+)
+from bot.agent_context import AgentTurnContext
 from webui_core.agent_meta import AGENT_TOOL_META, DEFAULT_AGENT_CONFIG
 
 # 让工具模块能读 config.json，避免它们反向 import main 造成循环依赖
@@ -3588,19 +3784,27 @@ def resolve_agent_user_level(user_id) -> str:
 
 
 def build_agent_context(user_id=None, group_id=None, is_group: bool = False,
-                        actions=None, event=None) -> _AgentContext:
+                        actions=None, event=None, allow_global_actions: bool = True) -> _AgentContext:
     def _log(content, tag: str = "AGENT"):
         print(f"[{tag}] {_short_text(content, 180)}")
 
-    return _AgentContext(
+    if actions is None and allow_global_actions:
+        # 其余读取点（send_qq_message_from_http、定时任务、_agent_actions）都持锁，
+        # 这里漏了会读到 clear_current_qq_actions 置空前后的中间态
+        with _qq_actions_lock:
+            actions = _current_qq_actions
+
+    ctx = _AgentContext(
         user_id=str(user_id or ""),
         group_id=str(group_id or ""),
         is_group=bool(is_group),
         user_level=resolve_agent_user_level(user_id),
-        actions=actions or _current_qq_actions,
+        actions=actions,
         event=event,
         log=_log,
     )
+    ctx.extra["allow_global_actions"] = bool(allow_global_actions)
+    return ctx
 
 
 # ==================== Agent QQ 工具 ====================
@@ -3611,10 +3815,53 @@ def build_agent_context(user_id=None, group_id=None, is_group: bool = False,
 def _agent_actions(ctx):
     """取本轮可用的 actions；没有连接时返回 None。"""
     actions = ctx.actions
-    if actions is None:
+    if actions is None and bool(ctx.extra.get("allow_global_actions", True)):
         with _qq_actions_lock:
             actions = _current_qq_actions
     return actions
+
+
+# Agent 主动发送的串行锁。parallel_tools 默认开启，同一轮里模型可能并发请求
+# 多个 send_message / send_image / send_file；不串行的话到达顺序由协程调度决定，
+# 模型精心安排的「先说结论再放图」会变成乱序。
+#
+# 不复用 _qq_send_lock：那把锁被 HTTP 接口用 3 秒超时抢，抢不到就返回 429。
+# 把 Agent 的发送也塞进去会让 WebUI 的发送接口在 Agent 干活时频繁失败。
+#
+# 必须是 threading.Lock 而不是 asyncio.Lock：Hyper 对每条消息新建线程 +
+# asyncio.run，asyncio.Lock 的等待者绑在创建它的 loop 上，跨 loop 无效
+# （同 agen_content 里 _history_lock 的理由）。
+_agent_send_lock = threading.Lock()
+# 单条消息的发送上限。卡死在这里会连带拖住整个工具循环，所以给个上界，
+# 超时就如实告诉模型，让它自己决定是重试还是改口径。
+_AGENT_SEND_LOCK_TIMEOUT = 30.0
+
+# send_file 有意不走这把锁：它的 timeout 是 180 秒（大文件上传），跟 30 秒的
+# 锁等待上限对不上。纳进来的话，一次大文件上传期间并发的 send_message 会成片
+# 超时失败——为了顺序严格而牺牲可用性，不划算。文件与消息之间的先后顺序因此
+# 不保证，但两者本来就是不同的展示通道，用户不会误读。
+
+
+async def _agent_send_serialized(coro_factory, what: str = "消息"):
+    """串行执行一次 Agent 主动发送。返回 (成功了吗, error 文本)。
+
+    coro_factory 是个可调用对象而不是协程：抢锁可能失败，那时协程根本不该被
+    创建（未 await 的协程会留下 "coroutine was never awaited" 警告）。
+    """
+    got = await asyncio.to_thread(_agent_send_lock.acquire, True, _AGENT_SEND_LOCK_TIMEOUT)
+    if not got:
+        return False, (
+            f"error: 发送通道繁忙，等待 {_AGENT_SEND_LOCK_TIMEOUT:g} 秒仍未轮到，"
+            f"这条{what}没有发出去。可以稍后再试，或直接把内容放进最终回复。"
+        )
+    try:
+        await coro_factory()
+        return True, ""
+    finally:
+        try:
+            _agent_send_lock.release()
+        except Exception:
+            pass
 
 
 def _agent_parse_qq(value, field: str = "user_id") -> tuple[int, str]:
@@ -4202,9 +4449,14 @@ async def _agent_send_message(args: dict, ctx) -> str:
     try:
         message = Manager.Message(*segments)
         if has_group:
-            await actions.send(group_id=target, message=message)
+            def _do():
+                return actions.send(group_id=target, message=message)
         else:
-            await actions.send(user_id=target, message=message)
+            def _do():
+                return actions.send(user_id=target, message=message)
+        ok, busy_err = await _agent_send_serialized(_do, "消息")
+        if not ok:
+            return busy_err
     except Exception as e:
         return f"error: 发送失败：{e}"
     extra = "（含图片）" if image_url else ""
@@ -4285,11 +4537,16 @@ async def _agent_send_image(args: dict, ctx) -> str:
         try:
             message = Manager.Message(Segments.Image(file=local.as_uri()))
             if ctx.is_group and ctx.group_id:
-                await actions.send(group_id=int(ctx.group_id), message=message)
+                def _do():
+                    return actions.send(group_id=int(ctx.group_id), message=message)
             elif ctx.user_id:
-                await actions.send(user_id=int(ctx.user_id), message=message)
+                def _do():
+                    return actions.send(user_id=int(ctx.user_id), message=message)
             else:
                 return "error: 当前没有可发送的会话目标"
+            ok, busy_err = await _agent_send_serialized(_do, "图片")
+            if not ok:
+                return busy_err
         except Exception as e:
             return f"error: 发送本地图片失败：{e}"
         return (
@@ -4320,11 +4577,16 @@ async def _agent_send_image(args: dict, ctx) -> str:
     try:
         message = Manager.Message(Segments.Image(file=url))
         if ctx.is_group and ctx.group_id:
-            await actions.send(group_id=int(ctx.group_id), message=message)
+            def _do():
+                return actions.send(group_id=int(ctx.group_id), message=message)
         elif ctx.user_id:
-            await actions.send(user_id=int(ctx.user_id), message=message)
+            def _do():
+                return actions.send(user_id=int(ctx.user_id), message=message)
         else:
             return "error: 当前没有可发送的会话目标"
+        ok, busy_err = await _agent_send_serialized(_do, "图片")
+        if not ok:
+            return busy_err
     except Exception as e:
         return f"error: 发送图片失败：{e}"
     return "图片已发送到当前对话。不需要再重复描述这张图片的链接。"
@@ -4701,6 +4963,8 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
         self.chat_id = chat_id
         self.auto_compress_enabled = True
         self.compress_after_messages = int(user_cfg.get("auto_compress_after_messages", 40))
+        # 配置键沿用旧名，但阈值语义是完整对话轮数。
+        self.compress_after_rounds = self.compress_after_messages
         self.total_tokens = 0
         self.total_calls = 0
         self.last_trace_id = ""
@@ -4712,12 +4976,21 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
         # >0 表示正在处理消息，LRU 淘汰时跳过，避免同一会话出现两个活跃对象
         self._busy = 0
 
+        # 本轮 Agent 对话的统一上下文，模仿 AstrBot 的 run_context.messages。
+        # 进入 agen_content 的 Agent 分支时创建，成功或降级后一次性提交。
+        self._current_turn: AgentTurnContext | None = None
+
+        # 总 token 预算，默认 0 表示不启用。启用后会优先保留最近完整轮次。
+        self.max_context_tokens = int(user_cfg.get("max_context_tokens", 0))
+
         self._load_memory()
 
     def set_auto_compress(self, enabled: bool, threshold: int = None):
         self.auto_compress_enabled = bool(enabled)
         if threshold is not None:
-            self.compress_after_messages = max(20, min(int(threshold), 80))
+            value = max(20, min(int(threshold), 80))
+            self.compress_after_messages = value
+            self.compress_after_rounds = value
 
     def get_stats(self) -> dict:
         return {
@@ -4726,33 +4999,29 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
         }
 
     def _load_memory(self):
-        """从文件加载历史记忆，仅加载普通对话历史"""
+        """从文件加载完整对话历史，包含可配对的工具调用消息。"""
         try:
             if self.context_type == "private" and self.chat_id:
                 history, token_counter = chat_memory.load_private_memory(self.chat_id)
                 if history:
-                    self.history = [msg for msg in history if msg.get("role") in ("user", "assistant")]
+                    self.history = fix_messages([msg for msg in history if msg.get("role") in ("user", "assistant", "tool")])
+                    self._enforce_message_limit()
                     self.total_tokens = token_counter
             elif self.context_type == "group" and self.chat_id:
                 history, token_counter, group_roles = chat_memory.load_group_memory(self.chat_id)
                 if history:
-                    self.history = [msg for msg in history if msg.get("role") in ("user", "assistant")]
+                    self.history = fix_messages([msg for msg in history if msg.get("role") in ("user", "assistant", "tool")])
+                    self._enforce_message_limit()
                     self.total_tokens = token_counter
         except Exception as e:
             print(f"加载记忆失败: {e}")
 
     def _save_memory(self):
-        """保存记忆到文件，仅保存普通对话历史。
-
-        会话已被 /reset 丢弃时直接跳过：清理路径会把 ctx 从管理器的 dict 里摘掉
-        并删文件，但此刻可能还有另一条消息正在这个 ctx 上跑 agen_content
-        （_history_lock 是 per-ctx 的，清理路径根本不碰它），它结束时的存盘会把
-        刚删掉的历史重新写回去——用户看到「已清除记忆」，下次对话记忆却回来了。
-        """
+        """保存包含工具调用链的完整对话历史。"""
         if getattr(self, "_discarded", False):
             return
         try:
-            clean_history = [msg for msg in self.history if msg.get("role") in ("user", "assistant")]
+            clean_history = [msg for msg in self.history if msg.get("role") in ("user", "assistant", "tool")]
             # 进文件锁之后再查一次标记：只在这里判断的话，/reset 可能恰好发生在
             # 「已通过检查、还没写盘」这个窗口里，旧历史仍会被写回去
             still_valid = lambda: not getattr(self, "_discarded", False)
@@ -4777,7 +5046,14 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
         #
         # threading.Lock 是阻塞的，不能直接在协程里 acquire（会卡住整个 loop），
         # 所以放到线程池里等；同一会话的并发消息会在这里排队，跨会话互不影响。
-        await asyncio.to_thread(self._history_lock.acquire)
+        #
+        # 必须带超时并走专用池：本函数会持锁跑完整个 agent 循环，无超时地等待
+        # 会让等待者堆在默认线程池里把它占满，进而拖死全局的 to_thread
+        # （详见 acquire_history_lock / _HISTORY_LOCK_EXECUTOR）。
+        if not await acquire_history_lock(self._history_lock):
+            print(f"[Context] 会话 {self.chat_id} 等待历史锁超过 "
+                  f"{_HISTORY_LOCK_TIMEOUT:g} 秒，放弃本次请求")
+            return "上一条消息还在处理中，请稍后再试。", 0, 0, 0
         # 标记为正在处理，LRU 淘汰会跳过它。用计数而非布尔：拍一拍、群总结等
         # 路径可能在同一会话对象上重入。
         self._busy = getattr(self, "_busy", 0) + 1
@@ -4799,6 +5075,7 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
             # 管理员的 user_id。宁可 agent_meta 为空（工具退化到只读全局 actions、
             # 权限降为普通用户），也不能张冠李戴。
             agent_meta = agent_meta if isinstance(agent_meta, dict) else {}
+            preferred_model = str(agent_meta.get("preferred_model") or "").strip()
             try:
                 if is_agent_enabled_for(self.context_type == "group", self.chat_id):
                     candidate = get_agent_settings()
@@ -4808,7 +5085,11 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                         is_group=self.context_type == "group",
                         actions=agent_meta.get("actions"),
                         event=agent_meta.get("event"),
+                        allow_global_actions=not bool(agent_meta.get("disable_global_actions")),
                     )
+                    forced_level = str(agent_meta.get("user_level") or "").strip()
+                    if forced_level in ("user", "admin"):
+                        agent_ctx.user_level = forced_level
                     # 工作区按会话隔离，只能在拿到 ctx 之后才知道具体路径
                     candidate.workspace = _agent_fs_tools.primary_root(agent_ctx)
                     # 该用户权限下一个工具都没开，就没必要走循环，省掉 tools 参数的 prompt 开销
@@ -4838,11 +5119,19 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                 has_image_message = isinstance(message, dict) and bool(message.get("image_urls"))
                 direct_image_mode = has_image_message and get_multimodal_image_mode() == "direct"
                 if direct_image_mode:
-                    current = key_manager.get_next_multimodal_for_request(
-                        tried_keys=tried_keys,
-                        include_cooldown=True,
-                        preferred_model=get_configured_multimodal_model(),
-                    )
+                    if preferred_model:
+                        current = key_manager.get_preferred_for_request(
+                            preferred_model=preferred_model,
+                            tried_keys=tried_keys,
+                            include_cooldown=True,
+                            require_multimodal=True,
+                        )
+                    else:
+                        current = key_manager.get_next_multimodal_for_request(
+                            tried_keys=tried_keys,
+                            include_cooldown=True,
+                            preferred_model=get_configured_multimodal_model(),
+                        )
                     if not current:
                         current = key_manager.get_next_for_request(
                             tried_keys=tried_keys,
@@ -4852,7 +5141,12 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                 else:
                     use_multimodal_directly = has_image_message and bool(key_manager.is_default_multimodal())
                     require_multimodal = use_multimodal_directly
-                    current = key_manager.get_next_for_request(
+                    current = key_manager.get_preferred_for_request(
+                        preferred_model=preferred_model,
+                        tried_keys=tried_keys,
+                        include_cooldown=True,
+                        require_multimodal=require_multimodal,
+                    ) if preferred_model else key_manager.get_next_for_request(
                         tried_keys=tried_keys,
                         include_cooldown=True,
                         require_multimodal=require_multimodal,
@@ -4998,18 +5292,21 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                                 "cached": cached,
                             }
 
+                        # 每次 attempt 都重新播种：换 Key 重试时工具循环会从头再跑，
+                        # 沿用上一轮残留的工具消息会让模型看到两份互相矛盾的工具链。
+                        self._current_turn = AgentTurnContext()
+                        self._current_turn.seed(messages)
                         if agent_settings is not None:
-                            # 工具中间消息只写进 loop_messages 这个临时列表，不进 self.history：
-                            # self._build_messages 只认 user/assistant，落库会破坏记忆压缩逻辑。
-                            loop_messages = list(messages)
-                            abort_event = AGENT_ABORTS.begin(self.session_id or "")
+                            _loop_session_id = self.session_id or ""
+                            abort_event = AGENT_ABORTS.begin(_loop_session_id)
                             try:
                                 result, agent_usages, agent_tool_calls = await _run_tool_loop(
-                                    _complete, loop_messages, agent_ctx, agent_settings,
+                                    _complete, self._current_turn.messages, agent_ctx, agent_settings,
                                     abort=abort_event,
+                                    session_id=_loop_session_id,
                                 )
                             finally:
-                                AGENT_ABORTS.end(self.session_id or "")
+                                AGENT_ABORTS.end(_loop_session_id)
                             usage_total = sum(int(u.get("total", 0) or 0) for u in agent_usages)
                             usage_prompt = sum(int(u.get("prompt", 0) or 0) for u in agent_usages)
                             usage_completion = sum(int(u.get("completion", 0) or 0) for u in agent_usages)
@@ -5045,14 +5342,39 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                     prompt_tokens = usage_prompt + relay_prompt_tokens
                     completion_tokens = usage_completion + relay_completion_tokens
 
+                    # 提交当前轮次到历史。使用统一上下文后，不再需要从 loop_messages 提取。
+                    _history_user_content = filter_sensitive_content(user_content)
+                    _delivered_follow_ups = [
+                        filter_sensitive_content(text)
+                        for text in ((agent_ctx.extra.get("follow_ups_delivered") or []) if agent_ctx else [])
+                    ]
+                    # 只取 seed 之后新增的消息：历史里已经存了往轮的工具链，
+                    # 对整个列表提取会把旧轮的工具消息再追加一遍，每轮翻倍。
+                    # 再过一遍 fix_messages：中断/超时会让最后一组 tool_calls 只有部分
+                    # 结果回灌，直接落盘的话下一轮请求就带着悬空 tool_calls 发出去。
+                    _agent_trail = fix_messages(
+                        extract_agent_trail(self._current_turn.new_messages())
+                    ) if self._current_turn else []
+                    if _delivered_follow_ups and not any(
+                        "[SYSTEM NOTICE] User sent follow-up" in str(item.get("content") or "")
+                        for item in _agent_trail
+                    ):
+                        _history_user_content += "\n\n[期间收到的补充消息]\n" + "\n".join(
+                            _delivered_follow_ups
+                        )
                     self.history.append({
                         "role": "user",
-                        "content": filter_sensitive_content(user_content)
+                        "content": _history_user_content,
                     })
+                    if agent_settings is not None:
+                        self.history.extend(_agent_trail)
                     self.history.append({
                         "role": "assistant",
                         "content": result
                     })
+
+                    # 清空本轮上下文
+                    self._current_turn = None
 
                     self._enforce_message_limit()
                     key_manager.mark_success(current_key, model=model, base_url=base_url)
@@ -5101,7 +5423,7 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                             self.auto_compress_enabled and
                             self.compressor and
                             self.session_id and
-                            self.get_message_count() >= self.compress_after_messages
+                            self.get_message_count() >= self.compress_after_rounds
                     ):
                         # 此处仍在 _history_lock 保护内，不能让压缩再取一次锁
                         await self.compressor.compress_context(
@@ -5280,14 +5602,32 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                 degraded = agent_ctx.extra.get("degraded_text")
                 if degraded:
                     print(f"[Agent] 所有渠道失败，返回已完成工具的降级结果")
-                    # 降级回复也要进历史：否则下一轮模型不知道自己上一句说了什么
-                    self.history.append({"role": "user", "content": filter_sensitive_content(_last_user_content)})
+                    _degraded_user_content = filter_sensitive_content(_last_user_content)
+                    _degraded_follow_ups = [
+                        filter_sensitive_content(text)
+                        for text in (agent_ctx.extra.get("follow_ups_delivered") or [])
+                    ]
+                    if _degraded_follow_ups:
+                        _degraded_user_content += "\n\n[期间收到的补充消息]\n" + "\n".join(
+                            _degraded_follow_ups
+                        )
+                    self.history.append({"role": "user", "content": _degraded_user_content})
+                    if self._current_turn is not None:
+                        _degraded_trail = fix_messages(
+                            extract_agent_trail(self._current_turn.new_messages())
+                        )
+                        self.history.extend(_degraded_trail)
                     self.history.append({"role": "assistant", "content": degraded})
+                    self._current_turn = None
                     self._enforce_message_limit()
                     return degraded, 0, 0, 0
 
             raise last_error or Exception("所有 API Key 均失败")
         finally:
+            # 成功/降级路径已各自置空，这里兜住抛异常退出的情况：留着上一轮的
+            # 工具消息，下一轮 seed 前若有人读 _current_turn 就会拿到过期数据，
+            # 而 messages 里的图片 base64 也会一直被引用着不释放。
+            self._current_turn = None
             self._busy = max(0, getattr(self, "_busy", 1) - 1)
             self._history_lock.release()
 
@@ -5944,11 +6284,11 @@ def show_conversation_timeline(session_id: str = None):
 
         for i, msg in enumerate(history):
             role = msg.get('role', 'unknown')
-            content = msg.get('content', '')
+            content = str(msg.get('content') or '')
 
             if content.startswith("[历史摘要，压缩了"):
                 summary_count += 1
-                match = re.search(r'\[历史摘要，压缩了(\d+)条消息\]', content)
+                match = re.search(r'\[历史摘要，压缩了(\d+)(?:条消息|轮消息)\]', content)
                 compressed_count = match.group(1) if match else '?'
                 summary_content = content.split(']\n', 1)[-1] if ']\n' in content else content
                 print(f"  [{timeline_position:2d}] 📌 历史摘要 #{summary_count} (压缩了{compressed_count}条消息)")
@@ -5956,7 +6296,12 @@ def show_conversation_timeline(session_id: str = None):
             elif role == 'user':
                 print(f"  [{timeline_position:2d}] 💬 用户: {content[:40]}...")
             elif role == 'assistant':
-                print(f"  [{timeline_position:2d]} 🤖 助手: {content[:40]}...")
+                if msg.get('tool_calls'):
+                    print(f"  [{timeline_position:2d}] 🧰 助手调用工具: {describe_message(msg, 100)[:100]}...")
+                else:
+                    print(f"  [{timeline_position:2d}] 🤖 助手: {content[:40]}...")
+            elif role == 'tool':
+                print(f"  [{timeline_position:2d}] 🔧 工具结果: {content[:40]}...")
 
             timeline_position += 1
 
@@ -5976,18 +6321,23 @@ def show_conversation_timeline(session_id: str = None):
 
         for i, msg in enumerate(history):
             role = msg.get('role', 'unknown')
-            content = msg.get('content', '')
+            content = str(msg.get('content') or '')
 
             if content.startswith("[历史摘要，压缩了"):
                 summary_count += 1
-                match = re.search(r'\[历史摘要，压缩了(\d+)条消息\]', content)
+                match = re.search(r'\[历史摘要，压缩了(\d+)(?:条消息|轮消息)\]', content)
                 compressed_count = match.group(1) if match else '?'
                 print(f"  [{timeline_position:2d}] 📌 群聊摘要 #{summary_count} (压缩了{compressed_count}条消息)")
                 print(f"      摘要: {content[:100]}...")
             elif role == 'user':
                 print(f"  [{timeline_position:2d}] 💬 用户: {content[:40]}...")
             elif role == 'assistant':
-                print(f"  [{timeline_position:2d]} 🤖 助手: {content[:40]}...")
+                if msg.get('tool_calls'):
+                    print(f"  [{timeline_position:2d}] 🧰 助手调用工具: {describe_message(msg, 100)[:100]}...")
+                else:
+                    print(f"  [{timeline_position:2d}] 🤖 助手: {content[:40]}...")
+            elif role == 'tool':
+                print(f"  [{timeline_position:2d}] 🔧 工具结果: {content[:40]}...")
 
             timeline_position += 1
 
@@ -6006,7 +6356,7 @@ SETTABLE_CONFIG = {
     "每日总结次数": ("Others.summary_per_day_limit", "int", "每群每天可总结次数"),
     "单次总结条数": ("Others.summary_max_messages", "int", "单次总结最多读取条数"),
     "压缩阈值": ("Others.compression_threshold", "int", "消息达到多少条允许压缩"),
-    "压缩保留": ("Others.compression_keep_recent", "int", "压缩时保留最近多少条"),
+    "压缩保留": ("Others.compression_keep_recent", "int", "压缩时保留最近多少轮"),
     "自动压缩条数": ("Others.auto_compress_after_messages", "int", "累计多少条自动压缩"),
     "弱黑名单概率": ("Others.weak_blacklist_trigger_probability", "prob", "0~1，越小越容易拦截"),
     "AI对话": ("FeatureSwitches.ai_chat", "bool", "总开关，开/关"),
@@ -6173,7 +6523,7 @@ async def handle_compression_commands(event, actions, is_group=True, order=""):
                 msg = f"📊 本群对话状态\n"
                 msg += f"═════════════════\n"
                 msg += f"当前消息数: {msg_count}条\n"
-                msg += f"保留最近: {cmc.compressor.keep_recent}条\n"
+                msg += f"保留最近: {cmc.compressor.keep_recent}轮\n"
                 msg += f"触发压缩: {ctx.compress_after_messages}条\n"
                 msg += f"自动压缩: {'✅ 开启' if ctx.auto_compress_enabled else '❌ 关闭'}\n"
                 msg += f"已压缩次数: {stats.get('compression_count', 0)}次\n"
@@ -6199,7 +6549,7 @@ async def handle_compression_commands(event, actions, is_group=True, order=""):
                 msg = f"📊 当前私聊状态\n"
                 msg += f"═════════════════\n"
                 msg += f"当前消息数: {msg_count}条\n"
-                msg += f"保留最近: {cmc.compressor.keep_recent}条\n"
+                msg += f"保留最近: {cmc.compressor.keep_recent}轮\n"
                 msg += f"触发压缩: {ctx.compress_after_messages}条\n"
                 msg += f"自动压缩: {'✅ 开启' if ctx.auto_compress_enabled else '❌ 关闭'}\n"
                 msg += f"已压缩次数: {stats.get('compression_count', 0)}次\n"
@@ -7200,12 +7550,13 @@ Token总计: {token_stats.total_tokens} Token（过去24小时）
             final_message = build_private_ai_text_message(event_user_nickname, order)
             deepseek_context = cmc.get_context(user_id, user_id, event_user_nickname)
 
-            # 检查是否有活跃的 Agent 会话，有则走 Follow-Up 注入
-            _p_session_id = f"private_{user_id}"
+            # 检查是否有活跃的 Agent 会话，有则走 Follow-Up 注入。
+            # 私聊的会话持有者就是发送者本人，不需要等级校验。
+            # 历史由 agen_content 在释放会话锁前写入，这里不能自己写。
+            _p_session_id = agent_session_id_of(deepseek_context)
             if _has_active_session(_p_session_id):
                 if _follow_up_session(_p_session_id, final_message):
-                    await append_follow_up_history(deepseek_context, final_message)
-                    print(f"[Follow-Up] 私聊 {user_id} 消息注入活跃 Agent 会话并写入历史: {final_message[:60]}")
+                    print(f"[Follow-Up] 私聊 {user_id} 消息注入活跃 Agent 会话: {final_message[:60]}")
                     return
                 print(f"[Follow-Up] 私聊 {user_id} 会话已结束，回退正常 AI 请求")
 
@@ -7255,12 +7606,13 @@ Token总计: {token_stats.total_tokens} Token（过去24小时）
             final_message = build_private_ai_text_message(event_user_nickname, user_message.strip())
             deepseek_context = cmc.get_context(user_id, user_id, event_user_nickname)
 
-            # 检查是否有活跃的 Agent 会话，有则走 Follow-Up 注入
-            _p2_session_id = f"private_{user_id}"
+            # 检查是否有活跃的 Agent 会话，有则走 Follow-Up 注入。
+            # 私聊的会话持有者就是发送者本人，不需要等级校验。
+            # 历史由 agen_content 在释放会话锁前写入，这里不能自己写。
+            _p2_session_id = agent_session_id_of(deepseek_context)
             if _has_active_session(_p2_session_id):
                 if _follow_up_session(_p2_session_id, final_message):
-                    await append_follow_up_history(deepseek_context, final_message)
-                    print(f"[Follow-Up] 私聊 {user_id} 消息注入活跃 Agent 会话并写入历史: {final_message[:60]}")
+                    print(f"[Follow-Up] 私聊 {user_id} 消息注入活跃 Agent 会话: {final_message[:60]}")
                     return
                 print(f"[Follow-Up] 私聊 {user_id} 会话已结束，回退正常 AI 请求")
 
@@ -8330,17 +8682,28 @@ Rebuilt from HypeR
                 final_message = build_group_ai_text_message(event_user_nickname, text_content.strip(), is_at_trigger=is_at_trigger)
                 deepseek_context = cmc.get_context(event.user_id, event.group_id, event_user_nickname)
 
-                # 检查是否有活跃的 Agent 会话，有则走 Follow-Up 注入
-                _g_session_id = f"group_{event.group_id}"
+                # 检查是否有活跃的 Agent 会话，有则走 Follow-Up 注入。
+                # 群聊会话按群号共享，所以这里可能命中的是别人起的循环——
+                # 注入者权限低于持有者时 _follow_up_session 会拒绝，
+                # 避免普通成员的话借管理员的工具白名单执行。
+                _g_session_id = agent_session_id_of(deepseek_context)
                 if _has_active_session(_g_session_id):
+                    _g_sender_level = resolve_agent_user_level(event.user_id)
                     # 检查与入队必须以返回值为准；会话可能恰好在两次操作之间结束。
-                    if _follow_up_session(_g_session_id, final_message):
-                        await append_follow_up_history(deepseek_context, final_message)
+                    # 历史由 agen_content 在释放会话锁前写入，这里不能自己写：
+                    # agen_content 全程持有 _history_lock，抢锁会一直阻塞到循环跑完。
+                    if _follow_up_session(_g_session_id, final_message,
+                                          sender_level=_g_sender_level):
                         # 本条已进 Agent，不走 consume；只丢掉自己，保留更早旁听给下次正式请求
                         discard_group_chat_context_record(event.group_id, _group_context_record_id)
-                        print(f"[Follow-Up] 群聊 {event.group_id} 消息注入活跃 Agent 会话并写入历史: {final_message[:60]}")
+                        print(f"[Follow-Up] 群聊 {event.group_id} 消息注入活跃 Agent 会话: {final_message[:60]}")
                         return
-                    print(f"[Follow-Up] 群聊 {event.group_id} 会话已结束，回退正常 AI 请求")
+                    _g_owner_level = _session_user_level(_g_session_id)
+                    if _g_owner_level and _LEVEL_RANK_MAIN.get(_g_sender_level, 0) < _LEVEL_RANK_MAIN.get(_g_owner_level, 0):
+                        print(f"[Follow-Up] 群聊 {event.group_id} 注入者权限({_g_sender_level})"
+                              f"低于会话持有者({_g_owner_level})，回退正常 AI 请求")
+                    else:
+                        print(f"[Follow-Up] 群聊 {event.group_id} 会话已结束，回退正常 AI 请求")
 
                 # 暂存「上次回复后、当前触发条之前」的旁听；仅当次请求，不落库。
                 # 所有 LLM 渠道最终失败时恢复，成功（含安全降级文本）后才确认消费。
@@ -8393,7 +8756,7 @@ def run_with_retry():
 
     print(f"=== {bot_name} {bot_name_en} 启动中 ===")
     print(f"记忆存储: data/ai_memory/")
-    print(f"动态压缩: 保留最近{user_cfg.get('compression_keep_recent', 20)}条消息，触发阈值{user_cfg.get('compression_threshold', 40)}条")
+    print(f"动态压缩: 保留最近{user_cfg.get('compression_keep_recent', 20)}轮，触发阈值{user_cfg.get('compression_threshold', 40)}条")
     print("=" * 20)
     set_connection_status("starting", "正在启动", "准备建立 OneBot / Hyper 连接")
 
@@ -8407,6 +8770,9 @@ def run_with_retry():
             print(f"尝试启动机器人... (第{retry_count + 1}次尝试)")
             set_connection_status("connecting", "连接中", f"第 {retry_count + 1} 次尝试连接 OneBot / Hyper")
             connect_time = time.time()
+            # Hyper 0.78.2 的 OneBot 适配器不会读取项目新增的 access_token；
+            # 在创建每条 WebSocket 连接前补上认证参数，不修改 site-packages。
+            install_onebot_ws_auth_patch()
             Listener.run()
             if HOT_SWITCH_IN_PROGRESS.is_set():
                 HOT_SWITCH_IN_PROGRESS.clear()
@@ -8447,7 +8813,7 @@ def run_with_retry():
             if time.time() - connect_time > 30:
                 retry_count = 0
             retry_count += 1
-            error_msg = str(e)
+            error_msg = _redact_connection_secrets(e)
             clear_current_qq_actions()
             set_connection_status("failed", "连接失败", error_msg)
 
@@ -8455,7 +8821,7 @@ def run_with_retry():
                 print(f"NapCat连接失败: {error_msg}")
             else:
                 print(f"启动失败: {error_msg}")
-                traceback.print_exc()
+                print(_redact_connection_secrets(traceback.format_exc()), end="")
 
             if running:
                 wait_time = reconnect_delay(retry_count)
@@ -8518,6 +8884,75 @@ print("=" * 60)
 
 cmc = EnhancedContextManager()
 
+
+def _webui_chat_numeric_id(session_id: str) -> int:
+    """把聊天室 UUID 稳定映射为纯数字，供 Agent 工作区隔离使用。"""
+    text = re.sub(r"[^0-9a-fA-F]", "", str(session_id or ""))
+    if not text:
+        text = uuid.uuid5(uuid.NAMESPACE_URL, str(session_id or "webui")).hex
+    return int(text[:15], 16)
+
+
+def handle_webui_chatroom_agent(payload: dict) -> dict:
+    """WebUI 聊天室同步入口：复用 QQ 对话同一套 Agent、上下文与追踪。"""
+    payload = payload if isinstance(payload, dict) else {}
+    session_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(payload.get("id") or ""))
+    if not session_id:
+        raise ValueError("无效的聊天室会话 ID")
+    numeric_id = _webui_chat_numeric_id(session_id)
+    system_prompt = cmc._get_system_prompt("WebUI 用户")
+    ctx = EnhancedLimitedDeepSeekContext(
+        system_prompt,
+        compressor=cmc.compressor,
+        session_id=f"webui_{session_id}",
+        context_type="webui",
+        chat_id=numeric_id,
+    )
+    history = payload.get("agent_history")
+    if not isinstance(history, list) or not history:
+        history = payload.get("visible_history")
+    if isinstance(history, list):
+        ctx.history = fix_messages([
+            dict(item) for item in history
+            if isinstance(item, dict) and item.get("role") in ("user", "assistant", "tool")
+        ])
+        ctx._enforce_message_limit()
+    ctx.total_tokens = int(payload.get("total_tokens") or 0)
+    ctx.total_calls = int(payload.get("total_calls") or 0)
+
+    attachments = payload.get("attachments") if isinstance(payload.get("attachments"), list) else []
+    image_urls = [
+        str(item.get("data") or "") for item in attachments
+        if isinstance(item, dict)
+        and str(item.get("type") or "").startswith("image/")
+        and str(item.get("data") or "").startswith("data:image/")
+    ]
+    message = {"text": str(payload.get("text") or ""), "image_urls": image_urls}
+    result, _, _, _ = asyncio.run(ctx.agen_content(
+        message,
+        agent_meta={
+            "user_id": str(numeric_id),
+            "user_level": "admin" if bool(payload.get("admin")) else "user",
+            "preferred_model": str(payload.get("model") or ""),
+            "disable_global_actions": True,
+            "actions": None,
+            "event": None,
+        },
+    ))
+    return {
+        "reply": result,
+        "history": fix_messages(list(ctx.history)),
+        "total_tokens": int(ctx.total_tokens or 0),
+        "total_calls": int(ctx.total_calls or 0),
+        "trace_id": str(ctx.last_trace_id or ""),
+    }
+
+
+def stop_webui_chatroom_agent(session_id: str) -> bool:
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", str(session_id or ""))
+    return bool(safe and AGENT_ABORTS.request_stop(f"webui_{safe}"))
+
+
 # 初始化压缩统计
 init_compression_stats()
 
@@ -8572,6 +9007,11 @@ if __name__ == "__main__":
                 _set_mcp_reload_hook(_agent_request_mcp_reload)
             except Exception as _e:
                 print(f"注册 MCP 重连回调失败（忽略）：{_e}")
+        if callable(_set_chatroom_agent_callbacks):
+            try:
+                _set_chatroom_agent_callbacks(handle_webui_chatroom_agent, stop_webui_chatroom_agent)
+            except Exception as _e:
+                print(f"注册聊天室 Agent 回调失败（忽略）：{_e}")
         start_webui(on_config_saved=apply_runtime_config)
         # 定时任务调度器必须在这里启动，不能只依赖「收到第一条 QQ 消息时」——
         # 机器人起来后长时间没人说话，已经到期的提醒一条都不会发出去。
@@ -8625,6 +9065,11 @@ if __name__ == "__main__":
                 _set_debug_self_message_callback(send_debug_self_message)
             except Exception as _e:
                 print(f"注册调试自检回调失败（忽略）：{_e}")
+        if callable(_set_chatroom_agent_callbacks):
+            try:
+                _set_chatroom_agent_callbacks(handle_webui_chatroom_agent, stop_webui_chatroom_agent)
+            except Exception as _e:
+                print(f"注册聊天室 Agent 回调失败（忽略）：{_e}")
         start_webui(on_config_saved=apply_runtime_config)
         # 定时任务调度器必须在这里启动，不能只依赖「收到第一条 QQ 消息时」——
         # 机器人起来后长时间没人说话，已经到期的提醒一条都不会发出去。

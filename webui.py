@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import traceback
+import weakref
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -67,7 +68,8 @@ LEGACY_CONFIG_PATHS = [
 _server: Optional[ThreadingHTTPServer] = None
 _server_thread: Optional[threading.Thread] = None
 _started_at = time.time()
-_log_buffer = deque(maxlen=800)
+# 实时日志页需要覆盖足够长的排障窗口。这里只保存轻量行对象；完整日志仍按天落盘。
+_log_buffer = deque(maxlen=3000)
 _log_lock = threading.RLock()
 _capture_installed = False
 _capture_stdout = None
@@ -76,6 +78,8 @@ _config_saved_callback = None
 _pre_restart_callback = None  # 由外部注册：自动更新重启前保存状态、释放资源等
 _qq_send_callback = None  # 由 main.py 注册：通过当前 OneBot / Hyper 连接发送 QQ 消息
 _debug_self_message_callback = None  # 由 main.py 注册：给机器人自己发调试私聊消息
+_chatroom_agent_callback = None  # 由 main.py 注册：复用统一 Agent / 上下文 / 追踪链路
+_chatroom_stop_callback = None  # 由 main.py 注册：中断聊天室 Agent 循环
 _webui_reconfigure_lock = threading.RLock()
 _update_cache_lock = threading.RLock()
 _update_cache = {"timestamp": 0.0, "data": None}
@@ -300,7 +304,9 @@ def force_apply_llm_endpoints_from_config(cfg: Dict[str, Any]):
 # ==================== 聊天室（WebUI 内置 AI 对话，独立沙盒） ====================
 CHATROOM_DIR = BASE_DIR / "data" / "webui" / "chatroom"
 _chatroom_lock = threading.RLock()
-_chatroom_session_locks: Dict[str, threading.RLock] = {}
+# 会话 ID 可以无限创建；强引用锁字典会在删除会话后持续泄漏。活动请求持有返回值的
+# 强引用即可，空闲锁用弱引用自动回收。
+_chatroom_session_locks = weakref.WeakValueDictionary()
 
 
 def _chatroom_session_lock(session_id: str) -> threading.RLock:
@@ -426,15 +432,30 @@ def _chatroom_save(obj: Dict[str, Any]):
     _atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
 
 
+
+def _chatroom_public(obj: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """剥离仅供后端 Agent 使用的工具链历史。"""
+    if not isinstance(obj, dict):
+        return obj
+    public = dict(obj)
+    public.pop("_agent_history", None)
+    public.pop("_agent_total_tokens", None)
+    public.pop("_agent_total_calls", None)
+    return public
+
+
 def _chatroom_delete(session_id: str) -> bool:
-    path = _chatroom_path(session_id)
-    if path.exists():
+    # 删除必须和发送共用同一把会话锁。否则 Agent 正在执行时删除文件，
+    # _chatroom_append_assistant() 会用旧 obj 把已删除会话重新写回来。
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", str(session_id or ""))
+    if not safe:
+        return False
+    with _chatroom_session_lock(safe):
+        path = _chatroom_path(safe)
+        if not path.exists():
+            return False
         path.unlink()
-        safe = re.sub(r"[^a-zA-Z0-9_-]", "", str(session_id or ""))
-        with _chatroom_lock:
-            _chatroom_session_locks.pop(safe, None)
-        return True
-    return False
+    return True
 
 
 def _chatroom_pair_count(messages: list[Dict[str, Any]]) -> int:
@@ -701,6 +722,9 @@ def _chatroom_stream_complete(model: str, messages: list[Dict[str, Any]]):
 # 会话 JSON 会无限膨胀，而且每次请求都要把整段历史重新发给模型。
 CHATROOM_MAX_MESSAGES = 200
 CHATROOM_MAX_CHARS = 2 * 1024 * 1024
+# 隐藏的 Agent 工具链不计入可见消息上限；单独限制，避免工具结果让会话文件无限增长。
+CHATROOM_AGENT_MAX_MESSAGES = 96
+CHATROOM_AGENT_MAX_CHARS = 512 * 1024
 
 
 def _chatroom_msg_size(msg: Dict[str, Any]) -> int:
@@ -726,6 +750,26 @@ def _chatroom_trim_history(obj: Dict[str, Any]) -> None:
         dropped = msgs.pop(0)
         if isinstance(dropped, dict):
             total -= _chatroom_msg_size(dropped)
+
+
+def _chatroom_trim_agent_history(obj: Dict[str, Any]) -> None:
+    """限制隐藏 Agent 历史，并从完整 user turn 开始保留。"""
+    history = obj.get("_agent_history")
+    if not isinstance(history, list):
+        return
+    cleaned = [
+        dict(item) for item in history
+        if isinstance(item, dict) and item.get("role") in ("user", "assistant", "tool")
+    ]
+    while cleaned and (
+        len(cleaned) > CHATROOM_AGENT_MAX_MESSAGES
+        or sum(len(json.dumps(x, ensure_ascii=False, separators=(",", ":"), default=str)) for x in cleaned)
+        > CHATROOM_AGENT_MAX_CHARS
+    ):
+        cleaned.pop(0)
+    while cleaned and cleaned[0].get("role") != "user":
+        cleaned.pop(0)
+    obj["_agent_history"] = cleaned
 
 
 # 单条消息的硬上限。历史裁剪循环有「至少保留两条」的下限，所以单条本身超预算时
@@ -771,20 +815,36 @@ def _chatroom_prepare_user_message(session_id: str, model: str, text: str, attac
             msg["attachments"] = attachments[:8]
         obj["messages"].append(msg)
         _chatroom_trim_history(obj)
+        _chatroom_trim_agent_history(obj)
         if obj.get("title", "新会话") == "新会话":
             obj["title"] = text.strip()[:30] or "新会话"
         _chatroom_save(obj)
     return obj, text
 
 
-def _chatroom_append_assistant(obj: Dict[str, Any], reply: str) -> Dict[str, Any]:
+def _chatroom_append_assistant(obj: Dict[str, Any], reply: str,
+                               agent_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     with _chatroom_lock:
         fresh = _chatroom_load(obj.get("id", "")) or obj
-        fresh.setdefault("messages", []).append({"role": "assistant", "content": reply, "ts": int(time.time()), "request_id": next((m.get("request_id") for m in reversed(fresh["messages"]) if m.get("role") == "user" and m.get("request_id")), "")})
+        fresh.setdefault("messages", []).append({
+            "role": "assistant",
+            "content": reply,
+            "ts": int(time.time()),
+            "request_id": next((
+                m.get("request_id") for m in reversed(fresh["messages"])
+                if m.get("role") == "user" and m.get("request_id")
+            ), ""),
+        })
+        if isinstance(agent_state, dict):
+            history = agent_state.get("history")
+            if isinstance(history, list):
+                fresh["_agent_history"] = history
+            fresh["_agent_total_tokens"] = int(agent_state.get("total_tokens") or 0)
+            fresh["_agent_total_calls"] = int(agent_state.get("total_calls") or 0)
+            _chatroom_trim_agent_history(fresh)
         _chatroom_trim_history(fresh)
         _chatroom_save(fresh)
         return fresh
-
 
 def _chatroom_remove_pending_user(session_id: str, request_id: str) -> None:
     """请求未完成时移除对应孤立 user turn。"""
@@ -802,18 +862,44 @@ def _chatroom_remove_pending_user(session_id: str, request_id: str) -> None:
         _chatroom_save(obj)
 
 
-def _chatroom_send(session_id: str, model: str, text: str, attachments: Optional[list[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def _chatroom_send(session_id: str, model: str, text: str,
+                   attachments: Optional[list[Dict[str, Any]]] = None) -> Dict[str, Any]:
     with _chatroom_session_lock(session_id):
         obj, text = _chatroom_prepare_user_message(session_id, model, text, attachments)
+        request_id = next((
+            m.get("request_id") for m in reversed(obj.get("messages", []))
+            if isinstance(m, dict) and m.get("role") == "user"
+        ), "")
         hint = _chatroom_handle_command(text)
-        if hint is not None:
-            reply = hint
-        else:
-            llm_messages = _chatroom_build_llm_messages(obj, obj.get("model") or model)
-            reply = _chatroom_complete(obj.get("model") or model, llm_messages)
-        obj = _chatroom_append_assistant(obj, reply)
-        return {"reply": reply, "session": obj}
-
+        agent_state = None
+        try:
+            if hint is not None:
+                reply = hint
+            elif callable(_chatroom_agent_callback):
+                result = _chatroom_agent_callback({
+                    "id": session_id,
+                    "model": obj.get("model") or model,
+                    "text": text,
+                    "attachments": attachments or [],
+                    "agent_history": obj.get("_agent_history") or [],
+                    "total_tokens": obj.get("_agent_total_tokens") or 0,
+                    "total_calls": obj.get("_agent_total_calls") or 0,
+                    "admin": bool(str(get_webui_config().get("access_token", "") or "").strip()),
+                })
+                if not isinstance(result, dict):
+                    raise RuntimeError("聊天室 Agent 回调返回格式无效")
+                reply = str(result.get("reply") or "")
+                agent_state = result
+            else:
+                llm_messages = _chatroom_build_llm_messages(obj, obj.get("model") or model)
+                reply = _chatroom_complete(obj.get("model") or model, llm_messages)
+        except Exception:
+            # 同步接口也必须和 SSE 接口一致：模型/Agent 失败时删除尚未配对的 user turn，
+            # 否则下一次请求会把一条永远没有 assistant 的消息带进上下文。
+            _chatroom_remove_pending_user(session_id, request_id)
+            raise
+        obj = _chatroom_append_assistant(obj, reply, agent_state=agent_state)
+        return {"reply": reply, "session": _chatroom_public(obj)}
 
 def normalize_string_list(values: Any) -> list[str]:
     if isinstance(values, str):
@@ -1277,7 +1363,7 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("Others.summary_per_day_limit", "每日总结次数", "number", "每个群每天允许总结的次数"),
             field("Others.summary_max_messages", "每次最多总结消息数", "number", "单次群聊总结最多读取多少条消息"),
             field("Others.compression_threshold", "压缩触发阈值", "number", "消息达到多少条后允许触发压缩"),
-            field("Others.compression_keep_recent", "压缩保留最近消息", "number", "压缩时保留最近多少条原始消息"),
+            field("Others.compression_keep_recent", "压缩保留最近消息", "number", "压缩时保留最近多少轮（完整对话轮次）"),
             field("Others.auto_compress_after_messages", "自动压缩消息数", "number", "消息累计到多少条时自动尝试压缩"),
             field("Others.system.log_retention_days", "日志保留天数", "number", "data/webui 下超出天数的 runtime-*.log 会被自动删除。每小时检查一次，保存配置时立即执行一次", 7, category="系统设置", min=1, max=365),
             field("Others.system.trace_max_records", "追踪保存条数", "number", "AI 对话追踪最多保留多少条记录，超出丢最旧的。条数越多占用磁盘和内存越大", 100, category="系统设置", min=1, max=1000),
@@ -1306,6 +1392,7 @@ field("Agent.show_time", "显示当前时间", "bool", "开启后每次对话在
             field("Connection.listener_host", "监听地址", "text"),
             field("Connection.listener_port", "监听端口", "number"),
             field("Connection.retries", "重试次数", "number"),
+            field("Connection.access_token", "OneBot 连接 Token", "password", "NapCat / OneBot WebSocket 认证 Token；仅 protocol=OneBot 时使用，保存后会重启连接。"),
             field("protocol", "协议", "select", options=["OneBot", "Satori"]),
             field("Log_level", "日志等级", "select", options=["DEBUG", "INFO", "WARNING", "ERROR"]),
         ]},
@@ -1346,13 +1433,13 @@ def set_ui_value(payload: Dict[str, Any], path: str, value):
     deep_set(payload.setdefault("config_json", {}), path, value)
 
 
-def collect_ui_state() -> Dict[str, Any]:
+def collect_ui_state(log_limit: int = 100) -> Dict[str, Any]:
     bundle = collect_config_bundle()
     values = {}
     for section in bundle["ui_schema"]:
         for item in section.get("fields", []):
             values[item["path"]] = get_ui_value(bundle, item["path"], item.get("default"))
-    return {**bundle, "form_values": values, "status": get_status(), "logs": get_recent_logs(100), "statistics": collect_statistics()}
+    return {**bundle, "form_values": values, "status": get_status(), "logs": get_recent_logs(log_limit), "statistics": collect_statistics()}
 
 
 def save_ui_state(data: Dict[str, Any]):
@@ -1400,15 +1487,30 @@ def _save_ui_state_locked(data: Dict[str, Any]):
 def get_recent_logs(limit: int = 100) -> list[Dict[str, str]]:
     # 顺带做一次日志清理，内部按小时防抖，不会每次都扫目录
     prune_old_logs()
+    try:
+        limit = max(1, min(int(limit), 5000))
+    except (TypeError, ValueError):
+        limit = 100
     with _log_lock:
         logs = list(_log_buffer)[-limit:]
-    if logs:
+    # 内存足够时保留 ANSI 颜色；刚重启时内存通常只有几条启动日志，不能因此
+    # 完全跳过当天磁盘日志，否则“实时日志”页看起来像只保留了几条。
+    if len(logs) >= limit:
         return logs
     today = _log_file()
     if today.exists():
         lines = _iter_runtime_log_lines(limit)
-        return [{"time": "", "stream": "file", "message": line} for line in lines]
-    return []
+        if lines:
+            rows = []
+            pattern = re.compile(r"^\[([^]]*)\]\s+\[([^]]*)\]\s?(.*)$")
+            for line in lines:
+                match = pattern.match(line)
+                if match:
+                    rows.append({"time": match.group(1), "stream": match.group(2), "message": match.group(3)})
+                else:
+                    rows.append({"time": "", "stream": "file", "message": line})
+            return rows[-limit:]
+    return logs
 
 
 def _iter_runtime_log_lines(limit: int = 20000) -> list[str]:
@@ -1934,6 +2036,14 @@ def set_debug_self_message_callback(fn) -> None:
     """供 main.py 注册调试用的“给机器人自己发消息”入口。"""
     global _debug_self_message_callback
     _debug_self_message_callback = fn
+
+
+
+def set_chatroom_agent_callbacks(send_fn, stop_fn=None) -> None:
+    """供 main.py 注册统一聊天室 Agent 入口与中断入口。"""
+    global _chatroom_agent_callback, _chatroom_stop_callback
+    _chatroom_agent_callback = send_fn
+    _chatroom_stop_callback = stop_fn
 
 
 def is_feature_enabled_now(key: str, default: bool = True) -> bool:
@@ -3236,7 +3346,10 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"ok": True, "data": collect_config_bundle()})
             elif parsed.path == "/api/logs":
                 qs = urllib.parse.parse_qs(parsed.query)
-                limit = int((qs.get("limit") or ["100"])[0])
+                try:
+                    limit = max(1, min(int((qs.get("limit") or ["100"])[0]), 5000))
+                except (TypeError, ValueError):
+                    limit = 100
                 _json_response(self, {"ok": True, "data": get_recent_logs(limit)})
             elif parsed.path == "/api/features":
                 bundle = collect_config_bundle()
@@ -3244,7 +3357,12 @@ class WebUIHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/agent/mcp":
                 _json_response(self, {"ok": True, "data": get_mcp_state()})
             elif parsed.path == "/api/ui-state":
-                _json_response(self, {"ok": True, "data": collect_ui_state()})
+                qs = urllib.parse.parse_qs(parsed.query)
+                try:
+                    log_limit = max(1, min(int((qs.get("log_limit") or ["100"])[0]), 5000))
+                except (TypeError, ValueError):
+                    log_limit = 100
+                _json_response(self, {"ok": True, "data": collect_ui_state(log_limit=log_limit)})
             elif parsed.path == "/api/statistics":
                 _json_response(self, {"ok": True, "data": collect_statistics()})
             elif parsed.path == "/api/update/check":
@@ -3275,7 +3393,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 if obj is None:
                     _json_response(self, {"ok": False, "error": "会话不存在"}, 404)
                 else:
-                    _json_response(self, {"ok": True, "data": obj})
+                    _json_response(self, {"ok": True, "data": _chatroom_public(obj)})
             elif parsed.path == "/api/trace/list":
                 qs = urllib.parse.parse_qs(parsed.query)
                 try:
@@ -3519,7 +3637,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/chat/new":
                 payload = data or {}
                 obj = _chatroom_new_session(str(payload.get("model", "") or ""), str(payload.get("title", "") or ""))
-                _json_response(self, {"ok": True, "data": obj})
+                _json_response(self, {"ok": True, "data": _chatroom_public(obj)})
             elif parsed.path == "/api/chat/send-stream":
                 payload = data or {}
                 sid = str(payload.get("id", "") or "")
@@ -3541,16 +3659,34 @@ class WebUIHandler(BaseHTTPRequestHandler):
                         request_id = next((m.get("request_id") for m in reversed(obj.get("messages", [])) if m.get("role") == "user"), "")
                         hint = _chatroom_handle_command(full_text)
                         reply_parts = []
+                        agent_state = None
                         if hint is not None:
                             reply_parts.append(hint)
                             _sse("delta", {"text": hint})
+                        elif callable(_chatroom_agent_callback):
+                            result = _chatroom_agent_callback({
+                                "id": sid,
+                                "model": obj.get("model") or model,
+                                "text": full_text,
+                                "attachments": attachments,
+                                "agent_history": obj.get("_agent_history") or [],
+                                "total_tokens": obj.get("_agent_total_tokens") or 0,
+                                "total_calls": obj.get("_agent_total_calls") or 0,
+                                "admin": bool(str(get_webui_config().get("access_token", "") or "").strip()),
+                            })
+                            if not isinstance(result, dict):
+                                raise RuntimeError("聊天室 Agent 回调返回格式无效")
+                            reply_parts.append(str(result.get("reply") or ""))
+                            agent_state = result
                         else:
                             llm_messages = _chatroom_build_llm_messages(obj, obj.get("model") or model)
                             for part in _chatroom_stream_complete(obj.get("model") or model, llm_messages):
                                 reply_parts.append(part)
                                 _sse("delta", {"text": part})
-                        fresh = _chatroom_append_assistant(obj, "".join(reply_parts))
-                        _sse("done", {"session": fresh})
+                        fresh = _chatroom_append_assistant(
+                            obj, "".join(reply_parts), agent_state=agent_state
+                        )
+                        _sse("done", {"session": _chatroom_public(fresh)})
                 except (BrokenPipeError, ConnectionResetError):
                     _chatroom_remove_pending_user(sid, request_id)
                 except Exception as e:
@@ -3565,6 +3701,12 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 result = _chatroom_send(str(payload.get("id", "") or ""), str(payload.get("model", "") or ""), str(payload.get("text", "") or ""), payload.get("attachments") if isinstance(payload.get("attachments"), list) else [])
                 _json_response(self, {"ok": True, "data": result})
 
+            elif parsed.path == "/api/chat/stop":
+                payload = data or {}
+                sid = str(payload.get("id", "") or "")
+                stopped = bool(_chatroom_stop_callback(sid)) if callable(_chatroom_stop_callback) else False
+                _json_response(self, {"ok": True, "data": {"stopped": stopped}})
+
             elif parsed.path == "/api/chat/model":
                 payload = data or {}
                 sid = str(payload.get("id", "") or "")
@@ -3573,26 +3715,26 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 if model not in available_models:
                     _json_response(self, {"ok": False, "error": "所选模型不可用，请刷新模型列表"}, 400)
                 else:
-                    with _chatroom_lock:
+                    with _chatroom_session_lock(sid):
                         obj = _chatroom_load(sid)
                         if obj is None:
                             _json_response(self, {"ok": False, "error": "会话不存在"}, 404)
                         else:
                             obj["model"] = model
                             _chatroom_save(obj)
-                            _json_response(self, {"ok": True, "data": obj})
+                            _json_response(self, {"ok": True, "data": _chatroom_public(obj)})
 
             elif parsed.path == "/api/chat/rename":
                 payload = data or {}
                 sid = str(payload.get("id", "") or "")
-                with _chatroom_lock:
+                with _chatroom_session_lock(sid):
                     obj = _chatroom_load(sid)
                     if obj is None:
                         _json_response(self, {"ok": False, "error": "会话不存在"}, 404)
                     else:
                         obj["title"] = (str(payload.get("title", "") or "").strip()[:60]) or obj.get("title", "新会话")
                         _chatroom_save(obj)
-                        _json_response(self, {"ok": True, "data": obj})
+                        _json_response(self, {"ok": True, "data": _chatroom_public(obj)})
             elif parsed.path == "/api/chat/delete":
                 payload = data or {}
                 ok = _chatroom_delete(str(payload.get("id", "") or ""))
