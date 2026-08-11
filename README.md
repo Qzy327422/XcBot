@@ -10,12 +10,8 @@
 [![OneBot](https://img.shields.io/badge/OneBot-11-111827)](https://github.com/botuniverse/onebot-11)
 [![Framework](https://img.shields.io/badge/Framework-Hyper-EF4444)](https://pypi.org/project/hyper-bot/)
 [![Agent](https://img.shields.io/badge/Agent-Tool%20Calling-8B5CF6)](#agent-能力)
-[![Version](https://img.shields.io/badge/Version-v3.4-0EA5E9?logo=semanticrelease&logoColor=white)](https://github.com/Qzy327422/XcBot)
 [![GitHub Stars](https://img.shields.io/github/stars/Qzy327422/XcBot?style=flat&logo=github&label=Stars)](https://github.com/Qzy327422/XcBot/stargazers)
-[![GitHub Forks](https://img.shields.io/github/forks/Qzy327422/XcBot?style=flat&logo=github&label=Forks)](https://github.com/Qzy327422/XcBot/network/members)
-[![GitHub Issues](https://img.shields.io/github/issues/Qzy327422/XcBot?logo=github&label=Issues)](https://github.com/Qzy327422/XcBot/issues)
-[![Repo Size](https://img.shields.io/github/repo-size/Qzy327422/XcBot?logo=github&label=Repo%20Size)](https://github.com/Qzy327422/XcBot)
-[![Last Commit](https://img.shields.io/github/last-commit/Qzy327422/XcBot?logo=github&label=Last%20Commit)](https://github.com/Qzy327422/XcBot/commits)
+
 
 [项目主页](https://qzy327422.github.io/XcBot/) ·
 [快速开始](#快速开始) ·
