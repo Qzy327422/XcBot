@@ -3,7 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="XcBot 使用指南：安装、NapCat 连接、模型与 Agent 配置。">
+  <meta name="description" content="XcBot 使用指南：安装依赖、连接 NapCat、配置人格与角色扮演、多模型设置、Agent 工具开关及 WebUI 使用说明。">
+  <meta name="keywords" content="XcBot,QQ机器人,使用指南,安装,NapCat,角色扮演,人格设定,AI对话,Agent,WebUI">
+  <meta property="og:title" content="使用指南 — XcBot">
+  <meta property="og:description" content="XcBot 安装、NapCat 连接、人格配置、Agent 工具、WebUI 使用说明。">
+  <meta property="og:url" content="https://qzy327422.github.io/XcBot/guide.html">
+  <link rel="canonical" href="https://qzy327422.github.io/XcBot/guide.html">
   <meta name="theme-color" content="#0b1020">
   <title>使用指南 — XcBot</title>
   <link rel="icon" href="assets/icon.jpg">
@@ -48,6 +53,7 @@
         <strong>目录</strong>
         <a href="#install">安装</a>
         <a href="#napcat">连接 NapCat</a>
+        <a href="#persona">人格与角色扮演</a>
         <a href="#model">配置模型</a>
         <a href="#agent">Agent 与权限</a>
         <a href="#webui">WebUI</a>
@@ -85,7 +91,16 @@ pip install -r requirements.txt</code></pre>
           <div class="callout warning"><strong>连接被重置？</strong>先确认端口、路径与 Token 完全一致。若 NapCat 开启了 Token 校验而 XcBot 未填写，握手可能在 TCP 阶段被服务端主动关闭。</div>
         </section>
 
-        <section id="model">
+        
+        <section id="persona">
+          <h2>人格与角色扮演</h2>
+          <p>在 WebUI 的「人格设定」页，用一段自然语言描述 AI 的性格、语气和说话风格。描述写得越具体，效果越稳定。</p>
+          <pre><code>你是「小忧」，一个温柔、略带俏皮的陪伴助手。
+说话简短自然，偶尔用颜文字，会照顾对方的情绪。
+不油腻，不过分热情，但始终在场。</code></pre>
+          <p>多轮对话中机器人会尽量保持设定的风格。如果你需要它扮演特定角色，只需在人格里写明角色背景即可。</p>
+          <div class="callout"><strong>提示：</strong>人格设定在 WebUI「人格」页修改，重启前生效。每个会话使用相同人格，但各自维护独立上下文。</div>
+        </section><section id="model">
           <h2>配置模型</h2>
           <p>在 WebUI 的「提供商」页填写兼容 OpenAI 格式的接口，可配置多个并设置轮换顺序：</p>
           <pre><code>Base URL: https://api.deepseek.com/v1
@@ -151,6 +166,7 @@ API Key:  sk-你的真实Key</code></pre>
         <strong>本页</strong>
         <a href="#install">安装</a>
         <a href="#napcat">连接 NapCat</a>
+        <a href="#persona">人格与角色扮演</a>
         <a href="#model">配置模型</a>
         <a href="#agent">Agent 与权限</a>
         <a href="#webui">WebUI</a>
