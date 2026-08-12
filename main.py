@@ -955,25 +955,84 @@ def install_onebot_ws_auth_patch(adapter_module=None) -> bool:
         if getattr(adapter_module, "__name__", "").endswith(".Satori"):
             return False
         network = getattr(adapter_module, "Network", None)
-        constructor = getattr(network, "WebsocketConnection", None)
-        if constructor is None:
+        connection_class = getattr(network, "WebsocketConnection", None)
+
+        # v3.4 的旧补丁曾把这个类替换成普通构造函数。WebUI 热重启时
+        # Hyper 模块可能仍留在当前进程，先还原旧补丁保存的原始连接类。
+        if not isinstance(connection_class, type):
+            original_class = getattr(connection_class, "_xcbot_original", None)
+            if isinstance(original_class, type):
+                network.WebsocketConnection = original_class
+                connection_class = original_class
+        if not isinstance(connection_class, type):
+            print(
+                "OneBot WebSocket Token 兼容补丁未安装："
+                f"Hyper.Network.WebsocketConnection 不是类型，而是 {type(connection_class).__name__}。"
+            )
             return False
-        if getattr(constructor, "_xcbot_access_token_patch", False):
+        if getattr(connection_class, "_xcbot_access_token_patch", False):
+            install_onebot_packet_send_patch(connection_class, network)
             return True
 
-        def _wrapped_ws_connection(url, *args, **kwargs):
+        original_init = connection_class.__init__
+
+        def _patched_ws_connection_init(self, url, *args, **kwargs):
             runtime = read_runtime_config()
             connection_cfg = runtime.get("Connection", {}) if isinstance(runtime, dict) else {}
             if not isinstance(connection_cfg, dict):
                 connection_cfg = {}
-            return constructor(_onebot_ws_url_with_auth(url, connection_cfg), *args, **kwargs)
+            original_init(self, _onebot_ws_url_with_auth(url, connection_cfg), *args, **kwargs)
 
-        _wrapped_ws_connection._xcbot_access_token_patch = True
-        _wrapped_ws_connection._xcbot_original = constructor
-        network.WebsocketConnection = _wrapped_ws_connection
+        # Keep WebsocketConnection as a class: Hyper uses it in isinstance() when sending packets.
+        connection_class.__init__ = _patched_ws_connection_init
+        connection_class._xcbot_access_token_patch = True
+        connection_class._xcbot_original_init = original_init
+        install_onebot_packet_send_patch(connection_class, network)
         return True
     except Exception as exc:
         print(f"OneBot WebSocket Token 兼容补丁安装失败（将按 Hyper 原始方式连接）: {exc}")
+        return False
+
+
+def install_onebot_packet_send_patch(connection_class, network=None) -> bool:
+    """避免 Hyper 发送时依赖可被运行时补丁改写的连接类全局名称。"""
+    try:
+        packet_class = getattr(Manager, "Packet", None)
+        if not isinstance(packet_class, type):
+            return False
+        current_send_to = getattr(packet_class, "send_to", None)
+        if getattr(current_send_to, "_xcbot_stable_connection_type_patch", False):
+            return True
+
+        http_connection_class = getattr(network, "HTTPConnection", None)
+        if not isinstance(http_connection_class, type):
+            http_connection_class = None
+
+        def _patched_packet_send_to(packet, connection):
+            if isinstance(connection, connection_class):
+                payload = {
+                    "action": packet.endpoint,
+                    "params": packet.paras,
+                    "echo": packet.echo,
+                }
+                connection.send(json.dumps(payload))
+                return
+
+            if http_connection_class is not None and isinstance(connection, http_connection_class):
+                connection.send(packet.endpoint, packet.paras, packet.echo)
+                return
+
+            raise TypeError(
+                "不支持的 OneBot 连接对象: "
+                f"{type(connection).__module__}.{type(connection).__name__}"
+            )
+
+        _patched_packet_send_to._xcbot_stable_connection_type_patch = True
+        _patched_packet_send_to._xcbot_original = current_send_to
+        packet_class.send_to = _patched_packet_send_to
+        return True
+    except Exception as exc:
+        print(f"OneBot 发送类型兼容补丁安装失败: {exc}")
         return False
 
 

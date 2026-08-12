@@ -2195,6 +2195,7 @@ def install_latest_update() -> None:
             info = fetch_update_info(force=True)
             latest_version = str(info.get("latest_version") or "").strip()
             tag_name = str(info.get("tag_name") or latest_version).strip()
+            asset_zip_url = str(info.get("asset_zip_url") or "").strip()
             zip_url = str(info.get("zipball_url") or "").strip()
             if not latest_version:
                 raise RuntimeError("未获取到可安装的更新包")
@@ -2211,9 +2212,19 @@ def install_latest_update() -> None:
                 cfg_for_repo = read_json(CONFIG_PATH, {})
                 repo = str((cfg_for_repo.get("Others") or {}).get("github_repo", "") or "").strip() or GITHUB_REPO
                 raw_tag = urllib.parse.quote(tag_name)
+                github_asset_url = asset_zip_url or (
+                    f"https://github.com/{repo}/releases/download/{raw_tag}/XcBot.zip"
+                    if repo and tag_name else ""
+                )
                 github_zip_url = zip_url or (f"https://github.com/{repo}/archive/refs/tags/{raw_tag}.zip" if repo and tag_name else "")
+                # Release 附件是发布者实际上传的成品包；GitHub 自动生成的 Tag
+                # 源码包可能与附件内容不同，因此附件必须优先，Tag 仅作后备。
+                if github_asset_url:
+                    download_candidates.extend(_github_accelerated_urls(github_asset_url))
                 if github_zip_url:
-                    download_candidates.extend(_github_accelerated_urls(github_zip_url))
+                    for candidate in _github_accelerated_urls(github_zip_url):
+                        if candidate not in download_candidates:
+                            download_candidates.append(candidate)
                 if not download_candidates:
                     raise RuntimeError("未获取到可下载的更新地址")
 
@@ -2263,10 +2274,22 @@ def install_latest_update() -> None:
                         with zf.open(info, "r") as src, out.open("wb") as dst:
                             shutil.copyfileobj(src, dst)
 
-                candidates = [x for x in extract_dir.iterdir() if x.is_dir()]
-                if not candidates:
-                    raise RuntimeError("更新包解压失败：未找到项目目录")
-                release_root = candidates[0]
+                # Release 附件通常把 main.py 直接放在 ZIP 根目录；GitHub 自动
+                # 生成的 Tag ZIP 则会额外套一层 "repo-tag" 目录。两种都支持，
+                # 并用项目标志文件识别根目录，不能随便取第一个子目录。
+                if (extract_dir / "main.py").is_file() and (extract_dir / "webui.py").is_file():
+                    release_root = extract_dir
+                else:
+                    candidates = [
+                        x for x in extract_dir.iterdir()
+                        if x.is_dir() and (x / "main.py").is_file() and (x / "webui.py").is_file()
+                    ]
+                    if len(candidates) != 1:
+                        raise RuntimeError(
+                            "更新包解压失败：未找到唯一项目目录"
+                            f"（候选数量 {len(candidates)}）"
+                        )
+                    release_root = candidates[0]
 
                 if had_old_config:
                     shutil.copy2(CONFIG_PATH, old_config_copy)
@@ -2824,6 +2847,7 @@ def fetch_update_info(force: bool = False) -> Dict[str, Any]:
         "release_name": "",
         "published_at": "",
         "release_url": html_url,
+        "asset_zip_url": "",
         "zipball_url": "",
         "body": "",
         "update_sources": _github_accelerated_urls(html_url) if html_url else [],
@@ -2863,6 +2887,7 @@ def fetch_update_info(force: bool = False) -> Dict[str, Any]:
 
     latest_version = tag_name
     # zip 下载地址不依赖 API，按 GitHub 固定 URL 规则拼即可
+    asset_zip_url = f"https://github.com/{repo}/releases/download/{urllib.parse.quote(tag_name)}/XcBot.zip"
     zipball_url = f"https://github.com/{repo}/archive/refs/tags/{urllib.parse.quote(tag_name)}.zip"
 
     # 用 atom feed 补一下名字/时间/正文。失败也无所谓，不阻断。
@@ -2892,6 +2917,7 @@ def fetch_update_info(force: bool = False) -> Dict[str, Any]:
         "release_name": release_name,
         "published_at": published_at,
         "release_url": release_url,
+        "asset_zip_url": asset_zip_url,
         "zipball_url": zipball_url,
         "body": body,
     })

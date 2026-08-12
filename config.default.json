@@ -32,7 +32,7 @@
     "_comment_protocol": "协议类型，默认 OneBot。",
     "Others": {
         "project_name": "XcBot",
-        "version_name": "v3.4",
+        "version_name": "v3.4.1",
         "slogan": "✨ 忻城 ✨",
         "robot_name_triggers": [
             "忻城"

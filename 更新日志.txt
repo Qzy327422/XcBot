@@ -1,7 +1,5 @@
-v3.4
-- 完整更新日志已迁移到 CHANGELOG.md。
-- 本版本包括 Agent 工具链持久化、Follow-Up/中断/并发修复、Trace JSON+SQLite 存储、WebUI Agent 聊天室、OneBot Token 和 README 徽章。
-- [WebUI 聊天室] 用户消息改为纯文本逐行渲染，保留手动换行，不再被 Markdown 段落合并。
-- [Agent] 模型在调用工具前返回的说明文字会先发送给 QQ 用户；WebUI 聊天室同步显示并保存为独立助手消息。
-- [WebUI 聊天室] Agent 调用改为支持 token 级流式：参考 AstrBot 使用 OpenAI SDK 的 ChatCompletionStreamState 聚合增量 tool_calls 参数，文本 delta 实时推送到页面；关闭流式时仍会显示工具前进度消息。
-- OneBot/NapCat 真实认证参数名和 WebSocket Path 仍需以实际服务器握手结果为准。
+v3.4.1
+- [OneBot] 修复 WebSocket Token 认证补丁将连接类替换为函数，导致 Hyper 发送消息时 `isinstance()` 异常的问题。
+- [OneBot] 增加旧补丁进程状态自修复；WebUI 热重启后若仍残留函数包装，会先恢复原始连接类再安装新版补丁。
+- [OneBot] 加固 Hyper `Packet.send_to()`：使用启动时捕获的稳定连接类型，修复普通消息、WebUI 调试发送及登录账号查询仍可能触发 `isinstance()` 异常的问题。
+- [WebUI 更新] 在线更新优先下载 Release 附件 `XcBot.zip`，GitHub 自动生成的 Tag 源码包仅作为后备，避免附件与 Tag 内容不一致时安装到错误版本。
