@@ -2,7 +2,7 @@
 
 <img src="./assets/icon.jpg" width="104" height="104" alt="XcBot Logo" />
 
-# XcBot v3.4
+# XcBot v3
 
 **具备自主工具调用、上下文记忆与可视化追踪能力的 QQ Bot**
 
