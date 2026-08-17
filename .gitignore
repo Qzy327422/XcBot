@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 env/
+AstrBot/
 
 # Runtime / generated data
 config.json
@@ -18,13 +19,15 @@ data/
 .trace_store.py.bak*
 trace_store.db*
 
+# Backups / temp
+config_backup/
+temps/
+*.bak
+*.tmp
+*.orig
+
 # OS / editor
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
-
-# Backups / temp
-*.bak
-*.tmp
-*.orig

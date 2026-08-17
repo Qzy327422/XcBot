@@ -40,6 +40,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from bot import knowledge_base as _knowledge_base
+
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -67,6 +69,8 @@ LEGACY_CONFIG_PATHS = [
 
 _server: Optional[ThreadingHTTPServer] = None
 _server_thread: Optional[threading.Thread] = None
+_STATIC_ASSET_CONTENT: Dict[str, str] = {}
+_STATIC_ASSET_CONTENT: Dict[str, str] = {}
 _started_at = time.time()
 # 实时日志页需要覆盖足够长的排障窗口。这里只保存轻量行对象；完整日志仍按天落盘。
 _log_buffer = deque(maxlen=3000)
@@ -1276,7 +1280,12 @@ def _save_config_bundle_locked(data: Dict[str, Any]):
             provider_id = str(provider.get("id", "") or "").strip()
             # 完全空白的渠道是初始化占位，保存时自动移除。
             raw_models = provider.get("models", []) if isinstance(provider.get("models", []), list) else []
+            raw_embedding_models = provider.get("embedding_models", []) if isinstance(provider.get("embedding_models", []), list) else []
             has_model_name = any(
+                isinstance(item, str) and item.strip()
+                or isinstance(item, dict) and str(item.get("name", "") or item.get("model", "") or "").strip()
+                for item in raw_embedding_models
+            ) or any(
                 isinstance(item, str) and item.strip()
                 or isinstance(item, dict) and str(item.get("name", "") or item.get("model", "") or "").strip()
                 for item in raw_models
@@ -1316,8 +1325,46 @@ def _save_config_bundle_locked(data: Dict[str, Any]):
                     cleaned.pop("model", None)
                     cleaned_models.append(cleaned)
                 provider["models"] = cleaned_models
+            raw_embedding_models = provider.get("embedding_models", [])
+            cleaned_embedding_models = []
+            if isinstance(raw_embedding_models, list):
+                seen_embedding_names = set()
+                for item in raw_embedding_models:
+                    if isinstance(item, str):
+                        item = {"name": item, "enabled": True}
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name", "") or item.get("model", "") or "").strip()
+                    if not name or name in seen_embedding_names:
+                        continue
+                    seen_embedding_names.add(name)
+                    cleaned = dict(item)
+                    cleaned["name"] = name
+                    cleaned.pop("model", None)
+                    cleaned["enabled"] = normalize_bool_config(item.get("enabled", True), default=True)
+                    try:
+                        cleaned["dimensions"] = max(0, int(item.get("dimensions", 0) or 0))
+                    except (TypeError, ValueError):
+                        cleaned["dimensions"] = 0
+                    cleaned_embedding_models.append(cleaned)
+            provider["embedding_models"] = cleaned_embedding_models
             cleaned_providers.append(provider)
         others["llm_providers"] = cleaned_providers
+
+    knowledge = cfg.setdefault("KnowledgeBase", {})
+    if not isinstance(knowledge, dict):
+        knowledge = {}
+        cfg["KnowledgeBase"] = knowledge
+    try:
+        chunk_size = max(200, min(int(knowledge.get("chunk_size", 1000) or 1000), 5000))
+    except (TypeError, ValueError):
+        chunk_size = 1000
+    try:
+        chunk_overlap = max(0, min(int(knowledge.get("chunk_overlap", 150) or 0), 1000))
+    except (TypeError, ValueError):
+        chunk_overlap = 150
+    knowledge["chunk_size"] = chunk_size
+    knowledge["chunk_overlap"] = min(chunk_overlap, chunk_size // 2)
 
     sync_provider_config(others)
     sync_personality_presets(others)
@@ -1376,11 +1423,20 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("Others.llm_split.filter_regex", "内容过滤正则表达式", "textarea", "仅模式二使用。对每段文本做清理，例如移除换行：\\n|\\r。模式一不受它影响，模型自己排的换行会原样保留"),
             field("Others.llm_split.max_chars_no_split", "超过多少字不分段", "number", "最终要发送的整条内容超过[ ]字时，忽略 <split>/正则分段，改为单条发送；填 0 表示不限制", 0),
         ]},
-        {"key": "providers", "title": "提供商", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>', "desc": "配置提供商、检测模型并设置轮换顺序", "fields": [
-            field("Others.llm_providers", "提供商", "providers"),
+        {"key": "providers", "title": "提供商", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>', "desc": "配置提供商、对话模型、嵌入模型并设置轮换顺序", "fields": [
+            field("Others.llm_providers", "提供商（对话 / 嵌入）", "providers", "对话模型与嵌入模型共用同一提供商的 Base URL 和 Key；嵌入模型在提供商卡片的“嵌入”区域配置。"),
             field("Others.llm_rotation", "模型轮换", "rotation"),
             field("Others.api_multimodal_model", "多模态图片模型", "multimodal_model", "主模型不支持多模态且用户发送图片时使用的多模态模型"),
             field("Others.api_multimodal_image_mode", "图片处理模式", "select", "relay=多模态模型先转述图片，再交给主模型回复；direct=直接由多模态模型回复图片消息", "relay", ["relay", "direct"]),
+        ]},
+        {"key": "knowledge", "title": "知识库", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z"/></svg>', "desc": "上传文档，配置向量检索或 SQLite 全文检索", "fields": [
+            field("KnowledgeBase.enabled", "启用知识库", "bool", "开启后 Agent 会自动检索 WebUI 上传的知识库文档。"),
+            field("KnowledgeBase.vector_mode_enabled", "使用向量模型", "bool", "默认开启；关闭后回退到 SQLite FTS 全文检索，不使用向量模型。"),
+            field("KnowledgeBase.embedding_model_ref", "向量模型", "embedding_model_ref", "按“提供商/模型名”选择已启用的嵌入模型。"),
+            field("KnowledgeBase.top_k", "知识库召回数量", "number", "每次最多注入多少个相关片段。", 5, min=1, max=20),
+            field("KnowledgeBase.chunk_size", "知识库分块大小", "number", "文档切分的近似字符数。", 1000, min=200, max=5000),
+            field("KnowledgeBase.chunk_overlap", "知识库分块重叠", "number", "相邻片段重叠的近似字符数。", 150, min=0, max=1000),
+            field("KnowledgeBase.max_context_chars", "知识库最大注入字数", "number", "限制每次注入模型上下文的知识库字数。", 8000, min=500, max=30000),
         ]},
         {"key": "persona", "title": "人格设定", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>', "desc": "编辑人设", "fields": [
             field("Others.personality_presets", "人格预设", "persona_presets"),
@@ -1396,7 +1452,8 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("Others.group_random_reply_quote", "群聊概率触发时引用消息", "bool", "开启后，概率触发的回复会引用原消息；关闭则直接发送"),
             field("Others.group_chat_context_max_messages", "群聊上下文最大条数", "number", "功能配置里开启「群聊上下文感知」后，每个群旁听缓冲最多保留多少条", 30, min=1, max=300),
             field("Others.poke_cooldown_seconds", "拍一拍冷却秒数", "number", "拍一拍自动回复的防抖时间"),
-            field("Others.group_join_welcome_text", "入群欢迎语", "textarea", "占位符：{bot_name} 机器人名字、{user_nickname} 新成员昵称、{user_id} 新成员QQ号、{group_id} 群号。头像和 @ 新成员由程序固定附加；留空则使用默认文案"),
+            field("Others.group_join_welcome_text", "入群欢迎语", "textarea", "完整欢迎语，支持换行。占位符：{at} @新成员、{user_nickname} 昵称、{user_id} QQ号、{group_id} 群号、{bot_name} 机器人名字。留空则使用默认文案"),
+            field("Others.group_join_welcome_send_avatar", "欢迎时发送头像图片", "bool", "开启后在欢迎消息中附上新成员头像；关闭后只发 @ + 欢迎语"),
             field("Others.summary_per_day_limit", "每日总结次数", "number", "每个群每天允许总结的次数"),
             field("Others.summary_max_messages", "每次最多总结消息数", "number", "单次群聊总结最多读取多少条消息"),
             field("Others.compression_threshold", "压缩触发阈值", "number", "消息达到多少条后允许触发压缩"),
@@ -1408,6 +1465,8 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
         {"key": "agent", "title": "Agent", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>', "desc": "让 AI 自主调用工具：联网搜索、调用插件、操作 QQ、定时提醒、读写文件、执行代码、接入 MCP", "fields": [
             field("Agent.enabled", "启用 Agent", "bool", "总开关。关闭时完全不向模型传 tools，与旧版行为一致"),
             field("Agent.max_rounds", "最大工具轮数", "number", "越大越能完成多步骤任务（搜索→读网页→再搜→总结），代价是 token 消耗上升", 30, min=1, max=50),
+            field("Agent.retry_attempts", "失败后额外重试次数", "number", "当前模型/Key 失败后再试几次；用尽后按轮换顺序切换下一个模型/Key。默认 1，设置为 0 表示直接轮换", 1, min=0, max=5),
+            field("Agent.clear_workspace_on_reset", "/reset 命令清空工作区", "bool", "开启后 /reset 会同时清空当前会话的 Agent 工作区；关闭后仍清除聊天记忆，但保留工作区文件"),
             field("Agent.tool_result_max_chars", "工具结果最大字数", "number", "超出部分写入 data/agent_overflow，只回灌预览+路径，AI 可用 file_read 读全文", 8000, min=500, max=60000),
             field("Agent.tool_timeout", "工具超时秒数", "number", "单个工具的执行上限", 120, min=10, max=600),
             field("Agent.parallel_tools", "并发执行工具", "bool", "同一轮多个工具并发跑，更快且不增加模型请求次数"),
@@ -1455,6 +1514,14 @@ def get_ui_value(bundle: Dict[str, Any], path: str, default=None):
         return bundle.get("manage_users", [])
     if path == "black_list":
         return bundle.get("blacklist_file", deep_get(bundle.get("config_json", {}), path, default) or [])
+    if path == "KnowledgeBase.embedding_model_ref":
+        cfg = bundle.get("config_json", {})
+        current = str(deep_get(cfg, path, "") or "").strip()
+        if current:
+            return current
+        provider_id = str(deep_get(cfg, "KnowledgeBase.embedding_provider_id", "") or "").strip()
+        model = str(deep_get(cfg, "KnowledgeBase.embedding_model", "") or "").strip()
+        return f"{provider_id}/{model}" if provider_id and model else ""
     return deep_get(bundle.get("config_json", {}), path, default)
 
 
@@ -1466,6 +1533,28 @@ def set_ui_value(payload: Dict[str, Any], path: str, value):
     if path == "black_list":
         payload["blacklist_file"] = value
         deep_set(payload.setdefault("config_json", {}), path, value)
+        return
+    if path == "KnowledgeBase.embedding_model_ref":
+        ref = str(value or "").strip()
+        cfg = payload.setdefault("config_json", {})
+        deep_set(cfg, path, ref)
+        matches = []
+        providers = deep_get(cfg, "Others.llm_providers", [])
+        for provider in providers if isinstance(providers, list) else []:
+            if not isinstance(provider, dict):
+                continue
+            provider_id = str(provider.get("id", "") or "").strip()
+            models = provider.get("embedding_models", [])
+            for item in models if isinstance(models, list) else []:
+                name = (
+                    str(item.get("name", "") or item.get("model", "") or "").strip()
+                    if isinstance(item, dict) else str(item or "").strip()
+                )
+                if name and f"{provider_id}/{name}" == ref:
+                    matches.append((provider_id, name))
+        provider_id, model = matches[0] if len(matches) == 1 else ("", "")
+        deep_set(cfg, "KnowledgeBase.embedding_provider_id", provider_id)
+        deep_set(cfg, "KnowledgeBase.embedding_model", model)
         return
     deep_set(payload.setdefault("config_json", {}), path, value)
 
@@ -3387,8 +3476,12 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     _json_response(self, {"ok": False, "error": "Icon Not Found"}, 404)
             elif parsed.path.startswith("/static/"):
                 fname = parsed.path[len("/static/"):]
+                cached = _STATIC_ASSET_CONTENT.get(fname)
                 fpath = (BASE_DIR / "static" / fname).resolve()
-                if fpath.is_file() and str(fpath).startswith(str((BASE_DIR / "static").resolve())):
+                if cached is not None:
+                    ct = "text/javascript" if fname.endswith(".js") else "text/css"
+                    _text_response(self, cached, ct + "; charset=utf-8", cache="public, max-age=31536000, immutable")
+                elif fpath.is_file() and str(fpath).startswith(str((BASE_DIR / "static").resolve())):
                     ct = "text/javascript" if fname.endswith(".js") else "text/css"
                     _text_response(self, fpath.read_text(encoding="utf-8"), ct + "; charset=utf-8", cache="public, max-age=31536000, immutable")
                 else:
@@ -3445,6 +3538,12 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 _text_response(self, text, "text/plain; charset=utf-8")
             elif parsed.path == "/api/plugins/store":
                 _json_response(self, {"ok": True, "data": _store_registry()})
+            elif parsed.path == "/api/knowledge/documents":
+                _json_response(self, {"ok": True, "data": _knowledge_base.list_documents()})
+            elif parsed.path == "/api/knowledge/status":
+                _json_response(self, {"ok": True, "data": {"documents": _knowledge_base.list_documents()}})
+            elif parsed.path == "/api/knowledge/capabilities":
+                _json_response(self, {"ok": True, "data": {"upload_path": "/api/knowledge/documents/upload", "version": 1}})
             elif parsed.path == "/api/chat/models":
                 _json_response(self, {"ok": True, "data": _chatroom_models()})
             elif parsed.path == "/api/chat/sessions":
@@ -3482,7 +3581,13 @@ class WebUIHandler(BaseHTTPRequestHandler):
         if not self._guard():
             return
         parsed = urllib.parse.urlparse(self.path)
-        body_limit = 4 * 1024 * 1024 if parsed.path == "/api/send" else 20 * 1024 * 1024
+        if parsed.path == "/api/send":
+            body_limit = 4 * 1024 * 1024
+        elif parsed.path in ("/api/knowledge/documents/upload", "/api/knowledge/upload"):
+            # 16MB 原文件经 base64 后约 21.34MB，再加 JSON 字段会超过通用 20MB。
+            body_limit = 24 * 1024 * 1024
+        else:
+            body_limit = 20 * 1024 * 1024
         data, err = self._read_body_json(max_bytes=body_limit)
         if err:
             status = 413 if err == "请求体过大" else 400
@@ -3617,6 +3722,35 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     _json_response(self, {"ok": True, "message": f"检测到 {len(models)} 个模型", "data": {"models": models, "error": ""}})
                 except Exception as e:
                     _json_response(self, {"ok": True, "message": "检测失败", "data": {"models": [], "error": str(e)}})
+            elif parsed.path in ("/api/knowledge/documents/upload", "/api/knowledge/upload"):
+                payload = data or {}
+                filename = str(payload.get("filename", "") or "")
+                content_b64 = str(payload.get("content_b64", "") or "")
+                if len(content_b64) > 22 * 1024 * 1024:
+                    raise ValueError("知识库文件过大（上限 16MB）")
+                try:
+                    raw = base64.b64decode(content_b64.split(",", 1)[-1], validate=False)
+                except Exception as e:
+                    raise ValueError("知识库文件数据无效") from e
+                cfg = read_json(CONFIG_PATH, {})
+                kb_cfg = cfg.get("KnowledgeBase", {}) if isinstance(cfg.get("KnowledgeBase", {}), dict) else {}
+                providers = (cfg.get("Others", {}) or {}).get("llm_providers", [])
+                result = _knowledge_base.add_document(filename, raw, kb_cfg, providers if isinstance(providers, list) else [])
+                status = str(result.get("status", "") or "")
+                if status == "indexing":
+                    msg = "文档正在索引中，请稍后刷新查看结果"
+                elif status == "failed":
+                    msg = f"文档索引失败：{str(result.get('error', '') or '未知错误')}"
+                elif status == "ready" and result.get("error"):
+                    msg = f"文档已建立索引（向量模式降级为 FTS：{result['error']}）"
+                else:
+                    msg = "知识库文档已上传并完成索引"
+                _json_response(self, {"ok": True, "data": result, "message": msg})
+            elif parsed.path == "/api/knowledge/documents/delete":
+                payload = data or {}
+                if not _knowledge_base.delete_document(str(payload.get("document_id", "") or "")):
+                    raise ValueError("知识库文档不存在")
+                _json_response(self, {"ok": True, "message": "知识库文档已删除"})
             elif parsed.path == "/api/update/install":
                 install_latest_update()
                 _json_response(self, {"ok": True, "message": "已开始安装更新", "data": {"install": dict(_update_install_status), "update": fetch_update_info()}})
@@ -3960,7 +4094,7 @@ INDEX_HTML = r'''<!doctype html>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>XcBot WebUI</title><link rel="icon" href="/assets/icon.jpg">
   <link rel="stylesheet" href="/static/app.css">
 </head>
-<body><svg style="position:absolute;width:0;height:0;pointer-events:none" aria-hidden="true"><defs><filter id="xcbot-liquid-glass" x="-10%" y="-10%" width="120%" height="120%" primitiveUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feTurbulence type="fractalNoise" baseFrequency="0.018 0.014" numOctaves="4" seed="7" result="noise"/><feDisplacementMap in="SourceGraphic" in2="noise" scale="20" xChannelSelector="R" yChannelSelector="G"/></filter></defs></svg><div class="app"><aside class="sidebar"><div class="brand"><div class="logo"><img src="/assets/icon.jpg" alt="XcBot"></div><div><h1 id="brandName">XcBot</h1><p>实时 Web 管理台</p></div></div><div class="nav-title">功能列表</div><nav id="nav" class="nav"></nav><div class="nav-title">OneBot / Hyper 连接状态</div><div id="connectionStatus" class="pill">加载中...</div><div id="connectionDetail" class="desc" style="margin:10px 12px 0 12px"></div></aside><main class="main"><div class="topbar"><div class="title"><h2 id="pageTitle">加载中...</h2><p id="pageDesc">正在连接 WebUI</p></div><div class="toolbar"><span id="saveState" class="pill">未加载</span><button class="btn" onclick="gotoPage('chatroom')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>聊天室</button><button class="btn" onclick="gotoPage('debug')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>调试</button><button class="btn" id="themeBtn" onclick="toggleTheme()">深色</button><button class="btn primary" onclick="saveAll()">保存设置</button></div></div><section id="content" class="grid"></section></main></div><div id="toast" class="toast"></div><div id="submitModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center"><div style="max-width:420px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 16px;color:var(--text)">提交插件</h3><div style="display:grid;gap:10px"><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div><div class="label">插件名</div><input class="input" id="submitName" placeholder="your_plugin"></div><div><div class="label">作者</div><input class="input" id="submitAuthor" placeholder="你的名字"></div></div><div><div class="label">功能描述</div><textarea class="input" id="submitDesc" rows="3" placeholder="简单描述插件功能" style="resize:vertical"></textarea></div><p class="desc">提交后将打开 GitHub Issue 页面，把 zip 拖入评论框上传后点提交</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="el('submitModal').style.display='none'">取消</button><button class="btn primary" onclick="storeSubmit()">打开 GitHub Issue</button></div></div></div></div><div id="leaveModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center"><div style="max-width:360px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 8px;color:var(--text)">确认操作</h3><p style="margin:0 0 24px;color:var(--muted)">当前页面有未保存修改，离开后将丢失这些更改。是否离开？</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="leaveCancel()">取消</button><button class="btn primary" onclick="leaveConfirm()">确定</button></div></div></div><div id="tokenModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:10000;align-items:center;justify-content:center"><div style="max-width:460px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 style="margin:0 0 10px;color:var(--text)">设置访问 Token</h3><p style="margin:0 0 6px;color:var(--muted);font-size:13px">当前未设置访问 Token，任何能打开这个地址的人都可以查看你的 LLM API Key、以机器人身份发消息。</p><p id="tokenModalHost" style="margin:0 0 18px;color:var(--bad,#e11d48);font-size:13px;display:none"></p><div style="display:grid;gap:10px"><div><div class="label">访问 Token（至少 8 位）</div><input class="input" id="newToken" type="password" placeholder="建议用随机字符串" autocomplete="new-password"></div><div><div class="label">再输入一次</div><input class="input" id="newToken2" type="password" placeholder="确认 Token" autocomplete="new-password"></div><div id="tokenModalMsg" class="desc" style="min-height:18px;color:var(--bad,#e11d48)"></div><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn primary" id="tokenModalBtn" onclick="submitNewToken()">保存并使用</button></div></div></div></div><input id="pluginUploadInput" type="file" accept=".zip" style="display:none" onchange="storeUploadFile(this)"><button id="pluginUploadBtn" onclick="el('pluginUploadInput').click()" title="上传本地插件" style="display:none;position:fixed;right:24px;bottom:24px;width:48px;height:48px;border-radius:50%;background:var(--accent,#6366f1);border:none;cursor:pointer;font-size:22px;color:#fff;box-shadow:0 2px 8px #0004;z-index:999">&#8679;</button>
+<body><svg style="position:absolute;width:0;height:0;pointer-events:none" aria-hidden="true"><defs><filter id="xcbot-liquid-glass" x="-10%" y="-10%" width="120%" height="120%" primitiveUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feTurbulence type="fractalNoise" baseFrequency="0.018 0.014" numOctaves="4" seed="7" result="noise"/><feDisplacementMap in="SourceGraphic" in2="noise" scale="20" xChannelSelector="R" yChannelSelector="G"/></filter></defs></svg><div class="app"><aside class="sidebar"><div class="brand"><div class="logo"><img src="/assets/icon.jpg" alt="XcBot"></div><div><h1 id="brandName">XcBot</h1><p>实时 Web 管理台</p></div></div><div class="nav-title">功能列表</div><nav id="nav" class="nav"></nav><div class="nav-title">OneBot / Hyper 连接状态</div><div id="connectionStatus" class="pill">加载中...</div><div id="connectionDetail" class="desc" style="margin:10px 12px 0 12px"></div></aside><main class="main"><div class="topbar"><div class="title"><h2 id="pageTitle">加载中...</h2><p id="pageDesc">正在连接 WebUI</p></div><div class="toolbar"><span id="saveState" class="pill">未加载</span><button class="btn" onclick="gotoPage('chatroom')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>聊天室</button><button class="btn" onclick="gotoPage('debug')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>调试</button><button class="btn" id="themeBtn" onclick="toggleTheme()">深色</button><button class="btn primary" onclick="saveAll()">保存设置</button></div></div><section id="content" class="grid"></section></main></div><div id="toast" class="toast"></div><div id="submitModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center"><div style="max-width:420px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 16px;color:var(--text)">提交插件</h3><div style="display:grid;gap:10px"><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div><div class="label">插件名</div><input class="input" id="submitName" placeholder="your_plugin"></div><div><div class="label">作者</div><input class="input" id="submitAuthor" placeholder="你的名字"></div></div><div><div class="label">功能描述</div><textarea class="input" id="submitDesc" rows="3" placeholder="简单描述插件功能" style="resize:vertical"></textarea></div><p class="desc">提交后将打开 GitHub Issue 页面，把 zip 拖入评论框上传后点提交</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="el('submitModal').style.display='none'">取消</button><button class="btn primary" onclick="storeSubmit()">打开 GitHub Issue</button></div></div></div></div><div id="leaveModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center"><div style="max-width:360px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 8px;color:var(--text)">确认操作</h3><p style="margin:0 0 24px;color:var(--muted)">当前页面有未保存修改，离开后将丢失这些更改。是否离开？</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="leaveCancel()">取消</button><button class="btn primary" onclick="leaveConfirm()">确定</button></div></div></div><div id="tokenModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:10000;align-items:center;justify-content:center"><div style="max-width:460px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 style="margin:0 0 10px;color:var(--text)">设置访问 Token</h3><p style="margin:0 0 6px;color:var(--muted);font-size:13px">当前未设置访问 Token，任何能打开这个地址的人都可以查看你的 LLM API Key、以机器人身份发消息。</p><p id="tokenModalHost" style="margin:0 0 18px;color:var(--bad,#e11d48);font-size:13px;display:none"></p><div style="display:grid;gap:10px"><div><div class="label">访问 Token（至少 8 位）</div><input class="input" id="newToken" type="password" placeholder="建议用随机字符串" autocomplete="new-password"></div><div><div class="label">再输入一次</div><input class="input" id="newToken2" type="password" placeholder="确认 Token" autocomplete="new-password"></div><div id="tokenModalMsg" class="desc" style="min-height:18px;color:var(--bad,#e11d48)"></div><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn primary" id="tokenModalBtn" onclick="submitNewToken()">保存并使用</button></div></div></div></div><div id="modelInputModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;align-items:center;justify-content:center" onclick="if(event.target===this)closeModelInput()"><div style="max-width:440px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 id="modelInputTitle" style="margin:0 0 18px;color:var(--text)">添加模型</h3><div class="field"><div class="label"><span id="modelInputLabel">模型名称</span></div><input id="modelInputValue" placeholder="例如 model-name" onkeydown="if(event.key==='Enter')submitModelInput();if(event.key==='Escape')closeModelInput()"><div class="desc">保存后模型将显示为“提供商/模型名”。</div></div><div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button class="btn" onclick="closeModelInput()">取消</button><button class="btn primary" onclick="submitModelInput()">添加</button></div></div></div><div id="modelInputModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;align-items:center;justify-content:center" onclick="if(event.target===this)closeModelInput()"><div style="max-width:440px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 id="modelInputTitle" style="margin:0 0 18px;color:var(--text)">添加模型</h3><div class="field"><div class="label"><span id="modelInputLabel">模型名称</span></div><input id="modelInputValue" placeholder="例如 model-name" onkeydown="if(event.key==='Enter')submitModelInput();if(event.key==='Escape')closeModelInput()"><div class="desc">保存后模型将显示为“提供商/模型名”。</div></div><div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button class="btn" onclick="closeModelInput()">取消</button><button class="btn primary" onclick="submitModelInput()">添加</button></div></div></div><input id="pluginUploadInput" type="file" accept=".zip" style="display:none" onchange="storeUploadFile(this)"><button id="pluginUploadBtn" onclick="el('pluginUploadInput').click()" title="上传本地插件" style="display:none;position:fixed;right:24px;bottom:24px;width:48px;height:48px;border-radius:50%;background:var(--accent,#6366f1);border:none;cursor:pointer;font-size:22px;color:#fff;box-shadow:0 2px 8px #0004;z-index:999">&#8679;</button>
 <script src="/static/app.js"></script></body></html>'''
 
 def _static_asset_version(filename: str) -> str:
@@ -3983,6 +4117,22 @@ def _static_asset_version(filename: str) -> str:
         prog = ""
     return f"{prog}-{digest}" if prog else digest
 
+
+# 启动时冻结静态资源内容，使带内容 hash 的 URL 始终对应同一份文件。
+# 自动更新覆盖磁盘文件但旧进程尚未重启时，不会出现“新 app.js 调旧后端路由”。
+for _asset_name in ("app.css", "app.js", "login.js"):
+    try:
+        _STATIC_ASSET_CONTENT[_asset_name] = (BASE_DIR / "static" / _asset_name).read_text(encoding="utf-8")
+    except Exception:
+        pass
+
+# 启动时冻结静态资源内容，使带内容 hash 的 URL 始终对应同一份文件。
+# 自动更新覆盖磁盘文件但旧进程尚未重启时，不会出现“新 app.js 调旧后端路由”。
+for _asset_name in ("app.css", "app.js", "login.js"):
+    try:
+        _STATIC_ASSET_CONTENT[_asset_name] = (BASE_DIR / "static" / _asset_name).read_text(encoding="utf-8")
+    except Exception:
+        pass
 
 # 注入到静态资源 URL：内容变了 URL 就变，浏览器自动拉新文件，普通刷新即可
 INDEX_HTML = INDEX_HTML.replace('/static/app.css"', f'/static/app.css?v={_static_asset_version("app.css")}"') \

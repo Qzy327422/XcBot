@@ -1,5 +1,5 @@
 {
-    "config_version": 6,
+    "config_version": 7,
     "_comment": "XcBot 主配置文件",
     "owner": [],
     "_comment_owner": "机器人拥有者 QQ 号列表，通常保留 1 个即可。",
@@ -32,7 +32,7 @@
     "_comment_protocol": "协议类型，默认 OneBot。",
     "Others": {
         "project_name": "XcBot",
-        "version_name": "v3.4.1",
+        "version_name": "v3.5",
         "slogan": "✨ 忻城 ✨",
         "robot_name_triggers": [
             "忻城"
@@ -44,8 +44,10 @@
         "_comment_emoji_plus_one_cooldown_seconds": "表情 +1 的防抖时间，单位秒。",
         "poke_reply_enabled": true,
         "_comment_poke_reply_enabled": "是否开启拍一拍自动回复。",
-        "group_join_welcome_text": " 加入{bot_name}的大家庭，{bot_name}是你最可爱的好朋友\n经常@{bot_name} 看看{bot_name}又学会做什么新事情啦~o((>ω< ))o\n祝你在{bot_name}的大家庭里生活愉快！♪(≧∀≦)ゞ☆",
-        "_comment_group_join_welcome_text": "新成员入群欢迎语正文。可用占位符：{bot_name} 机器人名字、{user_nickname} 新成员昵称、{user_id} 新成员QQ号、{group_id} 群号；其他花括号原样保留。头像图片和 @ 新成员由程序固定附加，无需写在这里。",
+        "group_join_welcome_text": "欢迎 {at}{user_nickname} 加入{bot_name}的大家庭！\n经常 @{bot_name} 看看{bot_name}又学会做什么新事情啦~o((>ω< ))o\n祝你在{bot_name}的大家庭里生活愉快！♪(≧∀≦)ゞ☆",
+        "_comment_group_join_welcome_text": "新成员入群欢迎语正文。占位符：{at} @新成员、{user_nickname} 昵称、{user_id} QQ号、{group_id} 群号、{bot_name} 机器人名字；其他花括号原样保留。",
+        "group_join_welcome_send_avatar": true,
+        "_comment_group_join_welcome_send_avatar": "开启后发送欢迎消息时同时附上新成员头像图片；关闭后只发 @ + 欢迎语。",
         "poke_cooldown_seconds": 8,
         "_comment_poke_cooldown_seconds": "拍一拍回复防抖时间，单位秒。",
         "api_request_timeout_seconds": 120,
@@ -101,9 +103,11 @@
                         "timeout_seconds": 120
                     }
                 ],
+                "embedding_models": [],
                 "detected_models": []
             }
         ],
+        "_comment_llm_provider_tabs": "提供商页面分为对话与嵌入两类模型；嵌入模型复用同一提供商的 Base URL 和 Key。",
         "_comment_llm_providers": "大模型提供商列表。每个提供商手动设置 id，模型显示名为 provider_id/model。",
         "llm_rotation": [],
         "_comment_llm_rotation": "按顺序轮换的模型列表，元素格式：{provider_id, model}。为空时按已启用模型顺序自动生成。",
@@ -160,12 +164,31 @@
     },
     "uin": 0,
     "_comment_uin": "机器人 QQ 号。某些环境下可保留 0 或由外部程序自动写入。",
+    "KnowledgeBase": {
+        "enabled": true,
+        "vector_mode_enabled": true,
+        "_comment_vector_mode_enabled": "关闭后回退到 SQLite FTS 全文检索，不使用向量模型。",
+        "top_k": 5,
+        "chunk_size": 1000,
+        "chunk_overlap": 150,
+        "max_context_chars": 8000,
+        "embedding_model_ref": "",
+        "_comment_embedding_model_ref": "WebUI 使用“提供商/模型名”统一选择嵌入模型。",
+        "embedding_model_ref": "",
+        "_comment_embedding_model_ref": "WebUI 使用“提供商/模型名”统一选择嵌入模型。",
+        "embedding_provider_id": "",
+        "embedding_model": ""
+    },
     "Agent": {
         "_comment": "Agent 工具调用（Function Calling）。开启后 AI 可以自主调用下方工具查资料、调用插件、操作 QQ、执行任务。每一轮工具调用都会多一次模型请求，token 消耗随之上升。",
         "enabled": true,
         "_comment_enabled": "Agent 总开关。关闭时完全不向模型传 tools 参数，行为与旧版完全一致。",
         "max_rounds": 30,
         "_comment_max_rounds": "最多允许几轮工具调用。轮数越大越能完成多步骤任务（搜索→读网页→再搜→总结），代价是 token 消耗上升。上限 50。",
+        "retry_attempts": 1,
+        "_comment_retry_attempts": "Agent 每个模型/Key 失败后的额外重试次数。默认 1，即当前渠道最多请求 2 次，仍失败后按轮换顺序切换下一个模型/Key。设置为 0 表示不额外重试。",
+        "clear_workspace_on_reset": true,
+        "_comment_clear_workspace_on_reset": "是否在 /reset 时同时清空当前私聊或群聊的 Agent 工作区。关闭后仍清除聊天记忆，但保留工作区文件。",
         "tool_result_max_chars": 8000,
         "_comment_tool_result_max_chars": "单个工具返回内容的最大字符数。超出部分会写入 data/agent_overflow 文件，只回灌预览和文件路径，AI 可用 file_read 按需读全文。",
         "tool_timeout": 120,

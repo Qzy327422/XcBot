@@ -2,10 +2,10 @@
 """WebUI feature switch metadata."""
 
 # 入群欢迎正文默认值。config.default.json 与 main.py 的兜底都引用这里，避免三处不一致。
-# 支持的字面占位符：{bot_name} {user_nickname} {user_id} {group_id}
+# 支持的字面占位符：{at} @新成员、{bot_name} {user_nickname} {user_id} {group_id}
 DEFAULT_GROUP_JOIN_WELCOME_TEXT = (
-    " 加入{bot_name}的大家庭，{bot_name}是你最可爱的好朋友\n"
-    "经常@{bot_name} 看看{bot_name}又学会做什么新事情啦~o((>ω< ))o\n"
+    "欢迎 {at}{user_nickname} 加入{bot_name}的大家庭！\n"
+    "经常 @{bot_name} 看看{bot_name}又学会做什么新事情啦~o((>ω< ))o\n"
     "祝你在{bot_name}的大家庭里生活愉快！♪(≧∀≦)ゞ☆"
 )
 
@@ -24,7 +24,7 @@ FEATURE_META = [
     {"key": "split_reply_quote", "title": "分段首段引用", "desc": "开启后：仅多段回复默认首段引用发送者消息", "group": "功能配置"},
     {"key": "weak_blacklist", "title": "弱黑名单", "desc": "按概率拦截触发", "group": "功能配置"},
     {"key": "poke_reply", "title": "拍一拍回复", "desc": "收到拍一拍时自动回复", "group": "功能配置"},
-    {"key": "group_join_welcome", "title": "入群欢迎", "desc": "新成员入群时发送头像 + @ + 欢迎语，欢迎语可在下方自定义", "group": "功能配置"},
+    {"key": "group_join_welcome", "title": "入群欢迎", "desc": "新成员入群时发送 @ + 欢迎语，可选同时发送头像图片；欢迎语和发图开关在下方自定义", "group": "功能配置"},
     {"key": "weather", "title": "天气查询", "desc": "允许使用 /天气 [城市] 查询天气", "group": "功能配置"},
     {"key": "quote", "title": "名言生成", "desc": "允许使用 /名言 引用消息生成名言图片", "group": "功能配置"},
     {"key": "image_generation", "title": "生图/搜图", "desc": "允许使用 /生图 [关键词] 搜索并发送图片", "group": "功能配置"},

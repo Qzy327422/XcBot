@@ -321,6 +321,9 @@ async def refresh() -> dict:
                     level="admin",
                     untrusted_output=True,
                     timeout=CALL_TIMEOUT,
+                    # MCP 的能力来自外部服务器，无法可靠判断只读/写入。按最严格策略
+                    # 一律视为有副作用，避免总结失败后换渠道重放未知操作。
+                    side_effect=True,
                 ))
                 _registered.add(key)
                 registered_names.append(key)

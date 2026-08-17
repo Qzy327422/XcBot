@@ -1086,6 +1086,9 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
                 # _exec_one 通过全部校验、即将真正调 handler 时回调到这里
                 pending["effect_state"] = "fired"
                 fired_side_effects.add(_name)
+                recorded = ctx.extra.setdefault("side_effects_fired", [])
+                if _name not in recorded:
+                    recorded.append(_name)
 
             async def _finish(text):
                 elapsed = int((time.time() - started) * 1000)
