@@ -75,6 +75,8 @@ _started_at = time.time()
 # 实时日志页需要覆盖足够长的排障窗口。这里只保存轻量行对象；完整日志仍按天落盘。
 _log_buffer = deque(maxlen=3000)
 _log_lock = threading.RLock()
+# TeeStream 拼半行用的锁。stdout / stderr 共用一把，两个流之间也不会互相插队。
+_tee_lock = threading.RLock()
 _capture_installed = False
 _capture_stdout = None
 _capture_stderr = None
@@ -126,14 +128,44 @@ from webui_core.agent_meta import (
     visible_tools, card_members, configurable_keys,
 )
 
+# Hyper 库自己往 stdout 打的噪音行，直接吞掉不进控制台/日志。
+# 典型是每轮重连都出现的 "🔴 *CRIT  重试次数达到最大值(5)，退出"——它描述的是
+# Hyper 内部那 5 次重试用完了，不是致命错误（外层 run_with_retry 会继续重连），
+# 但带着 CRIT 字样会被日志页标红，把真正的报错埋掉。我们自己在重连处打一行
+# 黄色警告代替它。
+_SUPPRESSED_LOG_PATTERNS = (
+    "重试次数达到最大值",
+)
+
+
+def _is_suppressed_log_line(line: str) -> bool:
+    text = str(line or "")
+    if not text.strip():
+        return False
+    return any(p in text for p in _SUPPRESSED_LOG_PATTERNS)
+
+
 class TeeStream(io.TextIOBase):
-    """将 stdout/stderr 同步写到原始流、内存缓冲和日志文件。"""
+    """将 stdout/stderr 同步写到原始流、内存缓冲和日志文件。
+
+    **按整行输出，且缓冲按线程隔离。** print(x) 会拆成 write(x) + write("\\n")
+    两次调用，多线程下这两次之间可能插进别的线程的输出，控制台就会出现
+    "=== 启动中 ===[AgentTask] 调度器已启动" 这种两条日志挤在一行、后一条没换行的
+    情况（主线程打启动横幅、调度器线程同时打自己的启动日志时必然发生），
+    内存缓冲里还会为单独那次 write("\\n") 多存一条空消息。
+    所以这里攒到换行才整行发出，一行只调一次原始流的 write；而且**每个线程各攒
+    自己的半行**——共用一个缓冲的话，A 的正文和 B 的正文照样会拼进同一行，
+    换行只是从"漏在下一行开头"变成"落在拼好的那行末尾"，症状不变。
+    """
 
     def __init__(self, original, stream_name: str):
         self.original = original
         self.stream_name = stream_name
         self._encoding = getattr(original, "encoding", "utf-8") or "utf-8"
         self._errors = getattr(original, "errors", "replace") or "replace"
+        # {线程 id: 该线程攒着的半行}。拿到换行才发出，发完就把空条目删掉，
+        # 所以这个字典平时只有正在打半行的那几个线程。
+        self._pending: "dict[int, str]" = {}
 
     @property
     def encoding(self):
@@ -161,13 +193,46 @@ class TeeStream(io.TextIOBase):
     def write(self, s):
         if not isinstance(s, str):
             s = str(s)
+        if not s:
+            return 0
+        tid = threading.get_ident()
+        # 拼行与发行都在锁内：发行本身要保证一行不被别的线程劈开。
+        # stdout / stderr 共用同一把锁，两个流之间也不会互相插队。
+        with _tee_lock:
+            pending = self._pending.get(tid, "") + s
+            if "\n" not in pending and "\r" not in pending:
+                self._pending[tid] = pending
+                return len(s)
+            # \r 也当行结束：部分库用 \r 回到行首覆盖上一行做进度显示
+            normalized = pending.replace("\r\n", "\n").replace("\r", "\n")
+            parts = normalized.split("\n")
+            tail = parts.pop()
+            if tail:
+                self._pending[tid] = tail
+            else:
+                self._pending.pop(tid, None)
+            for line in parts:
+                self._emit_line(line)
+        return len(s)
+
+    def drain(self):
+        """把各线程攒着的半行发出去。进程退出前调用，避免最后一行没换行就丢了。"""
+        with _tee_lock:
+            pending, self._pending = self._pending, {}
+        for line in pending.values():
+            if line:
+                with _tee_lock:
+                    self._emit_line(line)
+
+    def _emit_line(self, line: str) -> None:
+        if _is_suppressed_log_line(_strip_ansi(line)):
+            return
         try:
-            self.original.write(s)
+            self.original.write(line + "\n")
             self.original.flush()
         except Exception:
             pass
-        _append_log(s, self.stream_name)
-        return len(s)
+        _append_log(line, self.stream_name)
 
 
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[mGKHF]|\x1b\][^\x07]*\x07|\x1b[@-Z\\-_]')
@@ -176,15 +241,11 @@ def _strip_ansi(s: str) -> str:
     return _ANSI_RE.sub('', s)
 
 def _append_log(text: str, stream_name: str = "stdout"):
-    if text == "":
-        return
+    """把一行（TeeStream 已按换行切好）写进内存缓冲与当天日志文件。"""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines = text.splitlines()
-    if text.endswith(("\n", "\r")) and lines:
-        pass
-    elif not lines:
-        lines = [text]
+    # 正常只有一行；split 而不是 splitlines，空行要保留成一条空消息
+    lines = str(text).split("\n")
     log_path = _log_file()
     with _log_lock:
         with log_path.open("a", encoding="utf-8", errors="replace") as f:
@@ -203,6 +264,18 @@ def install_log_capture():
     sys.stdout = _capture_stdout
     sys.stderr = _capture_stderr
     _capture_installed = True
+    # TeeStream 攒到换行才发出。退出时把最后那半行冲出去，
+    # 否则 print(..., end="") 的收尾输出会连带丢掉。
+    atexit.register(_drain_log_capture)
+
+
+def _drain_log_capture():
+    for stream in (_capture_stdout, _capture_stderr):
+        try:
+            if stream is not None:
+                stream.drain()
+        except Exception:
+            pass
 
 
 from webui_core.json_io import atomic_write_text as _atomic_write_text
@@ -255,13 +328,21 @@ def normalize_bool_config(value, default: bool = False) -> bool:
     return bool(default)
 
 
+from bot.llm_config import build_all_provider_endpoints
 from bot.llm_config import build_llm_endpoints_from_providers
 from bot.llm_config import force_apply_llm_endpoints_from_config as _force_apply_llm_endpoints_core
+from bot.llm_config import get_provider_proxy as _get_provider_proxy
 from bot.llm_config import normalize_legacy_endpoints as _normalize_webui_llm_endpoints
 from bot.llm_config import normalize_llm_providers_config
 from bot.llm_config import normalize_provider_keys as _normalize_provider_keys
+from bot.llm_config import normalize_proxy_url as _normalize_proxy_url
+from bot.llm_config import normalize_reasoning_effort as _normalize_reasoning_effort
+from bot.llm_config import normalize_context_window as _normalize_context_window
+from bot.llm_config import REASONING_EFFORT_CHOICES
 from bot.llm_config import provider_display_model as _provider_display_model
 from bot.llm_config import sync_provider_config
+from bot.reasoning import split_model_output as split_reasoning_output
+from bot.reasoning import ThinkStreamSplitter
 
 def sync_personality_presets(others: Dict[str, Any]) -> None:
     prompt = str(others.get("personality_prompt", "") or "")
@@ -282,14 +363,26 @@ def sync_personality_presets(others: Dict[str, Any]) -> None:
             "name": str(item.get("name", "") or pid).strip() or pid,
             "prompt": str(item.get("prompt", "") or ""),
         })
+    ids = {x["id"] for x in normalized}
     active = str(others.get("active_personality_preset", "") or "").strip()
-    if active not in {x["id"] for x in normalized}:
+    if active not in ids:
         active = normalized[0]["id"] if normalized else "default"
+    # 私聊/群聊为空串表示「跟随默认」，必须原样保留：一旦在这里替换成当时的
+    # active 具体 id，之后用户改「默认人格」，私聊/群聊就被钉在旧预设上不动了。
+    # 只有填了无效 id 才清成空串回到跟随状态。
+    private_active = str(others.get("private_personality_preset", "") or "").strip()
+    if private_active and private_active not in ids:
+        private_active = ""
+    group_active = str(others.get("group_personality_preset", "") or "").strip()
+    if group_active and group_active not in ids:
+        group_active = ""
     current = next((x for x in normalized if x["id"] == active), None)
     if current:
         others["personality_prompt"] = current.get("prompt", "")
     others["personality_presets"] = normalized
     others["active_personality_preset"] = active
+    others["private_personality_preset"] = private_active
+    others["group_personality_preset"] = group_active
 
 
 def force_apply_llm_endpoints_from_config(cfg: Dict[str, Any]):
@@ -297,10 +390,7 @@ def force_apply_llm_endpoints_from_config(cfg: Dict[str, Any]):
     try:
         from key_manager import key_manager
         endpoints = _force_apply_llm_endpoints_core(cfg, set_endpoints=key_manager.set_endpoints)
-        print(
-            f"✅ WebUI 已直接热刷新 LLM 模型轮换: models={len(endpoints)}, "
-            f"keys={len(key_manager.get_all_keys())}, current={key_manager.get_current_display()}"
-        )
+        return endpoints
     except Exception as e:
         print(f"WebUI 直接热刷新 LLM 接口列表失败: {e}")
 
@@ -328,6 +418,30 @@ def _chatroom_session_lock(session_id: str) -> threading.RLock:
 
 CHATROOM_COMMAND_HINT = "⚠️ 该命令依赖 QQ 群聊/私聊环境，聊天室场景下不可用。"
 
+# 正在生成的聊天室会话 ID。前端已有拦截，但直接调 API 能绕过：
+# 删掉正在生成的会话，后台 Agent 收尾时会把它整个写回来（见 _chatroom_save 注释）。
+# 所以删除 / 重命名 / 换模型都要在后端再挡一次。
+_chatroom_generating: set[str] = set()
+
+
+def _chatroom_mark_generating(session_id: str, running: bool) -> None:
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", str(session_id or ""))
+    if not safe:
+        return
+    with _chatroom_lock:
+        if running:
+            _chatroom_generating.add(safe)
+        else:
+            _chatroom_generating.discard(safe)
+
+
+def _chatroom_is_generating(session_id: str) -> bool:
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", str(session_id or ""))
+    if not safe:
+        return False
+    with _chatroom_lock:
+        return safe in _chatroom_generating
+
 
 def _chatroom_others() -> Dict[str, Any]:
     cfg = read_json(CONFIG_PATH, {})
@@ -340,15 +454,47 @@ def _chatroom_reminder() -> str:
 
 
 def _chatroom_system_prompt() -> str:
-    prompt = str(_chatroom_others().get("personality_prompt", "") or "").strip()
-    return prompt or "你是一个乐于助人的 AI 助手。"
+    others = _chatroom_others()
+    presets = others.get("personality_presets", [])
+    preset_map = {
+        str(item.get("id", "")).strip(): str(item.get("prompt", "") or "")
+        for item in presets if isinstance(item, dict) and str(item.get("id", "")).strip()
+    } if isinstance(presets, list) else {}
+    # 私聊人格为空串表示跟随默认人格。
+    selected = str(others.get("private_personality_preset", "") or "").strip() \
+        or str(others.get("active_personality_preset", "") or "").strip()
+    # 选中的预设存在就用它，即使内容为空也不要回退到 personality_prompt——
+    # 那样用户会以为换了人格，实际用的是别的内容。
+    if selected in preset_map:
+        prompt = preset_map[selected].strip()
+    else:
+        prompt = str(others.get("personality_prompt", "") or "").strip()
+    if not prompt:
+        name = next(
+            (str(p.get("name", "") or selected) for p in presets
+             if isinstance(p, dict) and str(p.get("id", "")).strip() == selected),
+            selected,
+        ) if isinstance(presets, list) else selected
+        # 和 QQ 侧 main.py:_get_system_prompt 保持一致：如实报错，
+        # 不要把提示文案当 system prompt 塞给模型（那会让它照着这句话回答）。
+        raise ValueError(f"人格预设「{name}」内容为空：请在人格设定页面填写人设，或改用其他预设")
+    return prompt
+
+
+def _chatroom_all_endpoints() -> list[Dict[str, Any]]:
+    """聊天室可用的全部 endpoint：包含未勾选的模型。
+
+    勾选只决定是否参与 QQ 侧自动轮换；聊天室是手动选模型，不该被它限制。
+    """
+    endpoints = build_all_provider_endpoints(_chatroom_others())
+    if not endpoints:
+        endpoints = _normalize_webui_llm_endpoints(_chatroom_others().get("llm_endpoints", []))
+    return endpoints
 
 
 def _chatroom_models() -> list[Dict[str, Any]]:
-    """从 provider/model 轮换配置读取可用模型，不含 key。"""
-    endpoints = build_llm_endpoints_from_providers(_chatroom_others())
-    if not endpoints:
-        endpoints = _normalize_webui_llm_endpoints(_chatroom_others().get("llm_endpoints", []))
+    """从提供商配置读取可选模型，不含 key。未勾选的模型也可在聊天室里选。"""
+    endpoints = _chatroom_all_endpoints()
     seen = set()
     models = []
     for ep in endpoints:
@@ -361,16 +507,15 @@ def _chatroom_models() -> list[Dict[str, Any]]:
             "raw_model": ep.get("model", ""),
             "base_url": ep.get("base_url", ""),
             "supports_multimodal": bool(ep.get("supports_multimodal", False)),
+            # 未参与轮换的模型在下拉里标一下，避免用户以为勾选没生效
+            "in_rotation": bool(ep.get("enabled", True)),
         })
     return models
 
 
 def _chatroom_endpoint_for_model(model: str) -> Optional[Dict[str, Any]]:
     """返回首个匹配显示模型或真实模型的 endpoint（含 keys），用于实际调用。"""
-    endpoints = build_llm_endpoints_from_providers(_chatroom_others())
-    if not endpoints:
-        endpoints = _normalize_webui_llm_endpoints(_chatroom_others().get("llm_endpoints", []))
-    for ep in endpoints:
+    for ep in _chatroom_all_endpoints():
         display_model = ep.get("display_model") or _provider_display_model(ep.get("provider_id", ""), ep.get("model", ""))
         if model in {display_model, ep.get("model")} and ep.get("keys"):
             return ep
@@ -379,10 +524,7 @@ def _chatroom_endpoint_for_model(model: str) -> Optional[Dict[str, Any]]:
 
 def _chatroom_rotation_endpoints(model: str) -> list[Dict[str, Any]]:
     """按轮换顺序返回聊天室可尝试的 endpoint；优先从当前选择模型开始。"""
-    endpoints = build_llm_endpoints_from_providers(_chatroom_others())
-    if not endpoints:
-        endpoints = _normalize_webui_llm_endpoints(_chatroom_others().get("llm_endpoints", []))
-    endpoints = [ep for ep in endpoints if ep.get("keys")]
+    endpoints = [ep for ep in _chatroom_all_endpoints() if ep.get("keys")]
     if not endpoints:
         return []
     selected = str(model or "").strip()
@@ -396,7 +538,13 @@ def _chatroom_rotation_endpoints(model: str) -> list[Dict[str, Any]]:
             break
     if start is None:
         return endpoints
-    return endpoints[start:] + endpoints[:start]
+    # 选中的模型排第一个；后续失败切换只用参与轮换的模型，
+    # 不把用户特意没勾选的模型也拉进来当备选。
+    rest = [
+        ep for i, ep in enumerate(endpoints)
+        if i != start and bool(ep.get("enabled", True))
+    ]
+    return [endpoints[start]] + rest
 
 
 def _chatroom_http_error_message(e: urllib.error.HTTPError) -> str:
@@ -623,6 +771,7 @@ def _chatroom_complete(model: str, messages: list[Dict[str, Any]]) -> str:
         except Exception:
             timeout = 60
         display_model = ep.get("display_model") or _provider_display_model(ep.get("provider_id", ""), ep.get("model", ""))
+        opener = _make_provider_opener(ep)
         for key in ep.get("keys") or []:
             _chatroom_log_api_request(_chatroom_scene(model), display_model, base_url, key, len(messages), messages[-1].get("content", "") if messages else "")
             payload = json.dumps({"model": ep.get("model") or model, "messages": messages, "stream": False}).encode("utf-8")
@@ -637,7 +786,7 @@ def _chatroom_complete(model: str, messages: list[Dict[str, Any]]) -> str:
                 method="POST",
             )
             try:
-                with _make_opener().open(req, timeout=timeout) as resp:
+                with opener.open(req, timeout=timeout) as resp:
                     data = json.loads(resp.read().decode("utf-8", errors="replace"))
             except urllib.error.HTTPError as e:
                 last_error = RuntimeError(_chatroom_http_error_message(e))
@@ -648,19 +797,22 @@ def _chatroom_complete(model: str, messages: list[Dict[str, Any]]) -> str:
                 _chatroom_log_api_failure(_chatroom_scene(model), display_model, key, last_error)
                 continue
             try:
-                content = data["choices"][0]["message"]["content"]
+                message_obj = data["choices"][0]["message"]
+                content = message_obj.get("content")
             except Exception:
                 last_error = RuntimeError(f"模型返回格式异常：{str(data)[:300]}")
                 _chatroom_log_api_failure(_chatroom_scene(model), display_model, key, last_error)
                 continue
-            content = (content or "").rstrip("\n")
+            # 思考模型：思维链单独取出，不混进正文
+            content, reasoning = split_reasoning_output(message_obj, str(content or ""))
+            content = content.rstrip("\n")
             _chatroom_log_api_success(_chatroom_scene(model), display_model, _chatroom_response_tokens(data), content)
-            return content
+            return content, reasoning
     raise last_error or RuntimeError("所有模型均失败")
 
 
 def _chatroom_stream_complete(model: str, messages: list[Dict[str, Any]]):
-    """OpenAI 兼容流式输出，yield 文本增量。"""
+    """OpenAI 兼容流式输出，yield (正文增量, 思维链增量)。"""
     endpoints = _chatroom_rotation_endpoints(model)
     if not endpoints:
         raise ValueError("所选模型不可用，请在「提供商」配置里检查模型轮换列表。")
@@ -673,6 +825,7 @@ def _chatroom_stream_complete(model: str, messages: list[Dict[str, Any]]):
         except Exception:
             timeout = 60
         display_model = ep.get("display_model") or _provider_display_model(ep.get("provider_id", ""), ep.get("model", ""))
+        opener = _make_provider_opener(ep)
         for key in ep.get("keys") or []:
             _chatroom_log_api_request(_chatroom_scene(model), display_model, base_url, key, len(messages), messages[-1].get("content", "") if messages else "")
             payload = json.dumps({"model": ep.get("model") or model, "messages": messages, "stream": True}).encode("utf-8")
@@ -689,28 +842,55 @@ def _chatroom_stream_complete(model: str, messages: list[Dict[str, Any]]):
             )
             emitted = False
             reply_parts = []
+            # 流式下 <think> 标签会被切碎，交给 splitter 跨 chunk 缝合
+            splitter = ThinkStreamSplitter()
             try:
-                with _make_opener().open(req, timeout=timeout) as resp:
+                with opener.open(req, timeout=timeout) as resp:
                     for raw in resp:
                         line = raw.decode("utf-8", errors="replace").strip()
                         if not line or not line.startswith("data:"):
                             continue
                         data = line[5:].strip()
                         if data == "[DONE]":
-                            _chatroom_log_api_success(_chatroom_scene(model), display_model, 0, "".join(reply_parts))
-                            return
+                            tail_visible, tail_reasoning = splitter.flush()
+                            if tail_visible or tail_reasoning:
+                                if tail_visible:
+                                    emitted = True
+                                    reply_parts.append(tail_visible)
+                                yield tail_visible, tail_reasoning
+                            if reply_parts:
+                                _chatroom_log_api_success(_chatroom_scene(model), display_model, 0, "".join(reply_parts))
+                                return
+                            last_error = RuntimeError("模型返回空内容")
+                            _chatroom_log_api_failure(_chatroom_scene(model), display_model, key, last_error)
+                            break
                         try:
                             obj = json.loads(data)
-                            delta = obj.get("choices", [{}])[0].get("delta", {}).get("content")
+                            delta_obj = obj.get("choices", [{}])[0].get("delta", {}) or {}
+                            # 独立字段形式的思维链：直接转发，不进正文
+                            field_reasoning = ""
+                            for name in ("reasoning_content", "reasoning"):
+                                value = delta_obj.get(name)
+                                if isinstance(value, str) and value:
+                                    field_reasoning = value
+                                    break
+                            if field_reasoning:
+                                yield "", field_reasoning
+                            delta = delta_obj.get("content")
                             if delta:
-                                emitted = True
-                                reply_parts.append(str(delta))
-                                yield str(delta)
+                                visible, reasoning = splitter.feed(str(delta))
+                                if visible:
+                                    emitted = True
+                                    reply_parts.append(visible)
+                                if visible or reasoning:
+                                    yield visible, reasoning
                         except Exception:
                             continue
                     if emitted:
                         _chatroom_log_api_success(_chatroom_scene(model), display_model, 0, "".join(reply_parts))
                         return
+                    last_error = RuntimeError("模型流式响应未返回文本")
+                    _chatroom_log_api_failure(_chatroom_scene(model), display_model, key, last_error)
             except urllib.error.HTTPError as e:
                 last_error = RuntimeError(_chatroom_http_error_message(e))
                 _chatroom_log_api_failure(_chatroom_scene(model), display_model, key, last_error)
@@ -731,8 +911,23 @@ CHATROOM_AGENT_MAX_MESSAGES = 96
 CHATROOM_AGENT_MAX_CHARS = 512 * 1024
 
 
+# 单条消息保留的思维链上限。思考模型动辄几千字，会话里存十几条就把
+# CHATROOM_MAX_CHARS 撑爆；这里先截断，_chatroom_msg_size 也会把它计入体积。
+CHATROOM_REASONING_MAX_CHARS = 8000
+
+
+def _chatroom_clip_reasoning(text: str) -> str:
+    reasoning = str(text or "").strip()
+    if len(reasoning) <= CHATROOM_REASONING_MAX_CHARS:
+        return reasoning
+    return reasoning[:CHATROOM_REASONING_MAX_CHARS] + "\n\n…（思考过程过长，已截断）"
+
+
 def _chatroom_msg_size(msg: Dict[str, Any]) -> int:
     size = len(str(msg.get("content", "") or ""))
+    # 思维链是 assistant 消息的独立字段，不算进来的话裁剪预算会严重低估，
+    # data/webui/chatroom/*.json 会远超 CHATROOM_MAX_CHARS。
+    size += len(str(msg.get("reasoning", "") or ""))
     for att in msg.get("attachments") or []:
         size += len(str(att.get("data", "") or "")) + len(str(att.get("text", "") or ""))
     return size
@@ -853,9 +1048,37 @@ def _chatroom_progress_messages(agent_state: Optional[Dict[str, Any]]) -> list[s
     return messages
 
 
+ABORT_FALLBACK_TEXT = "好，那我先停下。"
+ABORT_NOTICE_TEXT = "（已停止）"
+
+
+def _chatroom_merge_aborted_reply(reply: str, streamed_parts: list[str]) -> str:
+    """中断时把页面上已流出的内容补回最终回复。
+
+    Agent 的 content_so_far 只在一次完整响应结束后才赋值，流到一半被中断时它
+    还是空的，于是 _abort_text() 只能返回兜底文案「好，那我先停下。」——用户
+    看着满屏内容却被这句话替换掉。这里用实际推给页面的片段兜住这种情况。
+    """
+    reply = str(reply or "")
+    streamed = "".join(streamed_parts or "").strip()
+    if not streamed:
+        return reply
+    stripped = reply.strip()
+    # 兜底文案说明这轮被中断且 Agent 没拿到内容，直接换成真实流出的内容。
+    if stripped == ABORT_FALLBACK_TEXT:
+        return f"{streamed}\n\n{ABORT_NOTICE_TEXT}"
+    # 只剩「（已停止）」或整体为空，同理补上。
+    if not stripped or stripped == ABORT_NOTICE_TEXT:
+        return f"{streamed}\n\n{ABORT_NOTICE_TEXT}"
+    # Agent 自己带回了内容（正常结束，或中断时 content_so_far 有值）就用它的，
+    # 避免流式片段与最终文本重复拼接。
+    return reply
+
+
 def _chatroom_append_assistant(obj: Dict[str, Any], reply: str,
                                agent_state: Optional[Dict[str, Any]] = None,
-                               progress_messages: Optional[list[str]] = None) -> Dict[str, Any]:
+                               progress_messages: Optional[list[str]] = None,
+                               reasoning: str = "") -> Dict[str, Any]:
     with _chatroom_lock:
         fresh = _chatroom_load(obj.get("id", "")) or obj
         request_id = next((
@@ -869,10 +1092,17 @@ def _chatroom_append_assistant(obj: Dict[str, Any], reply: str,
                     "role": "assistant", "content": content, "ts": int(time.time()),
                     "request_id": request_id,
                 })
-        fresh.setdefault("messages", []).append({
+        assistant_msg = {
             "role": "assistant", "content": reply, "ts": int(time.time()),
             "request_id": request_id,
-        })
+        }
+        # 思维链跟着这条回复存，但只作为独立字段——不进 content，
+        # 所以既不会被当正文渲染，也不会进 _agent_history 污染上下文。
+        # 存前截断：思考模型的思维链动辄几千字，不限长会撑爆会话文件。
+        reasoning = _chatroom_clip_reasoning(reasoning)
+        if reasoning:
+            assistant_msg["reasoning"] = reasoning
+        fresh.setdefault("messages", []).append(assistant_msg)
         if isinstance(agent_state, dict):
             history = agent_state.get("history")
             if isinstance(history, list):
@@ -910,6 +1140,7 @@ def _chatroom_send(session_id: str, model: str, text: str,
         ), "")
         hint = _chatroom_handle_command(text)
         agent_state = None
+        reasoning = ""
         try:
             if hint is not None:
                 reply = hint
@@ -927,10 +1158,11 @@ def _chatroom_send(session_id: str, model: str, text: str,
                 if not isinstance(result, dict):
                     raise RuntimeError("聊天室 Agent 回调返回格式无效")
                 reply = str(result.get("reply") or "")
+                reasoning = str(result.get("reasoning") or "")
                 agent_state = result
             else:
                 llm_messages = _chatroom_build_llm_messages(obj, obj.get("model") or model)
-                reply = _chatroom_complete(obj.get("model") or model, llm_messages)
+                reply, reasoning = _chatroom_complete(obj.get("model") or model, llm_messages)
         except Exception:
             # 同步接口也必须和 SSE 接口一致：模型/Agent 失败时删除尚未配对的 user turn，
             # 否则下一次请求会把一条永远没有 assistant 的消息带进上下文。
@@ -939,6 +1171,7 @@ def _chatroom_send(session_id: str, model: str, text: str,
         obj = _chatroom_append_assistant(
             obj, reply, agent_state=agent_state,
             progress_messages=_chatroom_progress_messages(agent_state),
+            reasoning=reasoning,
         )
         return {"reply": reply, "session": _chatroom_public(obj)}
 
@@ -1294,6 +1527,7 @@ def _save_config_bundle_locked(data: Dict[str, Any]):
                 provider_id
                 or str(provider.get("base_url", "") or "").strip()
                 or _normalize_provider_keys(provider.get("keys", []))
+                or str(provider.get("http_proxy", "") or "").strip()
                 or has_model_name
             )
             if not has_provider_content:
@@ -1303,6 +1537,15 @@ def _save_config_bundle_locked(data: Dict[str, Any]):
             if provider_id in seen_provider_ids:
                 raise ValueError(f"渠道 ID 重复：{provider_id}。每个渠道必须使用唯一名称")
             seen_provider_ids.add(provider_id)
+
+            raw_provider_proxy = str(provider.get("http_proxy", "") or "").strip()
+            normalized_proxy = _normalize_proxy_url(raw_provider_proxy)
+            if raw_provider_proxy and not normalized_proxy:
+                raise ValueError(
+                    f"渠道 {provider_id} 的 HTTP 代理格式无效：{raw_provider_proxy}。"
+                    "请使用 http://127.0.0.1:7890 这样的格式（仅支持 http/https 代理）"
+                )
+            provider["http_proxy"] = normalized_proxy
 
             seen_model_names = set()
             raw_models = provider.get("models", [])
@@ -1323,6 +1566,14 @@ def _save_config_bundle_locked(data: Dict[str, Any]):
                     cleaned = dict(model_cfg)
                     cleaned["name"] = model_name
                     cleaned.pop("model", None)
+                    raw_effort = str(model_cfg.get("reasoning_effort", "") or "").strip()
+                    cleaned["reasoning_effort"] = _normalize_reasoning_effort(raw_effort)
+                    if raw_effort and not cleaned["reasoning_effort"]:
+                        raise ValueError(
+                            f"渠道 {provider_id} 的模型 {model_name} 思考等级无效：{raw_effort}。"
+                            "可选：默认（留空）/ none / minimal / low / medium / high"
+                        )
+                    cleaned["context_window"] = _normalize_context_window(model_cfg.get("context_window", 0))
                     cleaned_models.append(cleaned)
                 provider["models"] = cleaned_models
             raw_embedding_models = provider.get("embedding_models", [])
@@ -1414,8 +1665,7 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
         ]},
         {"key": "ai", "title": "AI 配置", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>', "desc": "对话行为与分段设置", "fields": [
             field("Others.context_max_messages", "上下文最大消息数", "number"),
-            field("Others.api_failure_cooldown_seconds", "失败冷却秒数", "number", "单个 API / Key 调用失败后，冷却多久再重试", 5),
-            field("Others.llm_reply_failover_keywords", "回复切换关键词", "list", "一行一个。若模型回复命中其中任一关键词，则丢弃该回复并按现有失败冷却逻辑自动切换到下一个 API"),
+            field("Others.llm_reply_failover_keywords", "回复切换关键词", "list", "一行一个。若模型回复命中其中任一关键词，则丢弃该回复并切换到下一个 API"),
             field("Others.llm_split.enabled", "启用 LLM 分段回复", "bool", "仅对大模型生成结果生效，不影响普通群聊回复是否引用"),
             field("Others.llm_split.mode", "LLM 分段模式", "select", "auto_prompt=大模型自主分段；regex=按正则切分模型输出", "auto_prompt", ["auto_prompt", "regex"]),
             field("Others.llm_split.prompt_suffix", "自主分段提示词", "textarea", "模式一使用。会自动追加到每次 LLM 用户消息后。建议保留 <split> 分隔符说明"),
@@ -1440,7 +1690,9 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
         ]},
         {"key": "persona", "title": "人格设定", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>', "desc": "编辑人设", "fields": [
             field("Others.personality_presets", "人格预设", "persona_presets"),
-            field("Others.active_personality_preset", "当前预设", "text"),
+            field("Others.active_personality_preset", "默认人格", "text"),
+            field("Others.private_personality_preset", "私聊人格", "text"),
+            field("Others.group_personality_preset", "群聊人格", "text"),
             field("Others.personality_prompt", "编辑人设", "textarea", "可使用 {bot_name} 与 {user_name} 占位符"),
         ]},
         {"key": "features", "title": "功能配置", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="14" y="3" rx="1"/><path d="M10 21V8a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5a1 1 0 0 0-1-1H3"/></svg>', "desc": "配置功能", "fields": [
@@ -1498,11 +1750,11 @@ field("Agent.show_time", "显示当前时间", "bool", "开启后每次对话在
             field("WebUI.access_token", "访问 Token", "password", "暴露到公网时请务必设置"),
             field("Others.github_repo", "GitHub 更新仓库", "text", "格式 owner/repo，例如 Qzy327422/XcBot；留空使用默认仓库"),
             field("Others.github_download_mirrors", "GitHub 备用更新镜像", "list", "一行一个镜像前缀。检查/下载更新时先直连 GitHub，失败后按顺序尝试这些地址"),
-            field("Others.http_proxy", "HTTP 代理", "text", "格式 http://127.0.0.1:7890，影响模型调用与 GitHub 请求；留空不使用代理"),
+            field("Others.http_proxy", "HTTP 代理", "text", "格式 http://127.0.0.1:7890，影响 GitHub 更新检查 / 插件市场与 Agent 联网（搜索、抓网页）；模型调用请在「提供商」里为每个提供商单独填代理。留空不使用代理"),
             field("WebUI.theme_preset", "主题色", "select", "选择一套背景主题色", "aurora", ["aurora", "midnight", "sakura", "forest", "sunset", "ocean"]),
             field("WebUI.background_image", "自定义背景图片", "background_image", "从本机选一张图，点「保存设置」时上传"),
             field("WebUI.background_blur", "背景模糊度", "number", "0 到 40，数值越大越柔和", 10, min=0, max=40),
-            field("WebUI.liquid_glass", "仿苹果液体玻璃 UI", "bool", "⚠️ 低配机可能会出现卡顿，请自行决定是否开启"),
+            field("WebUI.liquid_glass", "液态玻璃UI", "bool", "⚠️ 低配机可能会出现卡顿，请自行决定是否开启"),
         ]},
         {"key": "trace", "title": "追踪", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></svg>', "desc": "最近 24 小时每次 AI 对话的发送链路、模型调用链路、系统提示词与 token 明细", "fields": []},
         {"key": "logs", "title": "实时日志", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg>', "desc": "查看完整运行日志", "fields": []},
@@ -1990,6 +2242,42 @@ def _set_update_install_status(state: str, text: str, detail: str = "") -> None:
     }
 
 
+def _extract_model_context_window(item: Dict[str, Any]) -> int:
+    """从 /v1/models 单条记录里尽力挖出上下文窗口 token 数。
+
+    OpenAI 官方接口不返回这个字段，但各家中转站/自建网关几乎都会带，只是键名各异：
+    One API / new-api 用 context_length，vLLM 用 max_model_len，
+    OpenRouter 顶层给 context_length、也可能塞在 top_provider 里。
+    挖不到就返回 0，交给用户手填。
+    """
+    if not isinstance(item, dict):
+        return 0
+    candidates = (
+        "context_length", "context_window", "max_model_len", "max_context_length",
+        "max_input_tokens", "n_ctx",
+    )
+    nests = ("top_provider", "limit", "limits", "meta", "metadata", "spec")
+    for key in candidates:
+        try:
+            value = int(float(item.get(key) or 0))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    for nest in nests:
+        sub = item.get(nest)
+        if not isinstance(sub, dict):
+            continue
+        for key in candidates + ("context",):
+            try:
+                value = int(float(sub.get(key) or 0))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+    return 0
+
+
 def _resolve_python_executable() -> str:
     """尽量解析出当前环境可用的 Python 可执行文件路径。"""
     candidates = []
@@ -2092,11 +2380,27 @@ def _get_http_proxy() -> str:
         return ""
 
 def _make_opener(proxy: str = ""):
+    """GitHub / 更新检查等自身请求用的 opener，走全局 Others.http_proxy。"""
     if not proxy:
         proxy = _get_http_proxy()
     if proxy:
         return urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
     return urllib.request.build_opener()
+
+
+def _make_provider_opener(proxy_or_endpoint):
+    """提供商请求专用 opener：只认该提供商自己的 http_proxy，不回退全局代理。
+
+    传入可以是代理字符串，也可以是带 http_proxy 的 endpoint / provider 字典。
+    ProxyHandler({}) 会显式禁用代理，避免继承环境变量里的 HTTP_PROXY。
+    """
+    if isinstance(proxy_or_endpoint, dict):
+        proxy = str(proxy_or_endpoint.get("http_proxy", "") or "").strip()
+    else:
+        proxy = str(proxy_or_endpoint or "").strip()
+    proxy = _normalize_proxy_url(proxy)
+    handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy} if proxy else {})
+    return urllib.request.build_opener(handler)
 
 
 def _github_accelerated_urls(github_url: str) -> list[str]:
@@ -2213,10 +2517,16 @@ def _restart_current_process_after_update() -> None:
       2) 旧进程退出前先 stop_webui / flush，并把等待时间放大到 1.8s 给新进程喘息；
       3) 保留原 close_fds，但显式 stdin=DEVNULL/stdout=stderr，避免句柄继承问题。
     """
-    # 先执行外部收尾回调（仅旧进程一次）
+    # 先执行外部收尾回调（仅旧进程一次）。main.py 注册的是
+    # save_state_before_restart：保存记忆/统计并释放目录锁——下面用
+    # os._exit(0) 退出，atexit 不会触发，这里不做就等于丢数据。
     try:
         if callable(_pre_restart_callback):
-            _pre_restart_callback()
+            try:
+                _pre_restart_callback("重启")
+            except TypeError:
+                # 兼容不接受参数的旧回调
+                _pre_restart_callback()
     except Exception as e:
         print(f"[更新] pre_restart 回调失败（忽略继续）：{e}")
 
@@ -2271,6 +2581,17 @@ def _restart_current_process_after_update() -> None:
             os._exit(0)
 
     threading.Thread(target=_exit_later, name="XcBot-ExitAfterUpdate", daemon=True).start()
+
+
+def restart_bot_process(reason: str = "手动重启") -> None:
+    """重启整个进程。复用自动更新那套拉起新进程 + 退出旧进程的流程。
+
+    自动更新的重启路径已经处理好了 Windows 控制台继承、Linux 脱离会话、
+    pre_restart 回调保存记忆、以及先 stop_webui 释放端口这些细节，
+    这里没有理由再写一份。
+    """
+    print(f"[重启] {reason}，正在启动新进程…")
+    _restart_current_process_after_update()
 
 
 def install_latest_update() -> None:
@@ -2793,15 +3114,13 @@ def _debug_runtime_snapshot() -> Dict[str, Any]:
                     status_list = km.get_status_list() or []
                     now_ts = time.time()
                     kl = getattr(km, "key_list", []) or []
-                    active = cooldown = disabled = multimodal = fails = 0
+                    active = disabled = multimodal = fails = 0
                     error_items = []
                     for it in kl:
                         if not isinstance(it, dict):
                             continue
                         if it.get("disabled"):
                             disabled += 1
-                        elif float(it.get("cooldown_until", 0) or 0) > now_ts:
-                            cooldown += 1
                         else:
                             active += 1
                         if it.get("supports_multimodal"):
@@ -2823,7 +3142,7 @@ def _debug_runtime_snapshot() -> Dict[str, Any]:
                     api = {
                         "total": _safe_len(status_list),
                         "active": active,
-                        "cooldown": cooldown,
+                        "cooldown": 0,
                         "disabled": disabled,
                         "multimodal": multimodal,
                         "fail_total": fails,
@@ -3391,6 +3710,93 @@ def _token_equal(given: str, expected: str) -> bool:
         return False
 
 
+# ==================== 登录失败冷却 ====================
+# 取代原来「Token 至少 8 位」的硬限制：长度不该由程序替用户决定，但短 Token
+# 必须有速率限制兜着，否则几千次尝试就能撞开。按来源 IP 记连续失败次数，
+# 连错 LOGIN_MAX_FAILS 次锁 LOGIN_LOCK_SECONDS，锁定期内即使 Token 正确也拒绝。
+# 30 秒对自己人几乎无感，对爆破却是量级差别：5 次/30 秒 ≈ 每天 1.4 万次，
+# 面对稍有随机性的 Token 依然不够看，而输错一次的正常用户也不会被罚站太久。
+LOGIN_MAX_FAILS = 5
+LOGIN_LOCK_SECONDS = 30
+# 距上次失败超过这个时间就把计数清零，避免「一天里零散错 5 次」被判为暴力破解
+LOGIN_FAIL_WINDOW_SECONDS = 900
+# 上限防内存膨胀：伪造 X-Forwarded-For 或大范围扫描会撑出无限多个 key
+_LOGIN_STATE_MAX_KEYS = 2048
+# {ip: [失败次数, 最后一次失败时间, 锁定到期时间]}
+_login_fails: "dict[str, list[float]]" = {}
+_login_fails_lock = threading.Lock()
+
+
+def _login_client_key(handler: BaseHTTPRequestHandler) -> str:
+    """限流的归组键。
+
+    只用 TCP 对端地址，**不读 X-Forwarded-For**：那个头客户端可以任意伪造，
+    读了等于把限流开关交给攻击者（每次换一个假 IP 就永不触发冷却）。
+    代价是反代后面所有用户共用一个 key；WebUI 是单人管理面板，可以接受。
+    """
+    try:
+        return str(handler.client_address[0])
+    except Exception:
+        return "unknown"
+
+
+def _login_locked_for(key: str) -> float:
+    """返回该来源还需锁定的秒数；0 表示未锁定。"""
+    now = time.time()
+    with _login_fails_lock:
+        row = _login_fails.get(key)
+        if not row:
+            return 0.0
+        remain = row[2] - now
+        if remain > 0:
+            return remain
+        # 锁已过期：清掉锁与计数，给一个干净的重试窗口
+        if row[2]:
+            _login_fails.pop(key, None)
+        elif now - row[1] > LOGIN_FAIL_WINDOW_SECONDS:
+            _login_fails.pop(key, None)
+        return 0.0
+
+
+def _login_note_failure(key: str) -> "tuple[int, float]":
+    """记一次失败，返回（当前连续失败次数, 本次触发的锁定秒数）。"""
+    now = time.time()
+    with _login_fails_lock:
+        row = _login_fails.get(key)
+        if row and now - row[1] <= LOGIN_FAIL_WINDOW_SECONDS:
+            row[0] += 1
+            row[1] = now
+        else:
+            row = [1.0, now, 0.0]
+            _login_fails[key] = row
+        locked = 0.0
+        if row[0] >= LOGIN_MAX_FAILS:
+            row[2] = now + LOGIN_LOCK_SECONDS
+            locked = float(LOGIN_LOCK_SECONDS)
+        if len(_login_fails) > _LOGIN_STATE_MAX_KEYS:
+            # 先清掉已过期的；仍超限就丢最旧的那批，保住正在锁定中的记录
+            for k, v in [(k, v) for k, v in _login_fails.items()
+                         if v[2] <= now and now - v[1] > LOGIN_FAIL_WINDOW_SECONDS]:
+                _login_fails.pop(k, None)
+            if len(_login_fails) > _LOGIN_STATE_MAX_KEYS:
+                for k in sorted(_login_fails, key=lambda x: _login_fails[x][1])[:256]:
+                    if _login_fails.get(k, [0, 0, 0])[2] <= now:
+                        _login_fails.pop(k, None)
+        return int(row[0]), locked
+
+
+def _login_note_success(key: str) -> None:
+    with _login_fails_lock:
+        _login_fails.pop(key, None)
+
+
+def _fmt_lock_remain(seconds: float) -> str:
+    total = max(1, int(seconds + 0.5))
+    if total < 60:
+        return f"{total} 秒"
+    return f"{total // 60} 分 {total % 60} 秒" if total % 60 else f"{total // 60} 分钟"
+
+
 class WebUIHandler(BaseHTTPRequestHandler):
     server_version = "XcBotWebUI/1.0"
 
@@ -3398,6 +3804,10 @@ class WebUIHandler(BaseHTTPRequestHandler):
     # 反代 access log，所以只留给必须直接嵌在 <img src> / <a href> 里的资源，
     # 其余接口一律只认 X-WebUI-Token 头。
     QUERY_TOKEN_PATHS = frozenset({"/api/webui/background", "/api/raw-log"})
+
+    # 登录页用它试 Token；限流只在这条路径上生效，避免正常使用中
+    # 某个接口偶发 401（比如 Token 刚改）就把人锁在门外。
+    LOGIN_PROBE_PATH = "/api/ui-state"
 
     def log_message(self, fmt, *args):
         return
@@ -3455,9 +3865,47 @@ class WebUIHandler(BaseHTTPRequestHandler):
         except Exception:
             _json_response(self, {"ok": False, "error": "请求路径无法解析"}, 400)
             return False
-        if path.startswith("/api/") and not self._auth_ok():
+        if not path.startswith("/api/"):
+            return True
+        # 登录探测口先看冷却。锁定期内即使 Token 正确也拒绝，
+        # 否则「猜对就放过」等于限流形同虚设。
+        is_probe = path == self.LOGIN_PROBE_PATH
+        client = _login_client_key(self)
+        if is_probe:
+            remain = _login_locked_for(client)
+            if remain > 0:
+                _json_response(self, {
+                    "ok": False,
+                    "error": f"登录失败次数过多，请等待 {_fmt_lock_remain(remain)} 后重试",
+                    "locked": True, "retry_after": int(remain + 0.5),
+                    "login": "/auth/login",
+                }, 429)
+                return False
+        if not self._auth_ok():
+            if is_probe:
+                fails, locked = _login_note_failure(client)
+                if locked:
+                    print(f"⚠️ WebUI 登录连续失败 {fails} 次（来源 {client}），"
+                          f"已锁定 {_fmt_lock_remain(locked)}。")
+                    _json_response(self, {
+                        "ok": False,
+                        "error": f"登录失败次数过多，请等待 {_fmt_lock_remain(locked)} 后重试",
+                        "locked": True, "retry_after": int(locked),
+                        "login": "/auth/login",
+                    }, 429)
+                    return False
+                left = max(0, LOGIN_MAX_FAILS - fails)
+                _json_response(self, {
+                    "ok": False,
+                    "error": f"访问 Token 不正确（还可尝试 {left} 次）" if left
+                             else "访问 Token 不正确",
+                    "remaining_attempts": left, "login": "/auth/login",
+                }, 401)
+                return False
             _json_response(self, {"ok": False, "error": "未授权：访问 Token 不正确或已失效", "login": "/auth/login"}, 401)
             return False
+        if is_probe:
+            _login_note_success(client)
         return True
 
     def do_GET(self):
@@ -3581,6 +4029,19 @@ class WebUIHandler(BaseHTTPRequestHandler):
         if not self._guard():
             return
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/auth/login":
+            # 登录表单带 method="post" 只是为了让浏览器/密码管理器把它识别成
+            # 标准登录表单（进而愿意填充和保存凭据）；正常路径由 login.js 拦截
+            # submit、走 fetch 校验，不会真的提交到这里。
+            # 这里只兜住禁用 JS 的情况：读掉表单体后重新渲染登录页。不设 action
+            # 时若用 GET 提交，Token 会以 ?password= 落进地址栏和浏览器历史，
+            # 所以表单固定用 POST。
+            try:
+                self._discard_body(int(self.headers.get("Content-Length", "0") or 0))
+            except Exception:
+                pass
+            _text_response(self, LOGIN_HTML)
+            return
         if parsed.path == "/api/send":
             body_limit = 4 * 1024 * 1024
         elif parsed.path in ("/api/knowledge/documents/upload", "/api/knowledge/upload"):
@@ -3597,8 +4058,6 @@ class WebUIHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/config":
                 save_config_bundle(data or {})
-                if callable(_config_saved_callback):
-                    _config_saved_callback()
                 _json_response(self, {"ok": True, "message": "配置已保存并已尝试热应用。", "data": collect_config_bundle()})
             elif parsed.path == "/api/auth/set-token":
                 # 首次设置 Token。设过之后此接口已被 _guard 保护，
@@ -3607,8 +4066,11 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 if current:
                     raise ValueError("已设置过访问 Token。如需修改请在「WebUI」页面改，或直接编辑 config.json")
                 new_token = str((data or {}).get("token", "") or "").strip()
-                if len(new_token) < 8:
-                    raise ValueError("Token 至少需要 8 个字符")
+                # 不再限制最短长度。短 Token 的风险由登录失败冷却兜住
+                # （连续错 5 次锁 5 分钟，见 _login_attempt_state），
+                # 逐个尝试的暴力破解在这种速率下不成立。
+                if not new_token:
+                    raise ValueError("Token 不能为空")
                 if len(new_token) > 256:
                     raise ValueError("Token 过长（超过 256 字符）")
                 with config_transaction(CONFIG_PATH):
@@ -3703,6 +4165,16 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 payload = data or {}
                 base_url = str(payload.get("base_url", "") or "").strip().rstrip("/")
                 keys = _normalize_provider_keys(payload.get("keys", []))
+                # 前端会把当前表单里的代理一起传过来（可能还没保存），
+                # 包括用户刚清空的情况——所以只在 payload 里完全没这个键时
+                # 才退回已保存配置，否则会用旧代理去测新配置。
+                if "http_proxy" in payload:
+                    provider_proxy = str(payload.get("http_proxy") or "").strip()
+                else:
+                    provider_proxy = _get_provider_proxy(
+                        read_json(CONFIG_PATH, {}).get("Others") or {},
+                        str(payload.get("provider_id", "") or ""),
+                    )
                 if not base_url:
                     raise ValueError("base_url 不能为空")
                 if not keys:
@@ -3713,15 +4185,26 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     method="GET",
                 )
                 try:
-                    with _make_opener().open(req, timeout=20) as resp:
+                    with _make_provider_opener(provider_proxy).open(req, timeout=20) as resp:
                         obj = json.loads(resp.read().decode("utf-8", errors="replace"))
                     models = []
+                    windows = {}
                     for item in obj.get("data", []) if isinstance(obj, dict) else []:
-                        if isinstance(item, dict) and str(item.get("id", "") or "").strip():
-                            models.append(str(item.get("id")).strip())
-                    _json_response(self, {"ok": True, "message": f"检测到 {len(models)} 个模型", "data": {"models": models, "error": ""}})
+                        if not isinstance(item, dict):
+                            continue
+                        model_id = str(item.get("id", "") or "").strip()
+                        if not model_id:
+                            continue
+                        models.append(model_id)
+                        window = _extract_model_context_window(item)
+                        if window > 0:
+                            windows[model_id] = window
+                    msg = f"检测到 {len(models)} 个模型"
+                    if windows:
+                        msg += f"，其中 {len(windows)} 个带上下文窗口信息"
+                    _json_response(self, {"ok": True, "message": msg, "data": {"models": models, "context_windows": windows, "error": ""}})
                 except Exception as e:
-                    _json_response(self, {"ok": True, "message": "检测失败", "data": {"models": [], "error": str(e)}})
+                    _json_response(self, {"ok": True, "message": "检测失败", "data": {"models": [], "context_windows": {}, "error": str(e)}})
             elif parsed.path in ("/api/knowledge/documents/upload", "/api/knowledge/upload"):
                 payload = data or {}
                 filename = str(payload.get("filename", "") or "")
@@ -3838,28 +4321,60 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "keep-alive")
                 self.end_headers()
+                sse_state = {"gone": False}
                 def _sse(event: str, obj: Dict[str, Any]):
-                    self.wfile.write((f"event: {event}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n").encode("utf-8"))
-                    self.wfile.flush()
+                    # 连接断了（用户点终止 / 关页面 / 切走）不能让写失败冒出去打断生成：
+                    # 异常会一路抛到下面的 except，把这次的 user turn 也删掉，
+                    # 结果就是点一下终止，半篇已经生成好的回复全丢。
+                    # 这里改成记下"客户端没了"并静默跳过后续推送，让生成正常收尾、
+                    # 把已产出的内容存进会话，用户刷新还能看到。
+                    if sse_state["gone"]:
+                        return
+                    try:
+                        self.wfile.write((f"event: {event}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n").encode("utf-8"))
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        sse_state["gone"] = True
                 request_id = ""
+                reply_parts = []
+                reasoning_parts = []
+                agent_state = None
+                obj = None
                 try:
                     with _chatroom_session_lock(sid):
+                        _chatroom_mark_generating(sid, True)
                         obj, full_text = _chatroom_prepare_user_message(sid, model, text, attachments)
                         request_id = next((m.get("request_id") for m in reversed(obj.get("messages", [])) if m.get("role") == "user"), "")
                         hint = _chatroom_handle_command(full_text)
-                        reply_parts = []
-                        agent_state = None
                         if hint is not None:
                             reply_parts.append(hint)
                             _sse("delta", {"text": hint})
                         elif callable(_chatroom_agent_callback):
                             progress_messages = []
+                            streamed_parts = []
 
                             def _emit_progress(progress: str):
                                 progress = str(progress or "").strip()
                                 if progress:
                                     progress_messages.append(progress)
                                     _sse("progress", {"text": progress})
+
+                            def _emit_delta(chunk):
+                                # 流式片段要留一份：用户中途点终止时，Agent 内部的
+                                # content_so_far 还是空的（它只在一次完整响应结束后
+                                # 才赋值），只能返回兜底文案。页面上已经显示的内容
+                                # 全靠这里累计下来，才能原样存进会话。
+                                text = str(chunk or "")
+                                if text:
+                                    streamed_parts.append(text)
+                                _sse("delta", {"text": text})
+
+                            def _emit_reasoning(chunk):
+                                # 思维链走独立事件，前端渲染成可折叠区，不混进正文
+                                text = str(chunk or "")
+                                if text:
+                                    reasoning_parts.append(text)
+                                    _sse("reasoning", {"text": text})
 
                             result = _chatroom_agent_callback({
                                 "id": sid,
@@ -3872,35 +4387,64 @@ class WebUIHandler(BaseHTTPRequestHandler):
                                 "admin": bool(str(get_webui_config().get("access_token", "") or "").strip()),
                                 "stream": stream_reply,
                                 "progress_callback": _emit_progress,
-                                "stream_callback": lambda chunk: _sse("delta", {"text": str(chunk or "")}),
+                                "stream_callback": _emit_delta,
+                                "reasoning_callback": _emit_reasoning,
                             })
                             if not isinstance(result, dict):
                                 raise RuntimeError("聊天室 Agent 回调返回格式无效")
-                            reply_parts.append(str(result.get("reply") or ""))
+                            reply_parts.append(
+                                _chatroom_merge_aborted_reply(str(result.get("reply") or ""), streamed_parts)
+                            )
                             agent_state = result
                         else:
                             llm_messages = _chatroom_build_llm_messages(obj, obj.get("model") or model)
                             if stream_reply:
-                                for part in _chatroom_stream_complete(obj.get("model") or model, llm_messages):
-                                    reply_parts.append(part)
-                                    _sse("delta", {"text": part})
+                                for part, part_reasoning in _chatroom_stream_complete(obj.get("model") or model, llm_messages):
+                                    if part:
+                                        reply_parts.append(part)
+                                        _sse("delta", {"text": part})
+                                    if part_reasoning:
+                                        reasoning_parts.append(part_reasoning)
+                                        _sse("reasoning", {"text": part_reasoning})
                             else:
-                                reply = _chatroom_complete(obj.get("model") or model, llm_messages)
+                                reply, reply_reasoning = _chatroom_complete(obj.get("model") or model, llm_messages)
                                 reply_parts.append(reply)
                                 _sse("delta", {"text": reply})
+                                if reply_reasoning:
+                                    reasoning_parts.append(reply_reasoning)
+                                    _sse("reasoning", {"text": reply_reasoning})
                         fresh = _chatroom_append_assistant(
                             obj, "".join(reply_parts), agent_state=agent_state,
                             progress_messages=_chatroom_progress_messages(agent_state),
+                            reasoning="".join(reasoning_parts),
                         )
                         _sse("done", {"session": _chatroom_public(fresh)})
                 except (BrokenPipeError, ConnectionResetError):
-                    _chatroom_remove_pending_user(sid, request_id)
-                except Exception as e:
-                    _chatroom_remove_pending_user(sid, request_id)
+                    # 走到这里说明是 _sse 之外的地方断的；已产出的内容此时还没落盘，
+                    # 能存就存，别把用户等了半天的半篇回复直接丢掉。
+                    saved = False
                     try:
-                        _sse("error", {"error": str(e)})
+                        partial = "".join(reply_parts).strip()
+                        if partial and obj is not None:
+                            _chatroom_append_assistant(
+                                obj, partial, agent_state=agent_state,
+                                progress_messages=_chatroom_progress_messages(agent_state),
+                                reasoning="".join(reasoning_parts),
+                            )
+                            saved = True
                     except Exception:
                         pass
+                    if not saved:
+                        _chatroom_remove_pending_user(sid, request_id)
+                except Exception as e:
+                    _chatroom_remove_pending_user(sid, request_id)
+                    _append_log(f"[聊天室] 模型调用失败：{e}", "webui")
+                    try:
+                        _sse("error", {"error": str(e), "detail": traceback.format_exc(limit=3)})
+                    except Exception:
+                        pass
+                finally:
+                    _chatroom_mark_generating(sid, False)
 
             elif parsed.path == "/api/chat/send":
                 payload = data or {}
@@ -3918,7 +4462,9 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 sid = str(payload.get("id", "") or "")
                 model = str(payload.get("model", "") or "").strip()
                 available_models = {str(item.get("model", "") or "") for item in _chatroom_models()}
-                if model not in available_models:
+                if _chatroom_is_generating(sid):
+                    _json_response(self, {"ok": False, "error": "该会话正在生成，完成或停止后再切换模型"}, 409)
+                elif model not in available_models:
                     _json_response(self, {"ok": False, "error": "所选模型不可用，请刷新模型列表"}, 400)
                 else:
                     with _chatroom_session_lock(sid):
@@ -3933,18 +4479,26 @@ class WebUIHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/chat/rename":
                 payload = data or {}
                 sid = str(payload.get("id", "") or "")
-                with _chatroom_session_lock(sid):
-                    obj = _chatroom_load(sid)
-                    if obj is None:
-                        _json_response(self, {"ok": False, "error": "会话不存在"}, 404)
-                    else:
-                        obj["title"] = (str(payload.get("title", "") or "").strip()[:60]) or obj.get("title", "新会话")
-                        _chatroom_save(obj)
-                        _json_response(self, {"ok": True, "data": _chatroom_public(obj)})
+                if _chatroom_is_generating(sid):
+                    _json_response(self, {"ok": False, "error": "该会话正在生成，完成或停止后再重命名"}, 409)
+                else:
+                    with _chatroom_session_lock(sid):
+                        obj = _chatroom_load(sid)
+                        if obj is None:
+                            _json_response(self, {"ok": False, "error": "会话不存在"}, 404)
+                        else:
+                            obj["title"] = (str(payload.get("title", "") or "").strip()[:60]) or obj.get("title", "新会话")
+                            _chatroom_save(obj)
+                            _json_response(self, {"ok": True, "data": _chatroom_public(obj)})
             elif parsed.path == "/api/chat/delete":
                 payload = data or {}
-                ok = _chatroom_delete(str(payload.get("id", "") or ""))
-                _json_response(self, {"ok": True, "data": {"deleted": ok}})
+                sid = str(payload.get("id", "") or "")
+                if _chatroom_is_generating(sid):
+                    # 删掉正在生成的会话，后台 Agent 收尾时会把它整个写回来
+                    _json_response(self, {"ok": False, "error": "该会话正在生成，请先停止后再删除"}, 409)
+                else:
+                    ok = _chatroom_delete(sid)
+                    _json_response(self, {"ok": True, "data": {"deleted": ok}})
             elif parsed.path == "/api/trace/switch":
                 payload = data if isinstance(data, dict) else {}
                 enabled = normalize_bool_config(payload.get("enabled"), default=False)
@@ -3988,6 +4542,25 @@ class WebUIHandler(BaseHTTPRequestHandler):
                         result = {"ok": False, "code": "INTERNAL_ERROR", "error": "发送回调返回格式无效", "status": 500}
                     status = int(result.pop("status", 200 if result.get("ok") else 500))
                     _json_response(self, result, status)
+            elif parsed.path == "/api/debug/restart":
+                # 立即回响应再重启：_restart_current_process_after_update 会在
+                # 1.8 秒后 os._exit，先把响应写出去，前端才能提示"正在重启"。
+                # 但它自己会先 stop_webui() 释放端口，所以必须延后一点再动手，
+                # 否则响应还没送到浏览器，服务就被关了。
+                _json_response(self, {"ok": True, "message": "正在重启，约 3~10 秒后自动刷新页面"})
+                try:
+                    self.wfile.flush()
+                except Exception:
+                    pass
+
+                def _delayed_restart():
+                    time.sleep(0.4)
+                    restart_bot_process("WebUI 调试页手动重启")
+
+                threading.Thread(
+                    target=_delayed_restart,
+                    name="XcBot-ManualRestart", daemon=True,
+                ).start()
             elif parsed.path == "/api/debug/self-message":
                 if not callable(_debug_self_message_callback):
                     _json_response(self, {
@@ -4070,13 +4643,81 @@ LOGIN_HTML = r'''<!doctype html>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>XcBot WebUI 登录</title><link rel="icon" href="/assets/icon.jpg">
   <style>
 
-    :root{--bg0:#06151b;--bg1:#0b2b26;--bg2:#12384a;--bg3:#071017;--text:#f2fbff;--muted:rgba(224,242,254,.68);--line:rgba(255,255,255,.14);--line2:rgba(255,255,255,.08);--glass:rgba(255,255,255,.105);--glass2:rgba(255,255,255,.065);--accent:#38d5ff;--accent2:#7cf7c8;--accent3:#a78bfa;--bad:#fb7185;--shadow:0 24px 90px rgba(0,0,0,.42)}
-    html[data-theme="light"]{--bg0:#f4f8fb;--bg1:#eef7f3;--bg2:#edf6ff;--bg3:#f8fbff;--text:#142334;--muted:rgba(44,62,80,.68);--line:rgba(148,163,184,.24);--line2:rgba(148,163,184,.16);--glass:rgba(255,255,255,.78);--glass2:rgba(255,255,255,.58);--accent:#3b82f6;--accent2:#34d399;--accent3:#8b5cf6;--bad:#e11d48;--shadow:0 24px 72px rgba(148,163,184,.18)}
-    *{box-sizing:border-box}html{min-height:100%;background:var(--bg0)}body{margin:0;min-height:100vh;color:var(--text);font-family:Segoe UI,Microsoft YaHei,Arial,sans-serif;display:grid;place-items:center;overflow:hidden;background:radial-gradient(circle at 18% 14%,rgba(124,247,200,.24),transparent 27%),radial-gradient(circle at 76% 18%,rgba(56,213,255,.18),transparent 28%),radial-gradient(circle at 82% 78%,rgba(167,139,250,.16),transparent 30%),linear-gradient(145deg,var(--bg0),var(--bg1) 42%,var(--bg2) 74%,var(--bg3))}body:after{content:"";position:fixed;inset:14px;pointer-events:none;border:1px solid rgba(255,255,255,.08);border-radius:30px;box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}.login{position:relative;z-index:1;width:min(360px,calc(100vw - 40px));padding:24px 26px 28px;border:1px solid var(--line);border-radius:26px;background:linear-gradient(145deg,var(--glass),var(--glass2));box-shadow:var(--shadow);backdrop-filter:blur(24px) saturate(145%);overflow:hidden;transform:translateY(12vh)}.login:before{content:"";position:absolute;inset:-1px;border-radius:inherit;pointer-events:none;background:radial-gradient(circle at 20% 0%,rgba(124,247,200,.18),transparent 36%),radial-gradient(circle at 88% 8%,rgba(56,213,255,.16),transparent 36%)}.login>*{position:relative}.head{display:flex;justify-content:space-between;align-items:center;gap:12px}.logo{width:54px;height:54px;border-radius:17px;overflow:hidden;background:linear-gradient(135deg,var(--accent),var(--accent3));display:grid;place-items:center;box-shadow:0 14px 34px rgba(56,213,255,.25)}.logo img{width:100%;height:100%;object-fit:cover}.theme{width:38px;height:38px;border-radius:14px;border:1px solid var(--line);background:linear-gradient(180deg,var(--glass),var(--glass2));color:var(--text);cursor:pointer;font-size:17px;box-shadow:inset 0 1px 0 rgba(255,255,255,.10)}h1{font-size:23px;margin:16px 0 6px;font-weight:900;letter-spacing:.2px}.sub{font-size:13px;color:var(--muted);margin-bottom:22px}.field{height:54px;border:1px solid var(--line);border-radius:16px;margin:0 0 14px;display:grid;grid-template-columns:34px 1fr 30px;align-items:center;padding:0 11px;color:var(--muted);background:rgba(5,12,25,.24);box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}html[data-theme="light"] .field{background:rgba(255,255,255,.55)}.field:focus-within{border-color:rgba(56,213,255,.55);box-shadow:0 0 0 4px rgba(56,213,255,.12),inset 0 1px 0 rgba(255,255,255,.10)}.field svg{width:18px;height:18px;opacity:.72}.field input{width:100%;height:38px;align-self:center;border:0;outline:0;background:transparent;color:var(--text);font:inherit;padding:0;line-height:38px;display:block;transform:translateY(2px)}.field input::placeholder{color:var(--muted)}.eye{width:30px;height:30px;border:0;background:transparent;color:var(--muted);cursor:pointer;font-size:17px;display:grid;place-items:center;line-height:1;padding:0}.btn{width:100%;height:42px;border:0;border-radius:15px;background:linear-gradient(135deg,var(--accent),var(--accent3));color:#031018;font-weight:900;cursor:pointer;margin-top:12px;box-shadow:0 16px 36px rgba(56,213,255,.24)}.btn:disabled{opacity:.65;cursor:not-allowed}.msg{min-height:18px;margin-top:-4px;color:var(--bad);font-size:12px}.shake{animation:shake .22s linear 2}@keyframes shake{25%{transform:translateX(-4px)}75%{transform:translateX(4px)}}
+    :root{--bg0:#06151b;--bg1:#0b2b26;--bg2:#12384a;--bg3:#071017;--text:#f2fbff;--muted:rgba(224,242,254,.68);--muted2:rgba(224,242,254,.46);--line:rgba(255,255,255,.14);--line2:rgba(255,255,255,.08);--glass:rgba(255,255,255,.105);--glass2:rgba(255,255,255,.072);--glass3:rgba(255,255,255,.045);--accent:#38d5ff;--accent2:#7cf7c8;--accent3:#a78bfa;--accent-rgb:56,213,255;--accent2-rgb:124,247,200;--bad:#fb7185;--shadow:0 24px 90px rgba(0,0,0,.42)}
+    html[data-theme="light"]{--bg0:#f4f8fb;--bg1:#eef7f3;--bg2:#edf6ff;--bg3:#f8fbff;--text:#142334;--muted:rgba(44,62,80,.68);--muted2:rgba(44,62,80,.48);--line:rgba(148,163,184,.24);--line2:rgba(148,163,184,.16);--glass:rgba(255,255,255,.78);--glass2:rgba(255,255,255,.64);--glass3:rgba(255,255,255,.48);--accent:#3b82f6;--accent2:#34d399;--accent3:#8b5cf6;--accent-rgb:59,130,246;--accent2-rgb:52,211,153;--bad:#e11d48;--shadow:0 24px 72px rgba(148,163,184,.18)}
+    /* 主题预设。与 app.css 里的同名规则保持一致，登录页才不会和主界面两种配色。
+       主界面把当前外观缓存在 localStorage，login.js 启动时还原，所以这里不需要
+       任何后端接口——登录前不暴露任何数据。 */
+    html:not([data-theme="light"])[data-webui-preset="aurora"]{--bg0:#061a1f;--bg1:#0e2d28;--accent-rgb:96,205,210;--accent2-rgb:76,192,160;--accent:#60cdd2;--accent2:#4cc0a0}
+    html:not([data-theme="light"])[data-webui-preset="xcbot"]{--bg0:#06151b;--bg1:#0d2a26;--accent-rgb:96,205,255;--accent2-rgb:76,192,160;--accent:#60cdff;--accent2:#4cc0a0}
+    html:not([data-theme="light"])[data-webui-preset="midnight"]{--bg0:#080d22;--bg1:#101830;--accent-rgb:96,160,220;--accent2-rgb:130,128,210;--accent:#60a0dc;--accent2:#8280d2}
+    html:not([data-theme="light"])[data-webui-preset="sakura"]{--bg0:#180810;--bg1:#2a1020;--accent-rgb:210,120,140;--accent2-rgb:200,148,180;--accent:#d2788c;--accent2:#c894b4}
+    html:not([data-theme="light"])[data-webui-preset="forest"]{--bg0:#061408;--bg1:#0e2414;--accent-rgb:110,185,140;--accent2-rgb:72,178,165;--accent:#6eb98c;--accent2:#48b2a5}
+    html:not([data-theme="light"])[data-webui-preset="sunset"]{--bg0:#180800;--bg1:#2a1206;--accent-rgb:210,140,80;--accent2-rgb:200,175,70;--accent:#d28c50;--accent2:#c8af46}
+    html:not([data-theme="light"])[data-webui-preset="ocean"]{--bg0:#021420;--bg1:#062438;--accent-rgb:60,185,205;--accent2-rgb:80,160,210;--accent:#3cb9cd;--accent2:#50a0d2}
+    html[data-theme="light"][data-webui-preset="aurora"]{--bg0:#ffffff;--bg1:#f3f3f3;--accent:#0078d4;--accent2:#0b6a0b;--accent-rgb:0,120,212;--accent2-rgb:11,106,11;--text:#142334}
+    html[data-theme="light"][data-webui-preset="xcbot"]{--bg0:#ffffff;--bg1:#f3f3f3;--accent:#0078d4;--accent2:#0b6a0b;--accent-rgb:0,120,212;--accent2-rgb:11,106,11;--text:#142334}
+    html[data-theme="light"][data-webui-preset="midnight"]{--bg0:#f8fafc;--bg1:#f0f4ff;--accent:#3864b4;--accent2:#645abe;--accent-rgb:56,100,180;--accent2-rgb:100,90,190;--text:#0d1b2a}
+    html[data-theme="light"][data-webui-preset="sakura"]{--bg0:#fffbff;--bg1:#fff1f2;--accent:#be5064;--accent2:#aa6496;--accent-rgb:190,80,100;--accent2-rgb:170,100,150;--text:#2a0a15}
+    html[data-theme="light"][data-webui-preset="forest"]{--bg0:#fafefb;--bg1:#f0fdf4;--accent:#14783c;--accent2:#289682;--accent-rgb:20,120,60;--accent2-rgb:40,150,130;--text:#0a1f10}
+    html[data-theme="light"][data-webui-preset="sunset"]{--bg0:#fffdfa;--bg1:#fff7ed;--accent:#be6428;--accent2:#b48228;--accent-rgb:190,100,40;--accent2-rgb:180,130,40;--text:#2a1000}
+    html[data-theme="light"][data-webui-preset="ocean"]{--bg0:#f5feff;--bg1:#ecfeff;--accent:#008296;--accent2:#1e6eaa;--accent-rgb:0,130,150;--accent2-rgb:30,110,170;--text:#042830}
+*{box-sizing:border-box}html{min-height:100%;background:var(--bg0)}    /* 背景与主界面同一套：六层 accent 径向光晕 + bg0→bg1 线性底。
+       原先登录页写死一组青蓝光晕、四层、还用了 bg2/bg3，换主题色时纹理和主界面
+       完全对不上——所以要一比一照抄 app.css 的那两条规则，只跟 accent 变量走。 */
+    body{margin:0;min-height:100vh;color:var(--text);font-family:Inter,Segoe UI,Microsoft YaHei,Arial,sans-serif;display:grid;place-items:center;overflow:hidden;
+      background:radial-gradient(at 50% 50%,rgba(var(--accent-rgb),.28) 0px,transparent 55%),
+                 radial-gradient(at 80% 20%,rgba(var(--accent2-rgb),.24) 0px,transparent 50%),
+                 radial-gradient(at 20% 80%,rgba(var(--accent-rgb),.20) 0px,transparent 60%),
+                 radial-gradient(at 40% 60%,rgba(var(--accent2-rgb),.20) 0px,transparent 55%),
+                 radial-gradient(at 70% 70%,rgba(var(--accent-rgb),.16) 0px,transparent 50%),
+                 radial-gradient(at 30% 30%,rgba(var(--accent2-rgb),.16) 0px,transparent 60%),
+                 linear-gradient(180deg,var(--bg0),var(--bg1))}
+    html[data-theme="light"] body{
+      background:radial-gradient(at 50% 50%,rgba(var(--accent-rgb),.35) 0px,transparent 55%),
+                 radial-gradient(at 80% 20%,rgba(var(--accent2-rgb),.30) 0px,transparent 50%),
+                 radial-gradient(at 20% 80%,rgba(var(--accent-rgb),.25) 0px,transparent 60%),
+                 radial-gradient(at 40% 60%,rgba(var(--accent2-rgb),.25) 0px,transparent 55%),
+                 radial-gradient(at 70% 70%,rgba(var(--accent-rgb),.20) 0px,transparent 50%),
+                 radial-gradient(at 30% 30%,rgba(var(--accent2-rgb),.20) 0px,transparent 60%),
+                 linear-gradient(180deg,var(--bg0),var(--bg1))}
+    /* 主界面用 body:after{display:none} 关掉了这道内描边，登录页也得关，
+       否则浅色模式下四周多一圈白边、看着就是两个页面。 */
+    body:after{display:none}
+    /* 自定义背景图层。图不由后端下发——登录前不该有可匿名访问的资源出口。
+       主界面在 applyWebuiAppearance 里把图片转成 data URL 存进 localStorage，
+       login.js 启动时读出来塞进 --user-bg-image。没有缓存时这一层是 none，
+       退回上面的渐变色，视觉上仍与主界面同一套配色。 */
+    body:before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
+      background-image:var(--user-bg-image,none);background-size:cover;background-position:center;
+      filter:blur(var(--user-bg-blur,0px));opacity:.82;transform:scale(1.06)}
+    html.has-bg body{background:var(--bg0)}
+    /* 有背景图时卡片压暗一点，白色文字在浅色壁纸上才读得清 */
+    html.has-bg .login{background:linear-gradient(145deg,rgba(10,20,30,.52),rgba(10,20,30,.38));border-color:rgba(255,255,255,.22)}
+    html.has-bg[data-theme="light"] .login{background:linear-gradient(145deg,rgba(255,255,255,.74),rgba(255,255,255,.6))}.login{position:relative;z-index:1;width:min(360px,calc(100vw - 40px));padding:24px 26px 28px;border:1px solid var(--line);border-radius:26px;background:linear-gradient(145deg,var(--glass),var(--glass2));box-shadow:var(--shadow);backdrop-filter:blur(24px) saturate(145%);overflow:hidden;--cardY:12vh;transform:translateY(var(--cardY))}.login:before{content:"";position:absolute;inset:-1px;border-radius:inherit;pointer-events:none;background:radial-gradient(circle at 20% 0%,rgba(124,247,200,.18),transparent 36%),radial-gradient(circle at 88% 8%,rgba(56,213,255,.16),transparent 36%)}.login>*{position:relative}.head{display:flex;justify-content:space-between;align-items:center;gap:12px}.logo{width:54px;height:54px;border-radius:17px;overflow:hidden;background:linear-gradient(135deg,var(--accent),var(--accent3));display:grid;place-items:center;box-shadow:0 14px 34px rgba(56,213,255,.25)}.logo img{width:100%;height:100%;object-fit:cover}.theme svg{width:17px;height:17px;display:block}.theme{width:38px;height:38px;border-radius:14px;border:1px solid var(--line);background:linear-gradient(180deg,var(--glass),var(--glass2));color:var(--text);cursor:pointer;display:grid;place-items:center;padding:0;box-shadow:inset 0 1px 0 rgba(255,255,255,.10)}h1{font-size:23px;margin:16px 0 6px;font-weight:900;letter-spacing:.2px}.sub{font-size:13px;color:var(--muted);margin-bottom:22px}.field{height:54px;border:1px solid var(--line);border-radius:16px;margin:0 0 14px;display:grid;grid-template-columns:34px 1fr 30px;align-items:center;padding:0 11px;color:var(--muted);background:rgba(5,12,25,.24);box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}html[data-theme="light"] .field{background:rgba(255,255,255,.55)}.field:focus-within{border-color:rgba(56,213,255,.55);box-shadow:0 0 0 4px rgba(56,213,255,.12),inset 0 1px 0 rgba(255,255,255,.10)}.field svg{width:18px;height:18px;opacity:.72}.field input{width:100%;height:38px;align-self:center;border:0;outline:0;background:transparent;color:var(--text);font:inherit;padding:0;line-height:38px;display:block;transform:translateY(2px)}.field input::placeholder{color:var(--muted)}.eye{width:30px;height:30px;border:0;background:transparent;color:var(--muted);cursor:pointer;display:grid;place-items:center;line-height:1;padding:0;border-radius:9px;transition:.16s ease}.eye:hover{color:var(--text);background:rgba(255,255,255,.10)}.eye svg{width:17px;height:17px;display:block}
+    /* 关掉 Edge / Chrome 自带的密码显示按钮，否则和我们的眼睛并排出现两个 */
+    .field input::-ms-reveal,.field input::-ms-clear{display:none!important;width:0;height:0}/* 登录按钮跟主界面的「保存设置」对齐：accent→accent2 渐变、文字用 --text、
+    字重 800。原先是 accent→accent3、写死深色文字 #031018、字重 900 —— 浅色模式下
+    「登录」二字不随主题变色，按钮配色也和主界面不是一套。浅色主题下渐变掺白，
+    与 app.css 的 color-mix 处理保持一致，深色文字才压得住。 */
+    .btn{width:100%;height:42px;border:0;border-radius:15px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:var(--text);font-weight:800;cursor:pointer;margin-top:12px;box-shadow:0 12px 26px rgba(var(--accent-rgb),.20),inset 0 1px 0 rgba(255,255,255,.24);transition:.2s ease}
+    html[data-theme="light"] .btn{background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 72%,white),color-mix(in srgb,var(--accent2) 72%,white))}
+    .btn:hover{transform:translateY(-1px);box-shadow:0 16px 32px rgba(var(--accent-rgb),.26),inset 0 1px 0 rgba(255,255,255,.28)}.btn:disabled{opacity:.65;cursor:not-allowed}.msg{min-height:18px;margin-top:-4px;color:var(--bad);font-size:12px}/* 出错抖动。原来是 ±4px 抖两轮、linear，晃得很凶；收敛成单轮 ±2px、
+    ease-out 衰减，够醒目又不刺眼。注意卡片本身带 translateY(--cardY) 定位，
+    关键帧里必须把它一起写上，否则动画期间卡片会瞬间跳到垂直居中再弹回。 */
+    .shake{animation:shake .3s cubic-bezier(.36,.07,.19,.97) 1}
+    @keyframes shake{
+      0%,100%{transform:translateY(var(--cardY)) translateX(0)}
+      20%{transform:translateY(var(--cardY)) translateX(-2px)}
+      45%{transform:translateY(var(--cardY)) translateX(2px)}
+      70%{transform:translateY(var(--cardY)) translateX(-1px)}
+      88%{transform:translateY(var(--cardY)) translateX(1px)}
+    }
+    @media (prefers-reduced-motion: reduce){.shake{animation:none}}
   
   </style>
 </head>
-<body><main class="login" id="box"><div class="head"><div class="logo"><img src="/assets/icon.jpg" alt="XcBot"></div><button class="theme" id="themeBtn" type="button" onclick="toggleTheme()" title="切换主题">🌙</button></div><h1>XcBot WebUI</h1><div class="sub">请输入访问 Token</div><form onsubmit="login(event)"><label class="field"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M17 9V7A5 5 0 0 0 7 7v2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2Zm-8 0V7a3 3 0 0 1 6 0v2Z"/></svg><input id="tok" type="password" placeholder="访问 Token" autocomplete="current-password" autofocus><button class="eye" type="button" onclick="togglePwd()">◉</button></label><div class="msg" id="msg"></div><button class="btn" id="btn" type="submit">登录</button></form></main><script src="/static/login.js"></script></body></html>'''
+<body><main class="login" id="box"><div class="head"><div class="logo"><img src="/assets/icon.jpg" alt="XcBot"></div><button class="theme" id="themeBtn" type="button" onclick="toggleTheme()" title="切换主题"></button></div><h1>XcBot WebUI</h1><div class="sub">请输入访问 Token</div><form method="post" onsubmit="login(event)"><label class="field"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M17 9V7A5 5 0 0 0 7 7v2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2Zm-8 0V7a3 3 0 0 1 6 0v2Z"/></svg><input id="tok" type="password" name="password" placeholder="访问 Token" autocomplete="current-password" autofocus><button class="eye" type="button" onclick="togglePwd()" id="eyeBtn" title="显示 / 隐藏"></button></label><div class="msg" id="msg"></div><button class="btn" id="btn" type="submit">登录</button></form></main><script src="/static/login.js"></script></body></html>'''
 
 
 INDEX_HTML = r'''<!doctype html>
@@ -4085,7 +4726,7 @@ INDEX_HTML = r'''<!doctype html>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>XcBot WebUI</title><link rel="icon" href="/assets/icon.jpg">
   <link rel="stylesheet" href="/static/app.css">
 </head>
-<body><svg style="position:absolute;width:0;height:0;pointer-events:none" aria-hidden="true"><defs><filter id="xcbot-liquid-glass" x="-10%" y="-10%" width="120%" height="120%" primitiveUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feTurbulence type="fractalNoise" baseFrequency="0.018 0.014" numOctaves="4" seed="7" result="noise"/><feDisplacementMap in="SourceGraphic" in2="noise" scale="20" xChannelSelector="R" yChannelSelector="G"/></filter></defs></svg><div class="app"><aside class="sidebar"><div class="brand"><div class="logo"><img src="/assets/icon.jpg" alt="XcBot"></div><div><h1 id="brandName">XcBot</h1><p>实时 Web 管理台</p></div></div><div class="nav-title">功能列表</div><nav id="nav" class="nav"></nav><div class="nav-title">OneBot / Hyper 连接状态</div><div id="connectionStatus" class="pill">加载中...</div><div id="connectionDetail" class="desc" style="margin:10px 12px 0 12px"></div></aside><main class="main"><div class="topbar"><div class="title"><h2 id="pageTitle">加载中...</h2><p id="pageDesc">正在连接 WebUI</p></div><div class="toolbar"><span id="saveState" class="pill">未加载</span><button class="btn" onclick="gotoPage('chatroom')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>聊天室</button><button class="btn" onclick="gotoPage('debug')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>调试</button><button class="btn" id="themeBtn" onclick="toggleTheme()">深色</button><button class="btn primary" onclick="saveAll()">保存设置</button></div></div><section id="content" class="grid"></section></main></div><div id="toast" class="toast"></div><div id="submitModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center"><div style="max-width:420px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 16px;color:var(--text)">提交插件</h3><div style="display:grid;gap:10px"><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div><div class="label">插件名</div><input class="input" id="submitName" placeholder="your_plugin"></div><div><div class="label">作者</div><input class="input" id="submitAuthor" placeholder="你的名字"></div></div><div><div class="label">功能描述</div><textarea class="input" id="submitDesc" rows="3" placeholder="简单描述插件功能" style="resize:vertical"></textarea></div><p class="desc">提交后将打开 GitHub Issue 页面，把 zip 拖入评论框上传后点提交</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="el('submitModal').style.display='none'">取消</button><button class="btn primary" onclick="storeSubmit()">打开 GitHub Issue</button></div></div></div></div><div id="leaveModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center"><div style="max-width:360px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 8px;color:var(--text)">确认操作</h3><p style="margin:0 0 24px;color:var(--muted)">当前页面有未保存修改，离开后将丢失这些更改。是否离开？</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="leaveCancel()">取消</button><button class="btn primary" onclick="leaveConfirm()">确定</button></div></div></div><div id="tokenModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:10000;align-items:center;justify-content:center"><div style="max-width:460px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 style="margin:0 0 10px;color:var(--text)">设置访问 Token</h3><p style="margin:0 0 6px;color:var(--muted);font-size:13px">当前未设置访问 Token，任何能打开这个地址的人都可以查看你的 LLM API Key、以机器人身份发消息。</p><p id="tokenModalHost" style="margin:0 0 18px;color:var(--bad,#e11d48);font-size:13px;display:none"></p><div style="display:grid;gap:10px"><div><div class="label">访问 Token（至少 8 位）</div><input class="input" id="newToken" type="password" placeholder="建议用随机字符串" autocomplete="new-password"></div><div><div class="label">再输入一次</div><input class="input" id="newToken2" type="password" placeholder="确认 Token" autocomplete="new-password"></div><div id="tokenModalMsg" class="desc" style="min-height:18px;color:var(--bad,#e11d48)"></div><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn primary" id="tokenModalBtn" onclick="submitNewToken()">保存并使用</button></div></div></div></div><div id="modelInputModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;align-items:center;justify-content:center" onclick="if(event.target===this)closeModelInput()"><div style="max-width:440px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 id="modelInputTitle" style="margin:0 0 18px;color:var(--text)">添加模型</h3><div class="field"><div class="label"><span id="modelInputLabel">模型名称</span></div><input id="modelInputValue" placeholder="例如 model-name" onkeydown="if(event.key==='Enter')submitModelInput();if(event.key==='Escape')closeModelInput()"><div class="desc">保存后模型将显示为“提供商/模型名”。</div></div><div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button class="btn" onclick="closeModelInput()">取消</button><button class="btn primary" onclick="submitModelInput()">添加</button></div></div></div><div id="modelInputModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;align-items:center;justify-content:center" onclick="if(event.target===this)closeModelInput()"><div style="max-width:440px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 id="modelInputTitle" style="margin:0 0 18px;color:var(--text)">添加模型</h3><div class="field"><div class="label"><span id="modelInputLabel">模型名称</span></div><input id="modelInputValue" placeholder="例如 model-name" onkeydown="if(event.key==='Enter')submitModelInput();if(event.key==='Escape')closeModelInput()"><div class="desc">保存后模型将显示为“提供商/模型名”。</div></div><div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button class="btn" onclick="closeModelInput()">取消</button><button class="btn primary" onclick="submitModelInput()">添加</button></div></div></div><input id="pluginUploadInput" type="file" accept=".zip" style="display:none" onchange="storeUploadFile(this)"><button id="pluginUploadBtn" onclick="el('pluginUploadInput').click()" title="上传本地插件" style="display:none;position:fixed;right:24px;bottom:24px;width:48px;height:48px;border-radius:50%;background:var(--accent,#6366f1);border:none;cursor:pointer;font-size:22px;color:#fff;box-shadow:0 2px 8px #0004;z-index:999">&#8679;</button>
+<body><svg style="position:absolute;width:0;height:0;pointer-events:none" aria-hidden="true"><defs><filter id="xcbot-liquid-glass" x="0%" y="0%" width="100%" height="100%" filterUnits="objectBoundingBox" color-interpolation-filters="sRGB"><feImage id="xcbot-liquid-map" x="0" y="0" width="100%" height="100%" preserveAspectRatio="none" result="xcbot-map"/><feDisplacementMap id="xcbot-liquid-displacement-r" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-red-displaced"/><feDisplacementMap id="xcbot-liquid-displacement-g" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-green-displaced"/><feDisplacementMap id="xcbot-liquid-displacement-b" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-blue-displaced"/><feColorMatrix in="xcbot-red-displaced" type="matrix" values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="xcbot-red-channel"/><feColorMatrix in="xcbot-green-displaced" type="matrix" values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="xcbot-green-channel"/><feColorMatrix in="xcbot-blue-displaced" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="xcbot-blue-channel"/><feBlend in="xcbot-green-channel" in2="xcbot-blue-channel" mode="screen" result="xcbot-gb"/><feBlend in="xcbot-red-channel" in2="xcbot-gb" mode="screen" result="xcbot-rgb"/><feComposite in="xcbot-rgb" in2="SourceAlpha" operator="in"/></filter></defs></svg><div class="app"><aside class="sidebar"><div class="brand"><div class="logo"><img src="/assets/icon.jpg" alt="XcBot"></div><div><h1 id="brandName">XcBot</h1><p>实时 Web 管理台</p></div></div><div class="nav-title">功能列表</div><nav id="nav" class="nav"></nav><div class="nav-title">OneBot / Hyper 连接状态</div><div id="connectionStatus" class="pill">加载中...</div><div id="connectionDetail" class="desc" style="margin:10px 12px 0 12px"></div></aside><div class="nav-scrim" id="navScrim" onclick="closeMobileNav()"></div><main class="main"><div class="topbar"><button class="nav-toggle" id="navToggle" onclick="toggleMobileNav()" aria-label="展开导航" aria-expanded="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h16"/></svg></button><div class="title"><h2 id="pageTitle">加载中...</h2><p id="pageDesc">正在连接 WebUI</p></div><div class="toolbar"><span id="saveState" class="pill">未加载</span><button class="btn" onclick="gotoPage('chatroom')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>聊天室</button><button class="btn" onclick="gotoPage('debug')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>调试</button><button class="btn" id="themeBtn" onclick="toggleTheme()">深色</button><button class="btn primary" onclick="saveAll()">保存设置</button></div></div><section id="content" class="grid"></section></main></div><div id="toast" class="toast"></div><div id="submitModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center"><div style="max-width:420px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 16px;color:var(--text)">提交插件</h3><div style="display:grid;gap:10px"><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div><div class="label">插件名</div><input class="input" id="submitName" placeholder="your_plugin"></div><div><div class="label">作者</div><input class="input" id="submitAuthor" placeholder="你的名字"></div></div><div><div class="label">功能描述</div><textarea class="input" id="submitDesc" rows="3" placeholder="简单描述插件功能" style="resize:vertical"></textarea></div><p class="desc">提交后将打开 GitHub Issue 页面，把 zip 拖入评论框上传后点提交</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="el('submitModal').style.display='none'">取消</button><button class="btn primary" onclick="storeSubmit()">打开 GitHub Issue</button></div></div></div></div><div id="leaveModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center"><div style="max-width:360px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 8px;color:var(--text)">确认操作</h3><p style="margin:0 0 24px;color:var(--muted)">当前页面有未保存修改，离开后将丢失这些更改。是否离开？</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="leaveCancel()">取消</button><button class="btn primary" onclick="leaveConfirm()">确定</button></div></div></div><div id="tokenModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:10000;align-items:center;justify-content:center"><div style="max-width:460px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 style="margin:0 0 10px;color:var(--text)">设置访问 Token</h3><p style="margin:0 0 6px;color:var(--muted);font-size:13px">当前未设置访问 Token，任何能打开这个地址的人都可以查看你的 LLM API Key、以机器人身份发消息。</p><p id="tokenModalHost" style="margin:0 0 18px;color:var(--bad,#e11d48);font-size:13px;display:none"></p><div style="display:grid;gap:10px"><div><div class="label">访问 Token</div><input class="input" id="newToken" type="password" placeholder="建议用随机字符串" autocomplete="new-password"></div><div><div class="label">再输入一次</div><input class="input" id="newToken2" type="password" placeholder="确认 Token" autocomplete="new-password"></div><div id="tokenModalMsg" class="desc" style="min-height:18px;color:var(--bad,#e11d48)"></div><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn primary" id="tokenModalBtn" onclick="submitNewToken()">保存并使用</button></div></div></div></div><div id="modelInputModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;align-items:center;justify-content:center" onclick="if(event.target===this)closeModelInput()"><div style="max-width:440px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 id="modelInputTitle" style="margin:0 0 18px;color:var(--text)">添加模型</h3><div class="field"><div class="label"><span id="modelInputLabel">模型名称</span></div><input id="modelInputValue" placeholder="例如 model-name" onkeydown="if(event.key==='Enter')submitModelInput();if(event.key==='Escape')closeModelInput()"><div class="desc">保存后模型将显示为“提供商/模型名”。</div></div><div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button class="btn" onclick="closeModelInput()">取消</button><button class="btn primary" onclick="submitModelInput()">添加</button></div></div></div><div id="modelInputModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;align-items:center;justify-content:center" onclick="if(event.target===this)closeModelInput()"><div style="max-width:440px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 id="modelInputTitle" style="margin:0 0 18px;color:var(--text)">添加模型</h3><div class="field"><div class="label"><span id="modelInputLabel">模型名称</span></div><input id="modelInputValue" placeholder="例如 model-name" onkeydown="if(event.key==='Enter')submitModelInput();if(event.key==='Escape')closeModelInput()"><div class="desc">保存后模型将显示为“提供商/模型名”。</div></div><div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button class="btn" onclick="closeModelInput()">取消</button><button class="btn primary" onclick="submitModelInput()">添加</button></div></div></div><input id="pluginUploadInput" type="file" accept=".zip" style="display:none" onchange="storeUploadFile(this)"><button id="pluginUploadBtn" onclick="el('pluginUploadInput').click()" title="上传本地插件" style="display:none;position:fixed;right:24px;bottom:24px;width:48px;height:48px;border-radius:50%;background:var(--accent,#6366f1);border:none;cursor:pointer;font-size:22px;color:#fff;box-shadow:0 2px 8px #0004;z-index:999">&#8679;</button>
 <script src="/static/app.js"></script></body></html>'''
 
 def _static_asset_version(filename: str) -> str:

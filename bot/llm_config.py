@@ -123,6 +123,55 @@ def provider_display_model(provider_id: str, model: str) -> str:
     return f"{provider_id}/{model}" if provider_id else model
 
 
+# 思考等级：下拉可选项。空串 = 不发任何参数，跟随模型自己的默认行为。
+# 之所以不给"默认=高"这种有主张的值：多数中转站按思考 token 计费，
+# 替用户开高档等于悄悄多花钱。
+REASONING_EFFORT_CHOICES = ("", "none", "minimal", "low", "medium", "high")
+
+
+def normalize_reasoning_effort(value) -> str:
+    """归一化思考等级。无法识别的值一律回落空串（不发参数）。"""
+    text = str(value or "").strip().lower()
+    # 兼容用户从别处抄来的大写写法与中文
+    alias = {
+        "off": "none", "close": "none", "disable": "none", "关闭": "none", "关": "none",
+        "min": "minimal", "最小": "minimal",
+        "低": "low", "中": "medium", "高": "high",
+        "default": "", "auto": "", "默认": "",
+    }
+    text = alias.get(text, text)
+    return text if text in REASONING_EFFORT_CHOICES else ""
+
+
+def normalize_context_window(value) -> int:
+    """归一化上下文窗口 token 数。0 表示未知 / 自动获取。"""
+    try:
+        window = int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+    # 负数没有意义；上限给一个宽松的防呆值，避免误填成字符数
+    return max(0, min(window, 100_000_000))
+
+
+def normalize_proxy_url(value) -> str:
+    """把用户填的代理地址整理成 urllib / httpx / aiohttp 都能接受的形式。
+
+    留空表示该提供商直连，不回退到全局代理（全局代理只管 GitHub 与 Agent）。
+    只写 127.0.0.1:7890 这种缺协议的写法很常见，这里补成 http://。
+    只接受 http/https：urllib 的 ProxyHandler 不支持 socks，httpx 也要额外装
+    socksio 才行，放行 socks 只会让用户以为配好了而实际静默失败。
+    """
+    text = str(value or "").strip().strip('"').strip("'").strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        text = f"http://{text}"
+    scheme = text.split("://", 1)[0].lower()
+    if scheme not in {"http", "https"}:
+        return ""
+    return text
+
+
 def normalize_legacy_endpoints(value) -> list[dict]:
     """Normalize a legacy llm_endpoints list into runtime endpoint slots."""
     result = []
@@ -146,8 +195,11 @@ def normalize_legacy_endpoints(value) -> list[dict]:
             "model": model,
             "display_model": str(raw.get("display_model", "") or "").strip() or model,
             "keys": keys,
+            "http_proxy": normalize_proxy_url(raw.get("http_proxy", "")),
             "supports_multimodal": normalize_bool_config(raw.get("supports_multimodal", False), False),
             "timeout_seconds": max(1, timeout_seconds),
+            "reasoning_effort": normalize_reasoning_effort(raw.get("reasoning_effort", "")),
+            "context_window": normalize_context_window(raw.get("context_window", 0)),
         })
     return result
 
@@ -181,6 +233,7 @@ def convert_legacy_endpoints_to_providers(others: Dict[str, Any]) -> list[dict]:
                 "id": provider_id,
                 "base_url": base_url,
                 "keys": keys,
+                "http_proxy": normalize_proxy_url(ep.get("http_proxy", "")),
                 "models": [],
                 "detected_models": [],
             }
@@ -199,6 +252,8 @@ def convert_legacy_endpoints_to_providers(others: Dict[str, Any]) -> list[dict]:
                 "enabled": True,
                 "supports_multimodal": normalize_bool_config(ep.get("supports_multimodal", False), False),
                 "timeout_seconds": max(1, timeout_seconds),
+                "reasoning_effort": normalize_reasoning_effort(ep.get("reasoning_effort", "")),
+                "context_window": normalize_context_window(ep.get("context_window", 0)),
             })
     for key in order:
         converted.append(grouped[key])
@@ -211,7 +266,7 @@ def normalize_llm_providers_config(others: Dict[str, Any]) -> tuple[list[Dict[st
     if not isinstance(providers, list):
         providers = []
     if not providers:
-        providers = [{"id": "provider1", "base_url": "", "keys": [], "models": [], "detected_models": []}]
+        providers = [{"id": "provider1", "base_url": "", "keys": [], "http_proxy": "", "models": [], "detected_models": []}]
 
     provider_has_model = any(
         isinstance(p, dict)
@@ -261,6 +316,10 @@ def normalize_llm_providers_config(others: Dict[str, Any]) -> tuple[list[Dict[st
                 "enabled": normalize_bool_config(item.get("enabled", True), True),
                 "supports_multimodal": normalize_bool_config(item.get("supports_multimodal", False), False),
                 "timeout_seconds": max(1, timeout_seconds),
+                # 思考等级：空串表示不发参数，跟随模型默认
+                "reasoning_effort": normalize_reasoning_effort(item.get("reasoning_effort", "")),
+                # 上下文窗口 token 数：0 表示未知，检测模型时会尝试自动填充
+                "context_window": normalize_context_window(item.get("context_window", 0)),
             })
         raw_embedding_models = raw.get("embedding_models", []) if isinstance(raw.get("embedding_models", []), list) else []
         embedding_models = []
@@ -293,6 +352,7 @@ def normalize_llm_providers_config(others: Dict[str, Any]) -> tuple[list[Dict[st
             "id": provider_id,
             "base_url": base_url,
             "keys": keys,
+            "http_proxy": normalize_proxy_url(raw.get("http_proxy", "")),
             "models": models,
             "embedding_models": embedding_models,
             "detected_models": detected,
@@ -355,10 +415,114 @@ def build_llm_endpoints_from_providers(others: Dict[str, Any]) -> list[Dict[str,
             "model": model_cfg.get("name", ""),
             "display_model": provider_display_model(provider.get("id", ""), model_cfg.get("name", "")),
             "keys": keys,
+            "http_proxy": normalize_proxy_url(provider.get("http_proxy", "")),
             "supports_multimodal": bool(model_cfg.get("supports_multimodal", False)),
             "timeout_seconds": int(model_cfg.get("timeout_seconds", others.get("api_request_timeout_seconds", 60)) or 60),
+            "reasoning_effort": normalize_reasoning_effort(model_cfg.get("reasoning_effort", "")),
+            "context_window": normalize_context_window(model_cfg.get("context_window", 0)),
         })
     return result
+
+
+def build_all_provider_endpoints(others: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """列出所有可调用的 provider/model 组合，不管模型有没有勾选。
+
+    models[].enabled 的语义是「是否参与 QQ 侧的自动轮换」，不代表该模型不可用。
+    WebUI 聊天室是手动选模型，所以要能看到并选中未勾选的模型。
+    顺序：先按轮换列表（已勾选的，保持轮换顺序），再补未勾选的，
+    这样聊天室的失败切换仍优先走用户配置的轮换顺序。
+    """
+    providers, _ = normalize_llm_providers_config(others)
+    rotation_refs = [
+        (ep.get("provider_id", ""), ep.get("model", ""))
+        for ep in build_llm_endpoints_from_providers(others)
+    ]
+    default_timeout = others.get("api_request_timeout_seconds", 60)
+    by_ref: Dict[tuple, Dict[str, Any]] = {}
+    order: list[tuple] = []
+    for provider in providers:
+        provider_id = str(provider.get("id", "") or "")
+        base_url = str(provider.get("base_url", "") or "").strip()
+        keys = normalize_provider_keys(provider.get("keys", []), strict_ascii=True)
+        if not base_url or not keys:
+            continue
+        proxy = normalize_proxy_url(provider.get("http_proxy", ""))
+        for model_cfg in provider.get("models", []):
+            if not isinstance(model_cfg, dict):
+                continue
+            name = str(model_cfg.get("name", "") or "").strip()
+            if not name:
+                continue
+            ref = (provider_id, name)
+            if ref in by_ref:
+                continue
+            by_ref[ref] = {
+                "provider_id": provider_id,
+                "base_url": base_url,
+                "model": name,
+                "display_model": provider_display_model(provider_id, name),
+                "keys": keys,
+                "http_proxy": proxy,
+                "supports_multimodal": bool(model_cfg.get("supports_multimodal", False)),
+                "timeout_seconds": int(model_cfg.get("timeout_seconds", default_timeout) or 60),
+                "enabled": normalize_bool_config(model_cfg.get("enabled", True), True),
+                "reasoning_effort": normalize_reasoning_effort(model_cfg.get("reasoning_effort", "")),
+                "context_window": normalize_context_window(model_cfg.get("context_window", 0)),
+            }
+            order.append(ref)
+    result = []
+    seen = set()
+    for ref in rotation_refs:
+        if ref in by_ref and ref not in seen:
+            seen.add(ref)
+            result.append(by_ref[ref])
+    for ref in order:
+        if ref not in seen:
+            seen.add(ref)
+            result.append(by_ref[ref])
+    return result
+
+
+def get_provider_proxy(others: Dict[str, Any], provider_id: str) -> str:
+    """按 provider id 取该提供商配置的代理；没配就返回空串（直连）。"""
+    if not isinstance(others, dict):
+        return ""
+    providers = others.get("llm_providers", [])
+    if not isinstance(providers, list):
+        return ""
+    target = str(provider_id or "").strip()
+    if not target:
+        return ""
+    for provider in providers:
+        if isinstance(provider, dict) and str(provider.get("id", "") or "").strip() == target:
+            return normalize_proxy_url(provider.get("http_proxy", ""))
+    return ""
+
+
+def get_provider_proxy_for_base_url(others: Dict[str, Any], base_url: str) -> str:
+    """按 base_url 反查提供商代理。
+
+    保留给只知道 base_url、拿不到 provider_id 的旧调用方（例如外部插件）。
+    运行时主路径已改为由 key_manager 随轮换结果直接给出 http_proxy，
+    不再走这里；多个提供商共用同一 base_url 时这个函数无法区分。
+    """
+    if not isinstance(others, dict):
+        return ""
+    providers = others.get("llm_providers", [])
+    if not isinstance(providers, list):
+        return ""
+    target = str(base_url or "").strip().rstrip("/")
+    if not target:
+        return ""
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        if str(provider.get("base_url", "") or "").strip().rstrip("/") != target:
+            continue
+        proxy = normalize_proxy_url(provider.get("http_proxy", ""))
+        if proxy:
+            return proxy
+    return ""
 
 
 def sync_provider_config(others: Dict[str, Any]) -> None:

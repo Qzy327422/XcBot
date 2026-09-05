@@ -54,7 +54,12 @@ def check_split_integrity(main: str, webui_src: str) -> None:
     # 历史上这里用「按事件循环懒建 asyncio.Lock」，但 Hyper 每条消息一个
     # asyncio.run，那种锁跨消息完全不互斥。现在统一用 threading.Lock。
     ok("history lock is threading.Lock", "self._history_lock = threading.Lock()" in main)
-    ok("history lock acquired off-loop", "asyncio.to_thread(self._history_lock.acquire)" in main)
+    # 早期是直接 await asyncio.to_thread(lock.acquire)，后来改成专用线程池 +
+    # 超时（见 main.py 的 _HISTORY_LOCK_EXECUTOR 注释：默认池会被等锁的
+    # worker 打满，导致所有 to_thread 一起停摆）。断言跟着改成新实现。
+    ok("history lock off-loop via dedicated executor", "_HISTORY_LOCK_EXECUTOR" in main)
+    ok("history lock acquire has timeout", "async def acquire_history_lock" in main)
+    ok("history lock not on default pool", "asyncio.to_thread(self._history_lock.acquire)" not in main)
     ok("no stale asyncio lazy-lock fields", "self._lock_loop" not in main and "self._lock_init_lock" not in main)
     ok("token command labels 24h", "过去24小时" in main and "会话生命周期，非24h" in main)
     ok("webui empty model hard fail gone", "模型名称不能为空" not in webui_src)

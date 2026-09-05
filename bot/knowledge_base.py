@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from bot.paths import BASE_DIR
+from bot.llm_config import normalize_proxy_url
 
 KB_ROOT = BASE_DIR / "data" / "knowledge_base"
 KB_DB = KB_ROOT / "knowledge.sqlite3"
@@ -37,7 +38,8 @@ def _db() -> sqlite3.Connection:
       extension TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE, size_bytes INTEGER NOT NULL,
       status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', chunks INTEGER NOT NULL DEFAULT 0,
       created_at REAL NOT NULL, updated_at REAL NOT NULL,
-      index_mode TEXT NOT NULL DEFAULT 'fts', embedding_ref TEXT NOT NULL DEFAULT ''
+      index_mode TEXT NOT NULL DEFAULT 'fts', embedding_ref TEXT NOT NULL DEFAULT '',
+      warning TEXT NOT NULL DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS chunks (
       id TEXT PRIMARY KEY, document_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
@@ -55,6 +57,10 @@ def _db() -> sqlite3.Connection:
         db.execute("ALTER TABLE documents ADD COLUMN index_mode TEXT NOT NULL DEFAULT 'fts'")
     if "embedding_ref" not in document_columns:
         db.execute("ALTER TABLE documents ADD COLUMN embedding_ref TEXT NOT NULL DEFAULT ''")
+    if "warning" not in document_columns:
+        # warning 与 error 分开：降级成功（回退 FTS）属于 ready 而不是 failed，
+        # 混用 error 列会让前端把成功的降级索引显示成失败。
+        db.execute("ALTER TABLE documents ADD COLUMN warning TEXT NOT NULL DEFAULT ''")
     chunk_columns = {row["name"] for row in db.execute("PRAGMA table_info(chunks)")}
     if "embedding_provider_id" not in chunk_columns:
         db.execute("ALTER TABLE chunks ADD COLUMN embedding_provider_id TEXT NOT NULL DEFAULT ''")
@@ -169,7 +175,13 @@ def _embed_with_key(texts: list[str], provider: dict, model: str, key: str) -> l
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as response:
+    # 嵌入走该提供商自己的代理；留空则显式禁用代理（ProxyHandler({})），
+    # 避免继承环境变量里的 HTTP_PROXY 造成"没配代理却走了代理"。
+    proxy = normalize_proxy_url(provider.get("http_proxy", ""))
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy} if proxy else {})
+    )
+    with opener.open(req, timeout=60) as response:
         obj = json.loads(response.read().decode("utf-8", errors="replace"))
     rows = sorted(obj.get("data", []), key=lambda x: int(x.get("index", 0)))
     vectors = [x.get("embedding") for x in rows]
@@ -243,6 +255,8 @@ def _embedding_ref(provider_id: str, model: str) -> str:
 
 def add_document(name: str, raw: bytes, cfg: dict, providers: list[dict]) -> dict:
     settings = _config(cfg)
+    display_name = Path(str(name or "")).name or "未命名文档"
+    print(f"[KnowledgeBase] 开始处理文档：{display_name}")
     safe_name = Path(str(name or "")).name
     ext = Path(safe_name).suffix.lower()
     if ext not in _ALLOWED:
@@ -269,8 +283,12 @@ def add_document(name: str, raw: bytes, cfg: dict, providers: list[dict]) -> dic
         if old:
             doc_id = old["id"]
             path = Path(old["path"])
+            # updated_at 兼作本次尝试的凭据（见下方 _still_mine）。必须严格大于旧值，
+            # 否则同一毫秒内的两次上传会拿到相同的 now，凭据失去区分能力。
+            if now <= float(old["updated_at"] or 0):
+                now = float(old["updated_at"] or 0) + 0.001
             db.execute(
-                "UPDATE documents SET name=?,extension=?,size_bytes=?,status='indexing',error='',updated_at=? WHERE id=?",
+                "UPDATE documents SET name=?,extension=?,size_bytes=?,status='indexing',error='',warning='',updated_at=? WHERE id=?",
                 (safe_name, ext, len(raw), now, doc_id),
             )
         else:
@@ -280,8 +298,19 @@ def add_document(name: str, raw: bytes, cfg: dict, providers: list[dict]) -> dic
             )
         db.commit()
         db.close()
+        print(f"[KnowledgeBase] 文档已登记，开始建立索引：{display_name}")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(raw)
+
+    # 本次尝试的凭据。同一文档被并发上传（前一次索引超过 _INDEXING_STALE_SECONDS
+    # 还没结束，用户又传了一遍）时，后来者会把 updated_at 改成它自己的值。
+    # 收尾前比对一次：不相等说明这行已被后来者接管，本次尝试的结果作废，
+    # 什么都不能写、不能删——否则慢的那次收尾会把快的那次的成果一起抹掉。
+    my_stamp = now
+
+    def _still_mine(db) -> bool:
+        row = db.execute("SELECT updated_at FROM documents WHERE id=?", (doc_id,)).fetchone()
+        return bool(row) and abs(float(row["updated_at"] or 0) - my_stamp) < 1e-6
 
     try:
         pages = _read_text(path, ext)
@@ -311,6 +340,12 @@ def add_document(name: str, raw: bytes, cfg: dict, providers: list[dict]) -> dic
             if not exists:
                 db.close()
                 raise RuntimeError("文档在索引期间已被删除")
+            if not _still_mine(db):
+                # 已被后来的上传接管：那次会写自己的 chunks，这里不能再插一遍
+                # （chunks.id 是 f"{doc_id}_{ordinal}"，两次一起写会主键冲突或串味）。
+                db.close()
+                print(f"[KnowledgeBase] 索引结果作废（同文档已被新的上传接管）：{display_name}")
+                return get_document(doc_id)
             db.execute("DELETE FROM chunks_fts WHERE document_id=?", (doc_id,))
             db.execute("DELETE FROM chunks WHERE document_id=?", (doc_id,))
             for ordinal, (item, page) in enumerate(chunks):
@@ -322,17 +357,39 @@ def add_document(name: str, raw: bytes, cfg: dict, providers: list[dict]) -> dic
                 )
                 db.execute("INSERT INTO chunks_fts(content,document_id,chunk_id) VALUES (?,?,?)", (item, doc_id, chunk_id))
             db.execute(
-                "UPDATE documents SET status='ready',error=?,chunks=?,updated_at=?,index_mode=?,embedding_ref=? WHERE id=?",
+                "UPDATE documents SET status='ready',error='',warning=?,chunks=?,updated_at=?,index_mode=?,embedding_ref=? WHERE id=?",
                 (warning, len(chunks), time.time(), index_mode, actual_ref, doc_id),
             )
             db.commit()
             db.close()
+        print(f"[KnowledgeBase] 索引完成：{display_name}，{len(chunks)} 个片段，模式={index_mode}")
     except Exception as e:
         with _LOCK:
             db = _db()
-            db.execute("UPDATE documents SET status='failed',error=?,updated_at=? WHERE id=?", (str(e), time.time(), doc_id))
-            db.commit()
+            superseded = not _still_mine(db)
+            if not superseded:
+                db.execute("DELETE FROM chunks_fts WHERE document_id=?", (doc_id,))
+                db.execute("DELETE FROM chunks WHERE document_id=?", (doc_id,))
+                db.execute("UPDATE documents SET status='failed',error=?,warning='',chunks=0,updated_at=? WHERE id=?", (str(e), time.time(), doc_id))
+                db.commit()
             db.close()
+        if superseded:
+            # 同文档已被新的上传接管（且很可能已经成功）。这里必须完全撒手：
+            # 早期版本无条件走下面的清理，导致「慢的那次失败收尾」把「快的那次的
+            # 成功结果」连 chunks 带磁盘原文一起抹掉，界面显示索引失败但其实刚成功过。
+            # 本次的异常也不再上抛——它属于一次已被取代的尝试，报给用户只会误导。
+            print(f"[KnowledgeBase] 索引失败但结果已作废（同文档已被新的上传接管）：{display_name}：{e}")
+            return get_document(doc_id)
+        # documents 行保留（前端要显示失败原因），但磁盘原文要删。
+        # 留着它没有任何用处：_read_text 只在本函数里调用，而本函数只由上传接口
+        # 触发——没有独立的「重新索引」入口。用户重试必然重新上传，上面的
+        # path.write_bytes(raw) 会把文件重写一遍。检索侧只读 chunks 表，不碰原文。
+        # 不删的话，反复索引失败的大文件会一直占着磁盘，直到删除文档才清。
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(f"[KnowledgeBase] 索引失败：{display_name}：{e}")
         raise
     return get_document(doc_id)
 

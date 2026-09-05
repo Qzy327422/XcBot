@@ -445,9 +445,11 @@ class TraceStore:
         raw_prompt = str(record.get("system_prompt", "") or "")
         raw_user = str(record.get("user_message", "") or "")
         raw_reply = str(record.get("reply", "") or "")
+        raw_reasoning = str(record.get("reasoning", "") or "")
         prompt_text, _ = self._clip(raw_prompt, self.SYSTEM_PROMPT_MAX)
         user_text, user_truncated = self._clip(raw_user, self.TEXT_MAX)
         reply_text, reply_truncated = self._clip(raw_reply, self.TEXT_MAX)
+        reasoning_text, reasoning_truncated = self._clip(raw_reasoning, self.TEXT_MAX)
         error_text, _ = self._clip(record.get("error", ""), self.ERROR_MAX)
 
         overview: list[dict] = []
@@ -498,6 +500,10 @@ class TraceStore:
             "reply": reply_text,
             "reply_chars": len(raw_reply),
             "reply_truncated": reply_truncated,
+            # 思考模型的思维链。不发给用户、不进历史，只在这里留档供排查。
+            "reasoning": reasoning_text,
+            "reasoning_chars": len(raw_reasoning),
+            "reasoning_truncated": reasoning_truncated,
             "images": int(record.get("images") or 0),
             "history_count": int(record.get("history_count") or len(overview)),
             "history_overview": overview,
@@ -552,6 +558,8 @@ class TraceStore:
             "history_count": int(entry.get("history_count") or 0),
             "images": int(entry.get("images") or 0),
             "send_parts": int(send.get("parts") or 0),
+            # 列表页只显示"有没有思维链"，正文在详情里
+            "reasoning_chars": int(entry.get("reasoning_chars") or 0),
             "user_preview": user_preview,
             "reply_preview": reply_preview,
             "error_short": error_short,

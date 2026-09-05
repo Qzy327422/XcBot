@@ -13,6 +13,39 @@ from typing import Any
 
 _WRITE_JSON_BAK_KEEP = 5
 
+# 备份统一收进被备份文件同级的 config_backup/ 子目录，不散在根目录里。
+# 目录名与 config_migrate.ensure_config_up_to_date 的默认备份目录一致，
+# 两套备份机制共用一个文件夹；那边的文件名前缀是 config-before-auto-upgrade_，
+# 与这里的 <name>.<时间戳>.bak 不冲突，互相不会被对方的清理规则删掉。
+_BACKUP_DIR_NAME = "config_backup"
+
+
+def backup_dir_for(path: Path) -> Path:
+    return Path(path).parent / _BACKUP_DIR_NAME
+
+
+def _backup_glob(path: Path) -> str:
+    return f"{Path(path).name}.*.bak"
+
+
+def _iter_backups(path: Path) -> "list[Path]":
+    """按新鲜度倒序列出可用备份。
+
+    同时扫描新目录与旧的同级位置：升级前产生的 .bak 仍在根目录，
+    只认新目录会让老备份在最需要它们的时候（配置刚损坏）失效。
+    """
+    path = Path(path)
+    found: "list[Path]" = []
+    for root in (backup_dir_for(path), path.parent):
+        try:
+            found.extend(root.glob(_backup_glob(path)))
+        except Exception:
+            continue
+    # 同一文件可能被两个 root 各命中一次（新目录恰好是 path.parent 的子目录时不会，
+    # 但调用方传入的路径本身可能已在 config_backup/ 内），按真实路径去重。
+    unique = {p.resolve(): p for p in found}
+    return sorted(unique.values(), key=lambda p: p.stat().st_mtime, reverse=True)
+
 
 # 按文件路径的事务锁。原子替换只保证不出现半截文件，防不住
 # 「读旧对象 → 改不同字段 → 整体写回」这种丢更新：两个线程各读一份旧配置，
@@ -53,12 +86,7 @@ def read_json(path: Path, default: Any = None) -> Any:
             return json.load(f)
     except Exception as e:
         try:
-            backups = sorted(
-                path.parent.glob(f"{path.name}.*.bak"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            for bak in backups:
+            for bak in _iter_backups(path):
                 try:
                     with bak.open("r", encoding="utf-8") as f:
                         data = json.load(f)
@@ -73,14 +101,9 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 
 def _prune_old_backups(path: Path, keep: int = _WRITE_JSON_BAK_KEEP) -> None:
-    """只保留最近 keep 份 JSON 备份。"""
+    """只保留最近 keep 份 JSON 备份（含旧的根目录残留）。"""
     try:
-        backups = sorted(
-            path.parent.glob(f"{path.name}.*.bak"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        for old in backups[keep:]:
+        for old in _iter_backups(path)[keep:]:
             try:
                 old.unlink()
             except Exception:
@@ -108,9 +131,16 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 
 def write_json(path: Path, data: Any):
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    backup = path.with_suffix(path.suffix + f".{datetime.now().strftime('%Y%m%d%H%M%S_%f')}.bak")
     if path.exists():
-        atomic_write_text(backup, path.read_text(encoding="utf-8", errors="replace"))
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S_%f")
+        backup = backup_dir_for(path) / f"{path.name}.{stamp}.bak"
+        # 备份失败不能挡住正常保存：目录建不出来（权限、磁盘满）时
+        # 让本次写入照常进行，只是这一次没有回退点。
+        try:
+            atomic_write_text(backup, path.read_text(encoding="utf-8", errors="replace"))
+        except Exception as e:
+            print(f"⚠️ 备份 {path.name} 失败，本次保存不生成回退点：{e}")
     atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=4) + "\n")
     _prune_old_backups(path)

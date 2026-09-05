@@ -1,4 +1,5 @@
 # key_manager.py
+import random
 import threading
 import time
 from typing import List, Tuple, Optional, Dict
@@ -118,11 +119,13 @@ class SiliconFlowKeyManager:
                     "key": key,
                     "model": model,
                     "display_model": display_model,
+                    "http_proxy": str(endpoint.get("http_proxy", "") or "").strip(),
+                    "reasoning_effort": str(endpoint.get("reasoning_effort", "") or "").strip(),
+                    "context_window": int(endpoint.get("context_window", 0) or 0),
                     "supports_multimodal": self._normalize_bool(endpoint.get("supports_multimodal", False), default=False),
                     "timeout_seconds": timeout_seconds,
                     "rotation_index": rotation_index,
                     "fail_count": 0,
-                    "cooldown_until": 0.0,
                     "disabled": False,
                     "last_error": "",
                     "last_used_at": 0.0,
@@ -192,12 +195,18 @@ class SiliconFlowKeyManager:
         self.current_index = current_slot if current_slot is not None else 0
 
     @staticmethod
-    def _attempt_identity(item: Dict) -> tuple[str, str, str]:
-        """一次模型请求的唯一身份；同一 Key 可被多个渠道/模型安全复用。"""
+    def _attempt_identity(item: Dict) -> tuple[str, str, str, str]:
+        """一次模型请求的唯一身份；同一 Key 可被多个渠道/模型安全复用。
+
+        必须带上 http_proxy：两个提供商可能填了相同 base_url + model + key
+        但走不同代理（一个直连一个走代理，用来做故障绕行）。只按前三项去重会
+        让第二个组合被判为"已试过"而永久跳过，代理备份就形同虚设。
+        """
         return (
             str(item.get("base_url", "") or ""),
             str(item.get("model", "") or ""),
             str(item.get("key", "") or ""),
+            str(item.get("http_proxy", "") or ""),
         )
 
     def _find_index_by_key(self, key: str = None, model: str = "", base_url: str = "") -> Optional[int]:
@@ -220,19 +229,21 @@ class SiliconFlowKeyManager:
                     return i
         return None
 
-    def _is_available(self, item: Dict, include_cooldown: bool = True) -> bool:
-        """模型不做冷却也不做禁用：每次请求都要允许从 Slot #1 重新开始尝试。
-
-        include_cooldown 参数保留只为兼容旧调用签名，内部不再使用。
-        """
-        return True
+    def _is_available(self, item: Dict) -> bool:
+        """模型不做冷却也不做禁用：每次请求都要允许从 Slot #1 重新开始尝试。"""
+        return not bool(item.get("disabled", False))
 
     def _matches_request(self, item: Dict, require_multimodal: bool = False) -> bool:
         if require_multimodal and not bool(item.get("supports_multimodal", False)):
             return False
         return True
 
-    def _result_tuple(self, item: Dict) -> Tuple[str, str, str, bool, int, str]:
+    def _result_tuple(self, item: Dict) -> Tuple[str, str, str, bool, int, str, str, Dict]:
+        """返回给调用方的轮换结果。
+
+        最后一项是"模型附加参数"字典，新增可选项（思考等级、上下文窗口等）
+        都塞在这里，不再继续加宽元组——每加一个字段就要改四处解包，容易漏。
+        """
         return (
             item["base_url"],
             item["key"],
@@ -240,28 +251,35 @@ class SiliconFlowKeyManager:
             bool(item.get("supports_multimodal", False)),
             int(item.get("timeout_seconds", 60) or 60),
             item.get("display_model") or item.get("model") or "",
+            str(item.get("http_proxy", "") or ""),
+            {
+                "reasoning_effort": str(item.get("reasoning_effort", "") or ""),
+                "context_window": int(item.get("context_window", 0) or 0),
+            },
         )
 
-    def _pick_from_slot(self, slot: Dict, tried_keys: set, include_cooldown: bool, require_multimodal: bool) -> Optional[int]:
+    def _pick_from_slot(self, slot: Dict, tried_keys: set, require_multimodal: bool) -> Optional[int]:
         indices = slot.get("indices") or []
         if not indices:
             return None
-        start = int(self.model_cursor.get(slot["rotation_index"], 0) or 0) % len(indices)
-        for offset in range(len(indices)):
-            pos = (start + offset) % len(indices)
-            idx = indices[pos]
+        available = []
+        for idx in indices:
             item = self.key_list[idx]
             identity = self._attempt_identity(item)
-            # 新代码使用 (base_url, model, key)；兼容外部仍传裸 key 的旧调用。
+            # 新代码使用 (base_url, model, key, http_proxy)；兼容外部仍传裸 key 的旧调用。
             if identity in tried_keys or item["key"] in tried_keys:
                 continue
-            if not self._is_available(item, include_cooldown=include_cooldown):
+            if not self._is_available(item):
                 continue
             if not self._matches_request(item, require_multimodal=require_multimodal):
                 continue
-            self.model_cursor[slot["rotation_index"]] = (pos + 1) % len(indices)
-            return idx
-        return None
+            available.append(idx)
+        if not available:
+            return None
+        # 同一模型槽位内多个 Key 随机分流；模型槽位本身仍遵循配置的轮换顺序。
+        idx = random.choice(available)
+        self.model_cursor[slot["rotation_index"]] = (indices.index(idx) + 1) % len(indices)
+        return idx
 
     def _iter_slot_positions(self) -> List[int]:
         """每次请求的尝试顺序：固定从 start_index（默认 Slot #1）开始向后轮询。
@@ -297,7 +315,7 @@ class SiliconFlowKeyManager:
                 "manual": manual,
             })
 
-    def get_current(self, require_multimodal: bool = False) -> Optional[Tuple[str, str, str, bool, int, str]]:
+    def get_current(self, require_multimodal: bool = False) -> Optional[Tuple[str, str, str, bool, int, str, str, Dict]]:
         with self._lock:
             if not self.key_list or not self.model_slots:
                 return None
@@ -305,7 +323,7 @@ class SiliconFlowKeyManager:
             if slot_pos is None:
                 return None
             slot = self.model_slots[slot_pos]
-            idx = self._pick_from_slot(slot, set(), True, require_multimodal)
+            idx = self._pick_from_slot(slot, set(), require_multimodal)
             if idx is not None:
                 item = self.key_list[idx]
                 item["last_used_at"] = self._now()
@@ -314,7 +332,7 @@ class SiliconFlowKeyManager:
             return self.get_next_for_request(require_multimodal=require_multimodal)
 
     def get_next_multimodal_for_request(self, tried_keys: set[str] = None, include_cooldown: bool = True,
-                                        preferred_model: str = "") -> Optional[Tuple[str, str, str, bool, int, str]]:
+                                        preferred_model: str = "") -> Optional[Tuple[str, str, str, bool, int, str, str, Dict]]:
         with self._lock:
             if not self.key_list or not self.model_slots:
                 return None
@@ -324,7 +342,7 @@ class SiliconFlowKeyManager:
                 for i, slot in enumerate(self.model_slots):
                     if preferred_model not in {slot.get("model"), slot.get("display_model")}:
                         continue
-                    idx = self._pick_from_slot(slot, tried_keys, include_cooldown, True)
+                    idx = self._pick_from_slot(slot, tried_keys, True)
                     if idx is not None:
                         item = self.key_list[idx]
                         self.last_selected_index = idx
@@ -333,7 +351,7 @@ class SiliconFlowKeyManager:
                         return self._result_tuple(item)
             for slot_pos in self._iter_slot_positions():
                 slot = self.model_slots[slot_pos]
-                idx = self._pick_from_slot(slot, tried_keys, include_cooldown, True)
+                idx = self._pick_from_slot(slot, tried_keys, True)
                 if idx is not None:
                     item = self.key_list[idx]
                     self.last_selected_index = idx
@@ -345,7 +363,7 @@ class SiliconFlowKeyManager:
     def get_preferred_for_request(self, preferred_model: str, tried_keys: set[str] = None,
                                   include_cooldown: bool = True,
                                   require_multimodal: bool = False,
-                                  allow_non_multimodal_fallback: bool = True) -> Optional[Tuple[str, str, str, bool, int, str]]:
+                                  allow_non_multimodal_fallback: bool = True) -> Optional[Tuple[str, str, str, bool, int, str, str, Dict]]:
         """优先从指定模型取一个可用 Key，不改变全局默认轮换起点。"""
         preferred_model = str(preferred_model or "").strip()
         if not preferred_model:
@@ -360,9 +378,9 @@ class SiliconFlowKeyManager:
             for slot in self.model_slots:
                 if preferred_model not in {slot.get("model"), slot.get("display_model")}:
                     continue
-                idx = self._pick_from_slot(slot, tried_keys, include_cooldown, require_multimodal)
+                idx = self._pick_from_slot(slot, tried_keys, require_multimodal)
                 if idx is None and require_multimodal and allow_non_multimodal_fallback:
-                    idx = self._pick_from_slot(slot, tried_keys, include_cooldown, False)
+                    idx = self._pick_from_slot(slot, tried_keys, False)
                 if idx is not None:
                     item = self.key_list[idx]
                     item["last_used_at"] = self._now()
@@ -378,14 +396,14 @@ class SiliconFlowKeyManager:
 
     def get_next_for_request(self, tried_keys: set[str] = None, include_cooldown: bool = True,
                              require_multimodal: bool = False,
-                             allow_non_multimodal_fallback: bool = True) -> Optional[Tuple[str, str, str, bool, int, str]]:
+                             allow_non_multimodal_fallback: bool = True) -> Optional[Tuple[str, str, str, bool, int, str, str, Dict]]:
         with self._lock:
             if not self.key_list or not self.model_slots:
                 return None
             tried_keys = tried_keys or set()
             for slot_pos in self._iter_slot_positions():
                 slot = self.model_slots[slot_pos]
-                idx = self._pick_from_slot(slot, tried_keys, include_cooldown, require_multimodal)
+                idx = self._pick_from_slot(slot, tried_keys, require_multimodal)
                 if idx is None:
                     continue
                 item = self.key_list[idx]
@@ -396,7 +414,7 @@ class SiliconFlowKeyManager:
             if require_multimodal and allow_non_multimodal_fallback:
                 for slot_pos in self._iter_slot_positions():
                     slot = self.model_slots[slot_pos]
-                    idx = self._pick_from_slot(slot, tried_keys, include_cooldown, False)
+                    idx = self._pick_from_slot(slot, tried_keys, False)
                     if idx is None:
                         continue
                     item = self.key_list[idx]
@@ -436,13 +454,9 @@ class SiliconFlowKeyManager:
                 self.current_index = slot_pos
             self._ensure_slot_state()
 
-    def mark_failure(self, key: str = None, reason: str = "", cooldown_seconds: int = 1,
+    def mark_failure(self, key: str = None, reason: str = "",
                      model: str = "", base_url: str = ""):
-        """记录失败并把 current_index 指向下一个模型。
-
-        不再写 cooldown_until：模型不做冷却，下一次请求仍要从 Slot #1 开始重试。
-        cooldown_seconds 参数保留只为兼容大量既有调用点。
-        """
+        """记录失败并把 current_index 指向下一个模型。"""
         with self._lock:
             if not self.key_list:
                 return
@@ -452,6 +466,7 @@ class SiliconFlowKeyManager:
             item = self.key_list[idx]
             item["fail_count"] += 1
             item["last_error"] = reason
+            item["disabled"] = False
             failed_slot = self._find_slot_pos_for_key_index(idx)
             if failed_slot is None:
                 failed_slot = self._resolve_current_slot_pos()
@@ -483,7 +498,6 @@ class SiliconFlowKeyManager:
             if 1 <= index <= len(self.key_list):
                 item = self.key_list[index - 1]
                 item["disabled"] = False
-                item["cooldown_until"] = 0.0
                 item["last_error"] = ""
                 return True
             return False
@@ -516,7 +530,7 @@ class SiliconFlowKeyManager:
         pass  # ponytail: no-op, default concept removed
 
     def is_default_key(self, key: str = None, model: str = "", base_url: str = "") -> bool:
-        # 轮换列表第一个模型（model_slots[0]）受保护：401/404 时只冷却不禁用
+        # 轮换列表第一个模型（model_slots[0]）受保护：401/404 时不禁用
         with self._lock:
             idx = self._find_index_by_key(key, model=model, base_url=base_url)
             if idx is None:
@@ -534,15 +548,6 @@ class SiliconFlowKeyManager:
             slot = self.model_slots[slot_pos]
             return any(bool(self.key_list[idx].get("supports_multimodal", False)) for idx in slot.get("indices", []))
 
-    def reset_cooldown(self, index: int) -> bool:
-        with self._lock:
-            if 1 <= index <= len(self.key_list):
-                item = self.key_list[index - 1]
-                item["cooldown_until"] = 0.0
-                item["last_error"] = ""
-                return True
-            return False
-
     def get_key_info(self, key: str = None) -> Optional[Dict]:
         with self._lock:
             idx = self._find_index_by_key(key)
@@ -551,13 +556,13 @@ class SiliconFlowKeyManager:
             return self.key_list[idx].copy()
 
     @staticmethod
-    def make_attempt_identity(base_url: str, key: str, model: str) -> tuple[str, str, str]:
-        return (str(base_url or ""), str(model or ""), str(key or ""))
+    def make_attempt_identity(base_url: str, key: str, model: str, http_proxy: str = "") -> tuple[str, str, str, str]:
+        return (str(base_url or ""), str(model or ""), str(key or ""), str(http_proxy or ""))
 
     def get_attempt_count(self) -> int:
-        """可尝试的渠道/模型/Key 组合数，而不是去重后的 Key 数。"""
+        """返回单次请求可尝试的唯一渠道/模型/Key 组合数。"""
         with self._lock:
-            return len(self.key_list)
+            return len({self._attempt_identity(item) for item in self.key_list})
 
     def get_all_keys(self) -> List[str]:
         with self._lock:
@@ -565,18 +570,11 @@ class SiliconFlowKeyManager:
 
     def get_status_list(self) -> List[Dict]:
         with self._lock:
-            now = self._now()
             current_slot = self._resolve_current_slot_pos()
             start_slot = self.start_index if 0 <= self.start_index < len(self.model_slots) else 0
             result = []
             for i, item in enumerate(self.key_list, start=1):
-                if item["disabled"]:
-                    status = "disabled"
-                elif item["cooldown_until"] > now:
-                    left = int(item["cooldown_until"] - now)
-                    status = f"cooldown({left}s)"
-                else:
-                    status = "active"
+                status = "disabled" if item["disabled"] else "active"
                 # rotation_index 是原始 endpoints 下标，可能含空洞；必须映射到 model_slots 下标
                 slot_pos = self._find_slot_pos_for_key_index(i - 1)
                 result.append({

@@ -646,22 +646,30 @@ EMPTY_OUTPUT_RETRY_WAIT = 1.0
 ABORT_NOTICE = "（已停止）"
 
 
+def _safe_error_text(err: Exception, limit: int = 320) -> str:
+    text = f"{type(err).__name__}: {err}"
+    text = re.sub(r"(?i)(bearer\s+)[^\s,;)]+", r"\1<redacted>", text)
+    text = re.sub(r"(?i)\bsk-[A-Za-z0-9_-]{8,}", "sk-<redacted>", text)
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
 def _degraded_text(partial: str, digest: "list[tuple[str, str]]", err: Exception) -> str:
     """模型在工具执行之后失败时的兜底回复。
 
     工具结果只存在于内部 messages 里，直接返回一句"出错了"等于把已经拿到的
-    信息扔掉。这里把它们摊平成人能读的文本交给用户。
+    信息扔掉。这里把它们摊平成人能读的文本交给用户，并保留安全的失败原因。
     """
     lines = []
     if str(partial or "").strip():
         lines.append(str(partial).strip())
     if digest:
-        lines.append("我已经查到/做完了这些，但在整理成回复时出错了：")
+        lines.append("我已经查到/做完了这些，但模型在整理最终回复时失败了。")
+        lines.append(f"失败原因：{_safe_error_text(err)}")
         for name, text in digest[-4:]:
             body = " ".join(str(text).split())
             lines.append(f"· {name}：{body[:300]}{'…' if len(body) > 300 else ''}")
     if not lines:
-        lines.append(f"刚才的操作已经执行完，但我在整理回复时出错了：{err}")
+        lines.append(f"刚才的操作已经执行完，但模型在整理最终回复时失败了：{_safe_error_text(err)}")
     return "\n".join(lines)
 
 
@@ -992,16 +1000,16 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
                         ctx.say(f"模型请求失败，第 {attempt + 1} 次重试：{e}", "AGENT")
                     await asyncio.sleep(EMPTY_OUTPUT_RETRY_WAIT)
                     continue
-                # 就地重试用尽。已经产生过不可重复的副作用（禁言、发消息、写文件…）
-                # 时绝不能向外抛：外层是 API Key 重试循环，它不知道工具跑过了，
-                # 换个 Key 会把整个工具循环从头重跑一遍，副作用重复发生。
-                # 只是"调过工具"不算——搜索、计算、读文件重跑一遍没有害处，
-                # 那种情况让外层换个渠道重试，用户能得到完整回答。
+                # 就地重试用尽。副作用工具已经执行过时仍向外抛，让外层切换
+                # 下一个模型；外层会复用现有工具结果、只做最终整理，不会重跑工具。
+                # 搜索、计算、读文件等只读工具也沿用同一条总结失败切换路径。
                 if fired_side_effects:
+                    ctx.extra["degraded_text"] = _degraded_text(content_so_far, tool_digest, e)
                     ctx.say(f"模型请求连续失败 {max_attempts} 次，"
-                            f"但已执行过副作用工具 {sorted(fired_side_effects)}，"
-                            f"不再换渠道重试以避免重复：{e}", "AGENT")
-                    return _degraded_text(content_so_far, tool_digest, e), usages, tool_calls_done
+                            f"已完成副作用工具 {sorted(fired_side_effects)}，"
+                            "保留工具结果并交由下一个模型整理，避免重复执行："
+                            f"{e}", "AGENT")
+                    raise
                 if tool_digest:
                     # 只读工具的结果不能白丢。这里仍然向外抛让外层换渠道重试，
                     # 但把已完成的结果挂到 ctx 上——所有渠道都失败时，
@@ -1025,12 +1033,13 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
             else:
                 error = RuntimeError(f"模型连续 {max_attempts} 次返回空响应")
                 if fired_side_effects:
+                    ctx.extra["degraded_text"] = _degraded_text(content_so_far, tool_digest, error)
                     ctx.say(
-                        f"{error}，但已执行过副作用工具 {sorted(fired_side_effects)}，"
-                        "不再换渠道重试以避免重复",
+                        f"{error}，已完成副作用工具 {sorted(fired_side_effects)}，"
+                        "保留工具结果并交由下一个模型整理，避免重复执行",
                         "AGENT",
                     )
-                    return _degraded_text(content_so_far, tool_digest, error), usages, tool_calls_done
+                    raise error
                 if tool_digest:
                     ctx.extra["tool_digest"] = list(tool_digest)
                     ctx.extra["degraded_text"] = _degraded_text(content_so_far, tool_digest, error)

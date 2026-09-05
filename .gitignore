@@ -28,3 +28,8 @@ Thumbs.db
 *.bak
 *.tmp
 *.orig
+config_backup/
+update_backup/
+temps/
+my_bot.lock
+my_bot.pid

@@ -32,7 +32,7 @@
     "_comment_protocol": "协议类型，默认 OneBot。",
     "Others": {
         "project_name": "XcBot",
-        "version_name": "v3.5.1",
+        "version_name": "v3.6",
         "slogan": "✨ 忻城 ✨",
         "robot_name_triggers": [
             "忻城"
@@ -95,12 +95,15 @@
                 "id": "provider1",
                 "base_url": "",
                 "keys": [],
+                "http_proxy": "",
                 "models": [
                     {
                         "name": "",
                         "enabled": false,
                         "supports_multimodal": false,
-                        "timeout_seconds": 120
+                        "timeout_seconds": 120,
+                        "reasoning_effort": "",
+                        "context_window": 0
                     }
                 ],
                 "embedding_models": [],
@@ -108,7 +111,7 @@
             }
         ],
         "_comment_llm_provider_tabs": "提供商页面分为对话与嵌入两类模型；嵌入模型复用同一提供商的 Base URL 和 Key。",
-        "_comment_llm_providers": "大模型提供商列表。每个提供商手动设置 id，模型显示名为 provider_id/model。",
+        "_comment_llm_providers": "大模型提供商列表。每个提供商手动设置 id，模型显示名为 provider_id/model。http_proxy 为该提供商单独的 HTTP 代理，格式 http://127.0.0.1:7890，留空则直连（不会回退到 Others.http_proxy）。每个模型可设 reasoning_effort（思考等级，留空=不发该参数，可选 none/minimal/low/medium/high）与 context_window（上下文窗口 token 数，0=沿用全局 max_context_tokens，检测模型时会尝试自动填入）。",
         "llm_rotation": [],
         "_comment_llm_rotation": "按顺序轮换的模型列表，元素格式：{provider_id, model}。为空时按已启用模型顺序自动生成。",
         "bot_name": "忻城",
@@ -121,7 +124,6 @@
         "_comment_Auto_approval": "自动审批关键词列表，入群答案包含这些关键词时自动通过。",
         "reminder": "/",
         "_comment_reminder": "命令前缀，例如 /帮助、/关于。",
-        "api_failure_cooldown_seconds": 5,
         "api_default_index": 1,
         "api_default_model": "",
         "api_multimodal_model": "",
@@ -135,6 +137,9 @@
             }
         ],
         "active_personality_preset": "default",
+        "private_personality_preset": "",
+        "group_personality_preset": "",
+        "_comment_active_personality_preset": "默认人格预设 id。private_personality_preset / group_personality_preset 留空表示跟随默认人格；填具体 id 则私聊 / 群聊单独使用该预设。WebUI 聊天室按私聊人格走。",
         "llm_split": {
             "enabled": true,
             "mode": "auto_prompt",
@@ -153,13 +158,7 @@
         ],
         "_comment_llm_reply_failover_keywords": "当 LLM 回复包含这些关键词时，丢弃该回复并自动切换到下一个 API 重试。",
         "sensitive_words": [
-            "prompt=人格",
-            "system=内部",
-            "system prompt=",
-            "system:prompt=",
-            "system：prompt=",
-            "json=数据格式",
-            "memory=记忆"
+            "sensitive_words=违禁词"
         ]
     },
     "uin": 0,

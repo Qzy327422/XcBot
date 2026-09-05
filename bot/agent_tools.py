@@ -45,6 +45,11 @@ def _setting(path: str, default=None):
 
 
 def _proxy() -> str | None:
+    """Agent 联网（搜索 / 抓网页）用的代理，读全局 Others.http_proxy。
+
+    这个全局代理只管 GitHub 相关请求与 Agent 联网；模型调用改由
+    每个提供商在「提供商」页面单独配置 http_proxy。
+    """
     return str(_setting("Others.http_proxy", "") or "").strip() or None
 
 
