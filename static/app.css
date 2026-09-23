@@ -63,6 +63,9 @@
     }
     body:after { display: none !important; }
     body::before{filter:blur(var(--user-bg-blur,0px));background-image:var(--user-bg-image) !important;background-size:cover !important;background-position:center !important;opacity:.82}
+    /* blur 会向外采样到 fixed 层之外的透明区域，边缘因此透出 --bg0（顶部一条发白）。
+       按模糊半径把这一层向四周扩出去，让被吃掉的边缘落在视口外。 */
+    html.has-bg body::before{inset:calc(-2 * var(--user-bg-blur,0px)) !important}
     html.has-bg body{background-image:none !important;background:var(--bg0) !important}
     html.has-bg[data-webui-preset]{--accent:#38d5ff;--accent2:#7cf7c8;--accent3:#a78bfa;--accent-rgb:56,213,255;--accent2-rgb:124,247,200}
     html.liquid-glass body::before{filter:blur(var(--user-bg-blur,0px)) !important;background-image:var(--user-bg-image) !important;background-size:cover !important;background-position:center !important;}
@@ -477,8 +480,22 @@
       html.liquid-glass .active-indicator-floater,html.liquid-glass .nav-bg-floater{transition:none !important}
     }
     @media (max-width: 980px) {
-      html, body { overflow: auto; height: auto; }
-      .app { width: 100%; height: auto; min-height: 100vh; grid-template-columns: 1fr !important; padding: 10px; overflow: visible; }
+      /* 窄屏不让根元素滚动：滚动交给 .main 内部（和桌面同一套模型）。
+         页面整体滚动时，移动浏览器的地址栏会随手势收放，布局视口跟着变高，
+         body::before 那层 position:fixed + background-size:cover 的壁纸就会被
+         重新拉伸、重绘，视觉上就是「背景图跟着手指动、底部还要补一块」。
+         根元素不滚动 => 地址栏不收放 => 视口尺寸恒定 => 壁纸彻底钉死。
+
+         min-height 必须一起清掉：本文件 :4 给 body / .app 留了 min-height:100vh，
+         而 iOS 的 100vh 是「地址栏收起后」的大视口高度，比实际可见区域高一截。
+         配上 overflow:hidden 就会把底部这一截直接裁掉、永远划不到。 */
+      html, body { overflow: hidden; height: 100%; min-height: 0; overscroll-behavior: none; }
+      /* dvh 可用时更准：它跟随可见视口，而根元素不滚动时地址栏不会收放，
+         这个值就是稳定的实际高度。旧内核落回上面的 height:100% 链。 */
+      @supports (height: 100dvh) {
+        html, body { height: 100dvh; }
+      }
+      .app { width: 100%; height: 100%; min-height: 0; grid-template-columns: 1fr !important; padding: 10px; overflow: hidden; }
       .app::before { display: none; }
       html.liquid-glass .card::before,html.liquid-glass .sidebar::before,html.liquid-glass .topbar::before,html.liquid-glass .chat-side::before,html.liquid-glass .chat-main::before,html.liquid-glass .chat-composer::before,html.liquid-glass .field::before,html.liquid-glass .feature::before,html.liquid-glass .stat::before,html.liquid-glass .btn::before,html.liquid-glass .pill::before {
         filter:none !important;
@@ -491,8 +508,8 @@
       html[data-theme="light"].liquid-glass .card,html[data-theme="light"].liquid-glass .sidebar,html[data-theme="light"].liquid-glass .topbar,html[data-theme="light"].liquid-glass .chat-side,html[data-theme="light"].liquid-glass .chat-main,html[data-theme="light"].liquid-glass .chat-composer {
         background:rgba(255,255,255,.10) !important;
       }
-      .sidebar { background: transparent !important; height: auto; overflow:visible; scrollbar-gutter:auto; }
-      .main { border-radius: 18px !important; overflow:visible !important; overflow-y:visible !important; scrollbar-gutter:auto; }
+      .sidebar { background: transparent !important; height: 100%; overflow:auto; scrollbar-gutter:auto; }
+      .main { border-radius: 18px !important; overflow-y:auto !important; overflow-x:hidden !important; scrollbar-gutter:auto; }
     }
 
 
@@ -516,14 +533,18 @@
   .nav-scrim{display:block}
   body.nav-open{overflow:hidden}
   body.nav-open .nav-scrim{opacity:1;pointer-events:auto}
+  /* 正文滚动已经收进 .main，抽屉打开时要锁住它，否则遮罩下的内容还能滑 */
+  body.nav-open .main{overflow:hidden !important}
 
-  .app{grid-template-columns:1fr !important;grid-template-rows:auto !important;gap:0;padding:10px}
+  .app{grid-template-columns:1fr !important;grid-template-rows:1fr !important;gap:0;padding:10px}
   /* 抽屉：脱离文档流，浮在内容与 topbar 之上，但低于弹窗（9999） */
   html:not(.liquid-glass) .sidebar,
   html.liquid-glass .sidebar,
   html.liquid-glass-fallback .sidebar{
     position:fixed !important;left:0 !important;top:0 !important;bottom:0 !important;
-    height:100vh !important;width:min(300px,82vw) !important;max-width:82vw !important;
+    /* 不写 100vh：iOS 的 100vh 是「地址栏收起后」的大视口高度，抽屉底部会被工具栏切掉。
+       top/bottom 都为 0 时留 height:auto，由实际可见视口决定。 */
+    height:auto !important;width:min(300px,82vw) !important;max-width:82vw !important;
     z-index:60 !important;margin:0 !important;
     border-radius:0 20px 20px 0 !important;border-left:none !important;
     overflow:auto !important;
@@ -539,13 +560,17 @@
   /* 抽屉宽度固定，标签不需要 120px 的最小宽度撑开 */
   .custom-nav-label{min-width:0}
 
-  /* 侧栏离开栅格后，主内容独占整行 */
+  /* 侧栏离开栅格后，主内容独占整行；并且它自己是滚动容器（见 :482 那段注释），
+     根元素不动，壁纸才不会随手势重绘。 */
   html:not(.liquid-glass) .main,
   html.liquid-glass .main,
   html.liquid-glass-fallback .main{
     grid-column:1/-1 !important;grid-row:1 !important;
-    height:auto !important;min-height:calc(100vh - 20px) !important;
-    overflow:visible !important;border-radius:18px !important;
+    height:100% !important;min-height:0 !important;
+    overflow-y:auto !important;overflow-x:hidden !important;border-radius:18px !important;
+    -webkit-overflow-scrolling:touch;
+    /* 滚到尽头时不把手势交给根元素，否则又会触发地址栏收放 */
+    overscroll-behavior:contain;
   }
 
   /* 汉堡是窄屏唯一的导航入口，正文滚动时不能跟着滑走。
@@ -565,6 +590,13 @@
   .toolbar>*{flex:0 0 auto}
 
   .grid{padding:12px;gap:12px}
+  /* 卡片标题与右侧按钮同排时，窄屏会把按钮压到只剩几个字宽，
+     "新增提供商" 于是竖着断成两行。让标题块可收缩、按钮不断词。 */
+  .section-head{flex-wrap:wrap}
+  .section-head>div:first-child{flex:1 1 180px;min-width:0}
+  .section-head>.btn,.section-head .btn{white-space:nowrap;flex:0 0 auto}
+  .label{flex-wrap:wrap}
+  .label .btn{white-space:nowrap}
   pre.log{height:56vh}
   .chat-side{max-height:38vh}
   .chatroom{height:auto !important}
@@ -581,6 +613,59 @@
 
 @media (prefers-reduced-motion: reduce) {
   .sidebar,.nav-scrim{transition:none !important}
+}
+
+/* ===== 原先写死在 JS 内联 style 里的多列布局 =====
+   内联 style 的具体度高于任何选择器，媒体查询无法覆盖，窄屏就会出现
+   「260px 侧列 + 被压成一条的内容列」——截图里提供商详情整块被挤出屏幕就是这个。
+   搬到这里之后窄屏可以正常塌成单列。 */
+.split-pane{display:grid;grid-template-columns:260px minmax(0,1fr);gap:16px}
+.split-pane-list{display:grid;gap:8px;align-content:start;min-width:0}
+.split-pane>*{min-width:0}
+
+/* 模型行：勾选 / 名称 / 多模态 / 超时 / 设置 / 删除 */
+.model-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto 120px auto auto;gap:10px;align-items:center}
+
+.embed-row{display:grid;grid-template-columns:auto minmax(0,1fr) 120px auto;gap:10px;align-items:center;padding:10px}
+
+/* 本文件 :4 的 `input{width:100%}` 会波及复选框。栅格里 auto 轨道是内容定宽，
+   百分比解析不出来所以看不出问题；换成 flex 后容器宽度是确定值，
+   复选框就会真的撑满整行。这里按住它的固有尺寸。 */
+.model-row input[type="checkbox"],.embed-row input[type="checkbox"]{width:auto;flex:0 0 auto}
+
+.persona-picker{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.persona-picker>label{min-width:0}
+
+.donut-layout{display:grid;grid-template-columns:180px minmax(0,1fr);gap:18px;align-items:center}
+.donut-layout>*{min-width:0}
+
+/* 轮换列表行：模型名 + 上移/下移 */
+.rot-row{display:flex;justify-content:space-between;gap:10px;align-items:center}
+.rot-row>b{min-width:0;overflow-wrap:anywhere}
+
+@media (max-width: 980px) {
+  /* 左侧列表改为顶部横向可滑的一行，省掉整屏高度 */
+  .split-pane{grid-template-columns:minmax(0,1fr);gap:12px}
+  .split-pane-list{grid-auto-flow:column;grid-auto-columns:max-content;overflow-x:auto;gap:8px;padding-bottom:2px;scrollbar-width:none}
+  .split-pane-list::-webkit-scrollbar{display:none}
+
+  /* 一行七列在手机上每格只剩几十 px。改成 flex 换行：模型名独占一行，
+     勾选 / 多模态 / 超时 / 按钮挤在第二行。 */
+  .model-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .model-row>input:not([type]),.model-row>input[type="text"]{flex:1 1 100%;order:-1}
+  .model-row>input[type="number"]{flex:0 0 76px;width:76px}
+  .model-row>button{flex:0 0 auto}
+
+  .embed-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .embed-row>input:not([type]),.embed-row>input[type="text"]{flex:1 1 100%;order:-1}
+  .embed-row>input[type="number"]{flex:1 1 100px;width:auto}
+  .embed-row>button{flex:0 0 auto;margin-left:auto}
+
+  .persona-picker{grid-template-columns:minmax(0,1fr)}
+  .donut-layout{grid-template-columns:minmax(0,1fr);gap:12px}
+  .donut-chart{width:150px;height:150px}
+  .rot-row{flex-wrap:wrap}
+  .rot-row>b{flex:1 1 100%}
 }
 
 /* 追踪页正文块：高度随内容自适应，超长才滚动 */

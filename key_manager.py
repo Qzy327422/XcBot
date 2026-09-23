@@ -43,9 +43,8 @@ class SiliconFlowKeyManager:
             # start_index 是管理员用 /model 选定的轮询起点，必须和 current_index
             # 一样按身份还原。只还原 current_index 的话，保存一次配置就会让实际
             # 请求悄悄回到第一个模型，而界面仍显示管理员选的那个。
-            prev_start_identity = self._get_slot_identity(
-                self.start_index if 0 <= self.start_index < len(self.model_slots) else None
-            )
+            prev_start_pos = self.start_index if 0 <= self.start_index < len(self.model_slots) else None
+            prev_start_identity = self._get_slot_identity(prev_start_pos)
 
             self.endpoints = endpoints or []
             self.current_index = 0
@@ -59,8 +58,15 @@ class SiliconFlowKeyManager:
 
             restored_current = self._find_slot_pos_by_identity(prev_current_identity)
             self.current_index = restored_current if restored_current is not None else 0
+
+            # 起点只在「管理员指定的那个模型还待在原来的位次」时保留。它的位次一变
+            # （表首插了新模型、它前面有项被删、顺序被调），或者它整个被删掉，就说明
+            # 轮换表被重排过，这次指定作废，起点回到列表第一项。
+            # 否则：在表首插入一个模型后，下次请求仍从原来那个开始，新模型永远轮不到，
+            # 而界面上「模型轮换列表」明明把它排在第一。
+            # 反过来，在表尾追加模型不影响前面的位次，指定继续有效。
             restored_start = self._find_slot_pos_by_identity(prev_start_identity)
-            self.start_index = restored_start if restored_start is not None else 0
+            self.start_index = restored_start if (restored_start is not None and restored_start == prev_start_pos) else 0
             self._ensure_slot_state()
 
     def _normalize_bool(self, value, default: bool = False) -> bool:
