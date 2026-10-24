@@ -25,7 +25,7 @@ function normalizeRoutePage(page){return routeAlias[page]||page||'welcome'}
 function routeForPage(page,section=''){const base=publicRoute[page]||page||'welcome';return '#/'+base+(section?'#'+encodeURIComponent(section):'')}
 const extraRoutes=['chatroom','debug','store'];
 function isValidPage(k){return extraRoutes.includes(k)||pages().some(p=>p.key===k)}
-function applyRoute(){const r=splitHashRoute();let page=normalizeRoutePage(r.page);if(pages().length&&!isValidPage(page))page='welcome';if(page==='chatroom'&&state.current!=='chatroom')chatState._enterBottom=true;state.current=page;state.section=r.section||'';localStorage.webuiPage=page}
+function applyRoute(){const r=splitHashRoute();let page=normalizeRoutePage(r.page);if(pages().length&&!isValidPage(page))page='welcome';if(page==='chatroom'&&state.current!=='chatroom'){chatState._enterBottom=true;if(chatState._loaded)chatRefreshHeaderOptions()}state.current=page;state.section=r.section||'';localStorage.webuiPage=page}
 function updateRoute(page,section='',replace=false){const target=routeForPage(page,section);if(location.hash===target){applyRoute();return}if(replace)history.replaceState(null,'',target);else location.hash=target;applyRoute()}
 const meta=()=>pages().find(x=>x.key===state.current)||pages()[0]||{title:'WebUI',desc:''};
 function setTheme(t){document.documentElement.dataset.theme=t;localStorage.webuiTheme=t;const btn=el('themeBtn');if(btn)btn.innerHTML=t==='light'?'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>浅色':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>深色'}
@@ -36,16 +36,39 @@ function setTheme(t){document.documentElement.dataset.theme=t;localStorage.webui
  * The warp-layer wiring (backdrop-filter blur + plain filter:url) follows liquid-glass-react.
  * Copyright (c) 2025 MAX ROVENSKY. MIT License.
  */
+// 读取折射强度（0-30，默认 5；5 等同于旧版的原始强度）。
+// 注意 getPropertyValue 在未设置时返回 ""，Number("")===0，会把强度静默归零，
+// 所以必须先判空再转数字。
+const glassRefraction=()=>{
+  const raw=getComputedStyle(document.documentElement).getPropertyValue('--liquid-glass-refraction').trim();
+  const v=raw===''?NaN:Number(raw);
+  return Math.max(0,Math.min(30,isNaN(v)?5:v));
+};
+// 触屏/移动设备判定用媒体查询而不是 UA 嗅探。
+const matchMediaCoarse=()=>matchMedia('(pointer:coarse)').matches;
+const narrowViewport=()=>matchMedia('(max-width:980px)').matches;
+const liquidGlassWebKitTarget=()=>{
+  const ua=navigator.userAgent||'';
+  const ios=/iPhone|iPad|iPod/i.test(ua)||(/Macintosh/i.test(ua)&&Number(navigator.maxTouchPoints||0)>1);
+  return ios||(/AppleWebKit/i.test(ua)&&!/(Chrome|CriOS|Edg|OPR)/i.test(ua));
+};
 const liquidGlassController=(()=>{
-  const SIZE=256,BASE_SCALE=40;
-  let enabled=false,built=false;
+  const SIZE=256;
+  let built=false;
   const root=()=>document.documentElement;
   const smoothStep=(a,b,t)=>{t=Math.max(0,Math.min(1,(t-a)/(b-a)));return t*t*(3-2*t)};
   const len=(x,y)=>Math.sqrt(x*x+y*y);
   const roundedRectSDF=(x,y,w,h,r)=>{const qx=Math.abs(x)-w+r,qy=Math.abs(y)-h+r;return Math.min(Math.max(qx,qy),0)+len(Math.max(qx,0),Math.max(qy,0))-r};
   function nodes(){return {image:document.getElementById('xcbot-liquid-map'),displacement:['r','g','b'].map(k=>document.getElementById('xcbot-liquid-displacement-'+k)).filter(Boolean)}}
-  // Firefox 不支持把 SVG filter 叠在 backdrop-filter 采样层上；窄屏和无 backdrop-filter 直接降级
-  function unsupported(){if(innerWidth<=980)return 'mobile';if(/firefox/i.test(navigator.userAgent))return 'browser';if(!window.CSS?.supports?.('backdrop-filter','blur(1px)'))return 'no-backdrop';return ''}
+  // CSS.supports 只能确认语法支持；WebKit 的壁纸折射另走显式图片源，
+  // 不把支持 blur 当作支持 backdrop 与 SVG 位移的组合。
+  function unsupported(){
+    const css=window.CSS;
+    if(liquidGlassWebKitTarget())return css?.supports?.('filter','url("#xcbot-liquid-glass")')?'':'no-filter';
+    if(/firefox/i.test(navigator.userAgent))return 'browser';
+    const supports=!!(css?.supports?.('backdrop-filter','blur(1px)')||css?.supports?.('-webkit-backdrop-filter','blur(1px)'));
+    return supports?'':'no-backdrop';
+  }
   function setState(reason){const bad=!!reason;root().classList.toggle('liquid-glass-fallback',bad);root().dataset.liquidGlassState=bad?('fallback-'+reason):'ready'}
   // k<1 使中心也有轻微放大折射，靠近圆角边缘时 k 急剧变小形成边缘弯曲
   function build(){
@@ -71,16 +94,792 @@ const liquidGlassController=(()=>{
     const href=cv.toDataURL('image/png');
     n.image.setAttribute('href',href);
     n.image.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href',href);
+    const refraction=glassRefraction();
+    // 滑块上限抬到 30 后位移量会非常大，超过 ~120 就会把边缘扯成明显断层，
+    // 这里用平方根收敛，让小数值仍然线性、大数值不会失控。
+    const BASE_SCALE=Math.min(120,(refraction<=10?refraction:10+Math.sqrt(refraction-10)*3)*8);
     n.displacement[0].setAttribute('scale',String(BASE_SCALE*1.1));
     n.displacement[1].setAttribute('scale',String(BASE_SCALE));
     n.displacement[2].setAttribute('scale',String(BASE_SCALE*.9));
+    if(liquidGlassWebKitTarget()){
+      document.getElementById('xcbot-liquid-glass-soft')?.remove();
+      const soft=n.image.parentNode.cloneNode(true);
+      soft.id='xcbot-liquid-glass-soft';
+      soft.querySelectorAll('[id]').forEach(node=>node.removeAttribute('id'));
+      const softBase=Math.min(120,(refraction<=10?refraction:10+Math.sqrt(refraction-10)*3)*8);
+      soft.querySelectorAll('feDisplacementMap').forEach((node,i)=>node.setAttribute('scale',String(Math.max(1,softBase*0.3-i*softBase*0.025))));
+      n.image.parentNode.parentNode.appendChild(soft);
+    }
+    // build() 成功后记下本次实际使用的强度，供 syncRefraction 判断是否需要重建。
+    lastRefraction=refraction;
     return true
   }
-  function start(){const bad=unsupported();if(bad){setState(bad);return}if(!built)built=build();if(!built){console.warn('[liquid-glass] displacement map build failed');setState('no-map');return}setState('')}
-  window.addEventListener('resize',()=>{if(enabled)start()},{passive:true});
-  return {setEnabled(v){enabled=v;if(v)start();else{root().classList.remove('liquid-glass-fallback');root().dataset.liquidGlassState='off'}}};
+  // 记录 build() 时实际用的强度，syncRefraction 据此判断要不要重建。
+  let lastRefraction=null;
+  function start(){
+    const bad=unsupported();if(bad){setState(bad);return false}
+    if(!built){try{built=build()}catch(e){built=false}}
+    if(!built){setState('no-map');return false}
+    setState('');return true
+  }
+  function syncRefraction(force){
+    if(!built)return false;
+    const r=glassRefraction();
+    // 不能提前把 lastRefraction 改成新值：build() 才是真正写入位移图的地方，
+    // 先改会导致「值变了但没重建」，滑块拖动时看起来毫无反应。
+    if(!force&&r===lastRefraction)return false;
+    try{build();lastRefraction=r}catch(e){return false}
+    return true;
+  }
+  return {
+    setEnabled(v){
+      if(v){return start()}
+      root().classList.remove('liquid-glass-fallback');root().dataset.liquidGlassState='off';return false
+    },
+    syncRefraction
+  };
 })();
-function applyWebuiAppearance(){const v=state.bundle?.form_values||{},root=document.documentElement;const preset=String(v['WebUI.theme_preset']||'aurora');root.dataset.webuiPreset=preset;const blur=Math.max(0,Math.min(40,Number(v['WebUI.background_blur']||0)));root.style.setProperty('--user-bg-blur',blur+'px');const img=String(v['WebUI.background_image']||'').trim();const bgUrl=img?(/^https?:\/\//i.test(img)?img:'/api/webui/background?token='+encodeURIComponent(token()||'')+'&v='+encodeURIComponent(img)):'';root.style.setProperty('--user-bg-image',bgUrl?'url("'+bgUrl.replace(/"/g,'%22')+'")':'none');root.classList.toggle('has-bg',!!img);const liquid=!!v['WebUI.liquid_glass'];root.classList.toggle('liquid-glass',liquid);liquidGlassController.setEnabled(liquid);cacheAppearanceForLogin(preset,blur,img,bgUrl)}
+// 折射强度：0-10 映射到 0-1.0，5 为原始强度（1.0）
+function refractionStrength(){return glassRefraction()/5}
+// 固定画布只更新玻璃区域，纹理坐标始终相对视口；避免副本随 DOM 滚动后再跳回。
+function createLiquidGlassGpu(image,onLost){
+  const canvas=document.createElement('canvas');canvas.className='glass-gpu-layer';
+  canvas.setAttribute('aria-hidden','true');
+  // 按需绘制后会停帧；保留缓冲，避免 WebKit 在下一次合成时丢掉静态结果。
+  const gl=canvas.getContext('webgl',{alpha:true,premultipliedAlpha:true,preserveDrawingBuffer:true,antialias:false,depth:false,stencil:false});
+  if(!gl)throw new Error('no-webgl');
+  let program=null,buffer=null,texture=null,disposed=false,lost=false;
+  // 已上传纹理对应的 CPU 侧模糊半径（屏幕像素）。NaN 表示还没上传过，
+  // 首次 draw 时才建纹理——避免初始化时先传一张清晰图、紧接着又为模糊重建。
+  let textureBlur=NaN;
+  const shaders=[];
+  const stats={textureUploads:0,frames:0,regions:0,lastJsMs:0,resolution:[0,0]};
+  function cleanup(){
+    if(disposed)return;disposed=true;
+    canvas.removeEventListener('webglcontextlost',contextLost);canvas.remove();
+    if(texture)gl.deleteTexture(texture);if(buffer)gl.deleteBuffer(buffer);
+    if(program)gl.deleteProgram(program);shaders.forEach(s=>gl.deleteShader(s));
+  }
+  function contextLost(e){e.preventDefault();lost=true;onLost()}
+  function shader(type,source){
+    const s=gl.createShader(type);shaders.push(s);gl.shaderSource(s,source);gl.compileShader(s);
+    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error('shader-compile');return s;
+  }
+  try{
+    const vertex=shader(gl.VERTEX_SHADER,`
+      precision mediump float;
+      attribute vec2 a_pos;
+      uniform vec4 u_rect;
+      uniform vec2 u_view;
+      varying vec2 v_pos;
+      void main(){v_pos=u_rect.xy+a_pos*u_rect.zw;gl_Position=vec4(v_pos.x/u_view.x*2.0-1.0,1.0-v_pos.y/u_view.y*2.0,0.0,1.0);}
+    `);
+    const fragment=shader(gl.FRAGMENT_SHADER,`
+      precision mediump float;
+      uniform sampler2D u_image;
+      uniform vec4 u_rect,u_radii,u_cover,u_clipBox;
+      uniform vec4 u_clips[8],u_clipRadii[8];
+      uniform int u_clipCount;
+      uniform vec3 u_base;
+      uniform float u_strength,u_pixel;
+      varying vec2 v_pos;
+      float radiusAt(vec2 p,vec4 radii){return p.y<0.0?(p.x<0.0?radii.x:radii.y):(p.x<0.0?radii.w:radii.z);}
+      float ss(float a,float b,float t){t=clamp((t-a)/(b-a),0.0,1.0);return t*t*(3.0-2.0*t);}
+      float roundedSdf(vec2 p){
+        vec2 q=abs(p)-vec2(.44)+vec2(.16);
+        return min(max(q.x,q.y),0.0)+length(max(q,0.0))-.16;
+      }
+      float pcScaleAt(vec2 uv){
+        vec2 p=uv-.5;
+        float scaled=ss(0.0,1.0,ss(.14,-.02,roundedSdf(p)));
+        return 1.0-scaled*.34-.03;
+      }
+      float distanceToBox(vec2 p,vec4 box,vec4 radii){
+        vec2 local=p-box.xy-box.zw*.5;float r=radiusAt(local,radii);
+        vec2 q=abs(local)-box.zw*.5+r;
+        return length(max(q,0.0))+min(max(q.x,q.y),0.0)-r;
+      }
+      vec3 sampleImage(vec2 p){
+        vec2 uv=clamp((p-u_cover.xy)/u_cover.zw,0.0,1.0);uv.y=1.0-uv.y;
+        // 纹理在 CPU 侧已经做过一次真正的 Gaussian blur（见 preBlurTexture），
+        // 这里只做单点采样。之前在这里撒离散采样点会因为间距小于图像细节
+        // 而产生「多份拷贝」的重影，看着头晕；预模糊是连续的，不会有这个问题。
+        vec4 c=texture2D(u_image,uv);
+        return mix(u_base,c.rgb,c.a*.82);
+      }
+      void main(){
+        if(v_pos.x<u_clipBox.x||v_pos.y<u_clipBox.y||v_pos.x>u_clipBox.z||v_pos.y>u_clipBox.w)discard;
+        float dist=distanceToBox(v_pos,u_rect,u_radii);
+        float mask=1.0-smoothstep(-u_pixel,0.0,dist);
+        for(int i=0;i<8;i++){
+          if(i<u_clipCount)mask*=1.0-smoothstep(-u_pixel,0.0,distanceToBox(v_pos,u_clips[i],u_clipRadii[i]));
+        }
+        if(mask<.01)discard;
+        vec2 local=v_pos-u_rect.xy-u_rect.zw*.5;
+        vec2 uv=local/u_rect.zw+.5;
+        float k=pcScaleAt(uv);
+        // 与 PC 的 canvas 位移图一致：中心也缩放，边缘曲率额外增强。
+        vec2 bend=local*(k-1.0)*u_strength;
+        vec3 c=sampleImage(v_pos-bend);
+        c.r=sampleImage(v_pos-bend*1.10).r;
+        c.b=sampleImage(v_pos-bend*.90).b;
+        gl_FragColor=vec4(c*mask,mask);
+      }
+    `);
+    program=gl.createProgram();gl.attachShader(program,vertex);gl.attachShader(program,fragment);gl.linkProgram(program);
+    if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw new Error('shader-link');
+    gl.useProgram(program);
+    buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);
+    gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([0,0,1,0,0,1,0,1,1,0,1,1]),gl.STATIC_DRAW);
+    const pos=gl.getAttribLocation(program,'a_pos');gl.enableVertexAttribArray(pos);gl.vertexAttribPointer(pos,2,gl.FLOAT,false,0,0);
+    texture=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,texture);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    const max=Math.min(4096,gl.getParameter(gl.MAX_TEXTURE_SIZE));
+    // 把壁纸按目标模糊半径预先高斯模糊一次，再上传给 GPU。
+    // 为什么要预模糊而不是在 shader 里多点采样：采样点之间的距离一旦超过
+    // 图像细节的尺度，拿到的就是同一批细节的「多份拷贝」，看起来就是重影，
+    // 越大越晕。CPU 侧的 Gaussian blur 是连续卷积，不存在离散空洞。
+    // 模糊半径按纹理像素算：屏幕 px / cover 缩放比。
+    function uploadTexture(blurScreenPx,coverWidth){
+      let source=image;
+      if(Math.max(image.naturalWidth,image.naturalHeight)>max){
+        const scaled=document.createElement('canvas'),ratio=max/Math.max(image.naturalWidth,image.naturalHeight);
+        scaled.width=Math.max(1,Math.round(image.naturalWidth*ratio));scaled.height=Math.max(1,Math.round(image.naturalHeight*ratio));
+        scaled.getContext('2d').drawImage(image,0,0,scaled.width,scaled.height);source=scaled;
+      }
+      // 模糊半径必须按**实际要上传的那张图**的像素尺度换算：
+      // 图片被 MAX_TEXTURE_SIZE 缩过之后，再拿原图宽度去乘会把模糊放大好几倍。
+      const sourceW=source.naturalWidth||source.width;
+      const texBlur=coverWidth>0?blurScreenPx*sourceW/coverWidth:blurScreenPx;
+      if(texBlur>0.1){
+        const cv=document.createElement('canvas');
+        cv.width=source.naturalWidth||source.width;cv.height=source.naturalHeight||source.height;
+        const ctx=cv.getContext('2d',{willReadFrequently:false});
+        if(ctx&&typeof ctx.filter==='string'){
+          // Chromium / Android：ctx.filter 是 GPU 加速的高斯，直接用。
+          ctx.filter=`blur(${texBlur.toFixed(2)}px)`;
+          // 先铺满四周再画，避免模糊后边缘变透明（CLAMP_TO_EDGE 也会露出暗边）。
+          ctx.drawImage(source,-texBlur*2,-texBlur*2,cv.width+texBlur*4,cv.height+texBlur*4);
+          ctx.filter='none';
+          source=cv;
+        }else if(ctx&&texBlur>0.05){
+          // iOS Safari 的 canvas 2D 没有 ctx.filter（实测 'filter' in ctx === false），
+          // 上面那段会整段跳过。这里用「等比降采样 + 逐级放大」近似高斯：
+          //   · 模糊半径与滑块数值**线性**对应，强度和其他平台的
+          //     ctx.filter(`blur(${texBlur}px)`) 一致（见下方系数标定）。
+          //   · 以前写的是 k = 2*sqrt(texBlur)：平方根把滑块后几档压缩掉了
+          //     （iOS 拖到 10 看着只等于别端 3），而最后一次大比例双线性放大
+          //     在 Safari 上还会留下明显的块状/锯齿。
+          //   · 降采样只按 2 的整数倍逐次减半（每次都是精确的 2x2 盒式平均），
+          //     再用同样的 2x 步长**逐级放大回原尺寸**。一次性大比例放大在
+          //     Safari 上只做双线性、会留下方块和锯齿；逐级放大每步只放大 2 倍，
+          //     多级叠起来等价于一个平滑的 tent 核，边缘不会有台阶。
+          const sw=source.naturalWidth||source.width,sh=source.naturalHeight||source.height;
+          // CSS 的 blur(r) 里 r 就是高斯标准差（Filter Effects 规范），
+          // 所以目标等效 sigma = texBlur。
+          // 「逐次减半 + 逐级 2x 放大」实测 sigma ≈ 0.7k，故取 k = 1.4*texBlur，
+          // 让 iOS 的模糊强度与其它平台的 ctx.filter('blur(r)') 对齐。
+          // 上一版取 0.7 只有目标的一半，看起来仍然"偏弱"。
+          const k=Math.min(Math.max(1,texBlur*1.4),Math.max(1,Math.min(sw,sh)/2));
+          const targetW=Math.max(2,Math.round(sw/k)),targetH=Math.max(2,Math.round(sh/k));
+          // 先工整地逐次减半（每步都是精确的 2x2 盒式平均），只保留当前层。
+          let cur=source,curW=sw,curH=sh;
+          function resample(from,fromW,fromH,toW,toH){
+            const cv2=document.createElement('canvas');cv2.width=toW;cv2.height=toH;
+            const c2=cv2.getContext('2d');
+            if(!c2)return null;
+            c2.imageSmoothingEnabled=true;c2.imageSmoothingQuality='high';
+            c2.drawImage(from,0,0,fromW,fromH,0,0,toW,toH);
+            return cv2;
+          }
+          while(curW>=targetW*2&&curH>=targetH*2&&curW>2&&curH>2){
+            const nw=Math.max(2,Math.round(curW/2)),nh=Math.max(2,Math.round(curH/2));
+            const tmp=resample(cur,curW,curH,nw,nh);
+            if(!tmp)break;
+            cur=tmp;curW=nw;curH=nh;
+          }
+          // 收尾：缩到目标尺寸（可以不是 2 的幂），保证每一档 texBlur 都有差异。
+          if(targetW<curW||targetH<curH){
+            const tmp=resample(cur,curW,curH,targetW,targetH);
+            if(tmp){cur=tmp;curW=targetW;curH=targetH}
+          }
+          // 逐级放大回原尺寸：每步只放大 2 倍，避免一次性大比例双线性的台阶，
+          // 同时不保留中间层，内存只多一张当前画布。
+          while(curW<sw||curH<sh){
+            const nw=Math.min(sw,Math.max(curW+1,curW*2)),nh=Math.min(sh,Math.max(curH+1,curH*2));
+            const tmp=resample(cur,curW,curH,nw,nh);
+            if(!tmp)break;
+            cur=tmp;curW=nw;curH=nh;
+          }
+          source=cur;
+        }
+      }
+      gl.bindTexture(gl.TEXTURE_2D,texture);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,source);
+      if(gl.getError()!==gl.NO_ERROR)throw new Error('texture-upload');stats.textureUploads++;
+    }
+    const locations={};['rect','view','radii','cover','clipBox','clips[0]','clipRadii[0]','clipCount','base','strength','pixel','image'].forEach(k=>locations[k]=gl.getUniformLocation(program,'u_'+k));
+    gl.uniform1i(locations.image,0);gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+    gl.clearColor(0,0,0,0);gl.disable(gl.DEPTH_TEST);
+    canvas.addEventListener('webglcontextlost',contextLost);document.body.insertBefore(canvas,document.body.firstChild);
+    const clipData=new Float32Array(32),radiusData=new Float32Array(32);
+    const maxBuffer=gl.getParameter(gl.MAX_RENDERBUFFER_SIZE);
+    return {canvas,dispose:cleanup,diagnostics:()=>({...stats,resolution:stats.resolution.slice(),refractionModel:'xcbot-sdf-v1',strengthProfile:'pc-base-scale-40-soft-35%'}),draw(regions,geometry){
+      if(disposed||lost)return;
+      const start=performance.now(),{width,height,cover,blur,base,animating}=geometry;
+      // 首次绘制，或模糊半径变化超过 0.5px 才重建纹理：
+      // 静态画面下只上传一次，拖滑块时才逐档重建。
+      if(!(Math.abs(blur-textureBlur)<0.5)){
+        // cover[2] 是壁纸在屏幕上的显示宽度；纹理是图片像素宽。
+        // 屏幕上的 blur 半径换算到纹理空间要乘这个比值。
+        try{uploadTexture(blur,cover[2]);textureBlur=blur}catch(e){}
+        gl.bindTexture(gl.TEXTURE_2D,texture);gl.uniform1i(locations.image,0);
+      }
+      // 像素预算：移动端 GPU 带宽有限，dpr 2.75 直接按 2 仍偏大；
+      // 桌面 4K 高 DPI 下 maxBuffer 也不起约束，会撑出上百 MB 的缓冲。
+      // 用预算反推 dpr，移动端再压一档，动画期间进一步降到 1.0
+      // （本质是模糊折射，1.0 与 1.5 的差异几乎不可见）。
+      // iOS 已经验收过、本身也流畅，保持原来的 dpr 2 不动；
+      // 降 dpr 只针对出问题的 Chromium 移动端。
+      // 这里刻意内联判断而不调用外部辅助函数：本函数会被测试单独抽取注入。
+      const ua=navigator.userAgent||'';
+      const webkitIOS=/iPhone|iPad|iPod/i.test(ua)||(/AppleWebKit/i.test(ua)&&!/(Chrome|CriOS|Edg|OPR)/i.test(ua));
+      const mobileGpu=(navigator.maxTouchPoints>0||window.matchMedia?.('(pointer:coarse)').matches)&&!webkitIOS;
+      const dprCap=(mobileGpu?1.5:2)*(animating&&mobileGpu?0.67:1);
+      const budget=mobileGpu?1600000:4200000;
+      const dpr=Math.max(1,Math.min(dprCap,devicePixelRatio||1,Math.sqrt(budget/(width*height)),maxBuffer/width,maxBuffer/height));
+      const w=Math.max(1,Math.round(width*dpr)),h=Math.max(1,Math.round(height*dpr));
+      if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}
+      if(canvas.style.width!==width+'px')canvas.style.width=width+'px';
+      if(canvas.style.height!==height+'px')canvas.style.height=height+'px';
+      gl.viewport(0,0,w,h);gl.disable(gl.SCISSOR_TEST);gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.enable(gl.SCISSOR_TEST);
+      gl.uniform2f(locations.view,width,height);gl.uniform4fv(locations.cover,cover);gl.uniform3fv(locations.base,base);
+      gl.uniform1f(locations.pixel,Math.max(1/dpr,.75));
+      // 折射强度每次 draw 只读一次样式，不再在每个 region 里 getComputedStyle。
+      // 同样内联：本函数会被测试单独抽取注入。
+      const rawStrength=getComputedStyle(document.documentElement).getPropertyValue('--liquid-glass-refraction').trim();
+      const strengthNum=rawStrength===''?NaN:Number(rawStrength);
+      // 与 SVG 分支一致地收敛：0-10 保持线性（5=1.0 原始强度），
+      // 10 以上用平方根放大，避免高值把采样推出纹理边界。
+      const sr=Math.max(0,Math.min(30,isNaN(strengthNum)?5:strengthNum));
+      const strengthBase=(sr<=10?sr:10+Math.sqrt(sr-10)*3)/5;
+      for(const item of regions){
+        const x0=Math.max(0,Math.floor(Math.max(item.rect[0],item.clipBox[0])*dpr)),x1=Math.min(w,Math.ceil(Math.min(item.rect[0]+item.rect[2],item.clipBox[2])*dpr));
+        const y0=Math.max(0,Math.floor(Math.max(item.rect[1],item.clipBox[1])*dpr)),y1=Math.min(h,Math.ceil(Math.min(item.rect[1]+item.rect[3],item.clipBox[3])*dpr));
+        gl.scissor(x0,h-y1,Math.max(0,x1-x0),Math.max(0,y1-y0));
+        gl.uniform4fv(locations.rect,item.rect);gl.uniform4fv(locations.radii,item.radii);
+        gl.uniform4fv(locations.clipBox,item.clipBox);gl.uniform1f(locations.strength,(item.soft?.35:1.0)*strengthBase);
+        clipData.fill(0);radiusData.fill(0);const count=Math.min(8,item.clips.length);
+        for(let i=0;i<count;i++){clipData.set(item.clips[i].rect,i*4);radiusData.set(item.clips[i].radii,i*4)}
+        gl.uniform4fv(locations['clips[0]'],clipData);gl.uniform4fv(locations['clipRadii[0]'],radiusData);gl.uniform1i(locations.clipCount,count);
+        gl.drawArrays(gl.TRIANGLES,0,6);
+      }
+      stats.frames++;stats.regions=regions.length;stats.resolution=[w,h];stats.lastJsMs=Number((performance.now()-start).toFixed(2));
+    }};
+  }catch(e){cleanup();throw new Error(['no-webgl','shader-compile','shader-link','texture-upload'].includes(e.message)?e.message:'gpu-init')}
+}
+// 渲染器仲裁：决定液态玻璃走哪条路径。
+//   off  — 总开关关闭
+//   css  — 只用 CSS（每个元素 ::before 的 backdrop-filter + SVG 折射），Chromium 的默认回退
+//   svg  — WebKit 的每元素 SVG 克隆层
+//   gpu  — 一张 WebGL 画布统一绘制所有玻璃区域（最快，优先）
+// WebGL 探测结果按页面生命周期缓存：applyWebuiAppearance 每次 render 都会调用，
+// 不缓存会不断新建上下文，撞上 Chromium 约 16 个的上下文上限。
+const liquidGlassWebGLProbe=(()=>{
+  let cached=null;
+  return function(){
+    if(cached!==null)return cached;
+    try{
+      const canvas=document.createElement('canvas');
+      canvas.width=1;canvas.height=1;
+      // 属性必须和 createLiquidGlassGpu 保持一致。
+      // failIfMajorPerformanceCaveat 会挡掉 SwiftShader 软光栅——
+      // 那种情况下 WebGL "可用"，但比 CSS 还慢，是最容易把优化变成负优化的场景。
+      const gl=canvas.getContext('webgl',{alpha:true,premultipliedAlpha:true,preserveDrawingBuffer:true,antialias:false,depth:false,stencil:false,failIfMajorPerformanceCaveat:true});
+      if(!gl){cached=false;return cached}
+      const lost=gl.getExtension('WEBGL_lose_context');
+      if(lost)lost.loseContext();
+      cached=true;
+    }catch(e){cached=false}
+    return cached;
+  };
+})();
+function liquidGlassRenderPlan(value,url,svgReady){
+  const webkit=liquidGlassWebKitTarget();
+  if(!value)return {engine:'off',reason:'disabled'};
+  // WebKit 的历史行为优先保留：无壁纸时仍然进入控制器的 no-wallpaper 流程。
+  if(!url)return {engine:webkit?'svg':'off',reason:'no-wallpaper'};
+  let sameOrigin=false;
+  try{sameOrigin=new URL(url,location.href).origin===location.origin}catch(e){}
+  // 跨域壁纸读不到像素，GPU 无法上传纹理。放在 WebGL 探测之前，避免白建上下文。
+  if(!sameOrigin)return {engine:webkit?'svg':'css',reason:'external-image'};
+  if(navigator.connection?.saveData===true)return {engine:webkit?'svg':'css',reason:'save-data'};
+  if(!liquidGlassWebGLProbe())return {engine:webkit?'svg':'css',reason:'no-webgl'};
+  // 仍可能因为 image 解码或 shader 失败而落到 startGpu 的降级。
+  return {engine:'gpu',reason:'ready'};
+}
+const liquidGlassLensController=(()=>{
+  const root=document.documentElement,ns='http://www.w3.org/2000/svg',xlink='http://www.w3.org/1999/xlink';
+  const selector='.card,.sidebar,.topbar,.chat-side,.chat-main,.chat-composer,.field,.feature,.stat,.btn:not(.primary),.pill';
+  const mainSelector='.main';
+  let enabled=false,engine='off',image=null,source=null,imageSrc='',blobUrl='',status='off',generation=0,frame=0,listening=false,targetsDirty=true,sequence=0,request=null;
+  // WebKit（Safari/iOS）沿用原有语义：控制器负责写 fallback 状态。
+  // Chromium 上只负责 GPU 画布，失败要无声退回它原本的 CSS 折射路径，
+  // 不能写 liquid-glass-fallback，否则会把可用的 filter:url() 折射降级成纯模糊。
+  const webkitTarget=liquidGlassWebKitTarget();
+  let targets=[],gpu=null,gpuReason='',movingUntil=0,lastJsMs=0,animationTracking=false,coverViewport=null,drawerTransition=false,drawerRect=null;
+  const surfaces=new Map();
+  // 记录上一次观察到的抽屉开合状态，用于判断 drawer class 变化是否真的翻转。
+  let wasDrawerOpen=document.body.classList.contains('nav-open')||document.body.classList.contains('drawer-intent-open');
+  const resizeObserver=window.ResizeObserver?new ResizeObserver(()=>schedule()):null;
+  // 自己插入/移除的装饰 SVG 不应触发整页重新扫描。
+  const mutationObserver=new MutationObserver(records=>{
+    let changed=false;
+    for(const record of records){
+      if(record.type==='attributes'&&record.attributeName==='class'){
+        const drawerOpen=document.body.classList.contains('nav-open')||document.body.classList.contains('drawer-intent-open');
+        drawerTransition=true;
+        movingUntil=performance.now()+360;
+        animationTracking=true;
+        // 必须用**实时**矩形，不能预置成「已完全打开」的矩形。
+        // 以前这里写的是 {x:0,w:r.width}：抽屉还停在屏幕外时，主内容玻璃就被
+        // 按最终宽度裁掉了一条，而抽屉本体还没滑到那儿 —— 那一帧看起来
+        // 就是凭空出现的一块玻璃框（iOS 上尤其明显）。
+        // 实时矩形在动画第一帧就等于关闭位置，随滑动逐帧收回，不会留下空隙。
+        if(drawerOpen){
+          const sidebar=document.querySelector('.sidebar'),r=sidebar?.getBoundingClientRect();
+          if(r)drawerRect={x:r.x,y:r.y,w:r.width,h:r.height};
+        }
+        // 抽屉开合会改变 targets 的过滤条件（侧栏进出），必须重新扫描，
+        // 否则关闭后侧栏永远不会被加回玻璃目标。
+        // 注意：这个 observer 挂的是 document.body 的 subtree + class 过滤，
+        // 页面里任何元素换 class（导航高亮、开关切换）都会走到这里。
+        // 只有抽屉状态真的翻转时才重扫，否则每次点击都全量 querySelectorAll，
+        // 翻页动画会明显掉帧。
+        if(drawerOpen!==wasDrawerOpen){targetsDirty=true;wasDrawerOpen=drawerOpen}
+        changed=true;continue
+      }
+      if(record.addedNodes.length||record.removedNodes.length){
+        const relevant=[...record.addedNodes,...record.removedNodes].some(n=>!(n instanceof Element&&n.matches('.glass-lens-layer')));
+        if(relevant){targetsDirty=true;changed=true}
+      }
+    }
+    if(changed)schedule();
+  });
+  function syncState(){
+    const ready=enabled&&status==='ready';
+    // webkit-liquid-glass 只服务 WebKit 的回退样式（把模糊挪到元素本体），
+    // 对 Chromium 是错误分支，会丢折射，所以只在 WebKit 上置位。
+    root.classList.toggle('webkit-liquid-glass',enabled&&webkitTarget);
+    // ios-liquid-glass 收窄为「WebKit 的 SVG 克隆层就绪」，Chromium 永不置位。
+    root.classList.toggle('ios-liquid-glass',ready&&webkitTarget&&engine==='svg');
+    root.classList.toggle('gpu-liquid-glass',ready&&!!gpu);
+    root.dataset.liquidGlassEngine=engine;
+    root.classList.toggle('drawer-transition',drawerTransition);
+    root.style.setProperty('--drawer-open',document.body.classList.contains('nav-open')?'1':'0');
+    // 状态归属：只有 WebKit 由本控制器写 fallback 与状态字符串；
+    // Chromium 的 CSS 折射与 GPU 成败无关，写了只会造成误降级。
+    if(enabled&&webkitTarget){
+      root.classList.toggle('liquid-glass-fallback',!ready);
+      root.dataset.liquidGlassState=ready?(gpu?'gpu-wallpaper-refraction':'svg-wallpaper-refraction'):'fallback-'+status;
+    }
+  }
+  function schedule(){
+    if(!enabled||status!=='ready'||frame)return;
+    frame=requestAnimationFrame(()=>{frame=0;update()});
+  }
+  function onScroll(){movingUntil=performance.now()+220;schedule()}
+  function onVisible(){if(document.visibilityState==='visible'){targetsDirty=true;schedule()}}
+  function onMotion(event){
+    if(event.target instanceof Element&&event.target.matches(selector+',.page-anim,.chatroom')){
+      // 翻页动画持续 0.82s，延迟最长 0.61s，总共约 1.43s。
+      // 动画期间必须持续更新玻璃位置，否则模糊区域会停留在初始位置。
+      movingUntil=performance.now()+(event.type==='animationstart'?1500:220);
+      schedule();
+    }
+  }
+  const motionEvents=['animationstart','animationend','animationcancel','transitionrun','transitionstart','transitionend','transitioncancel'];
+  function listen(on){
+    if(on===listening)return;
+    listening=on;
+    if(on){
+      document.addEventListener('scroll',onScroll,{passive:true,capture:true});
+      document.addEventListener('touchmove',onScroll,{passive:true,capture:true});
+      document.addEventListener('touchend',onScroll,{passive:true,capture:true});
+      window.addEventListener('resize',schedule,{passive:true});
+      window.visualViewport?.addEventListener('resize',schedule,{passive:true});
+      window.visualViewport?.addEventListener('scroll',schedule,{passive:true});
+      // 切回前台时 rAF 曾被节流，画布可能停在旧状态，补一次重绘。
+      document.addEventListener('visibilitychange',onVisible,false);
+      motionEvents.forEach(type=>document.addEventListener(type,onMotion,true));
+      mutationObserver.observe(document.body,{attributes:true,attributeFilter:['class'],childList:true,subtree:true});
+      targetsDirty=true;
+    }else{
+      document.removeEventListener('scroll',onScroll,true);
+      document.removeEventListener('touchmove',onScroll,true);
+      document.removeEventListener('touchend',onScroll,true);
+      window.removeEventListener('resize',schedule);
+      window.visualViewport?.removeEventListener('resize',schedule);
+      window.visualViewport?.removeEventListener('scroll',schedule);
+      document.removeEventListener('visibilitychange',onVisible,false);
+      motionEvents.forEach(type=>document.removeEventListener(type,onMotion,true));
+      mutationObserver.disconnect();resizeObserver?.disconnect();
+    }
+  }
+  function removeSurface(node,surface){node.classList.remove('glass-lens-surface');surface.svg.remove();surfaces.delete(node)}
+  function clear(){
+    if(frame)cancelAnimationFrame(frame);
+    frame=0;movingUntil=0;listen(false);
+    surfaces.forEach((surface,node)=>removeSurface(node,surface));targets=[];
+    if(gpu)gpu.dispose();gpu=null;gpuReason='';
+    root.classList.remove('gpu-liquid-glass');
+    if(request)request.abort();request=null;
+    if(blobUrl)URL.revokeObjectURL(blobUrl);blobUrl='';imageSrc='';coverViewport=null;animationTracking=false;
+  }
+  // 元素级滤镜是模板的克隆体，强度改了要逐个同步，否则只有模板变了、
+  // 页面上实际使用的克隆还是旧 scale（iPhone 上就会看到和卡片不一致）。
+  function applyFilterScale(filter,soft){
+    const r=glassRefraction();
+    // 和 build() 用同一套收敛曲线，保证模板与克隆体强度一致。
+    const base=Math.min(120,(r<=10?r:10+Math.sqrt(r-10)*3)*8);
+    filter.querySelectorAll('feDisplacementMap').forEach((n,i)=>{
+      const scale=soft?Math.max(1,base*0.3-i*base*0.025):base*(i===0?1.1:i===2?.9:1);
+      n.setAttribute('scale',String(scale));
+    });
+  }
+  function makeSurface(node){
+    const svg=document.createElementNS(ns,'svg'),defs=document.createElementNS(ns,'defs');
+    const soft=node.matches('.field,.feature,.stat,.btn,.pill');
+    const template=document.getElementById(soft?'xcbot-liquid-glass-soft':'xcbot-liquid-glass');
+    if(!template)return null;
+    const filter=template.cloneNode(true),id='xcbot-lens-'+(++sequence);
+    filter.id=id;filter.querySelectorAll('[id]').forEach(n=>n.removeAttribute('id'));
+    filter.setAttribute('filterUnits','userSpaceOnUse');filter.setAttribute('primitiveUnits','userSpaceOnUse');
+    filter.setAttribute('x','0');filter.setAttribute('y','0');
+    const blur=document.createElementNS(ns,'feGaussianBlur');
+    blur.setAttribute('in','SourceGraphic');blur.setAttribute('result','lens-source');
+    filter.querySelectorAll('feDisplacementMap').forEach(n=>n.setAttribute('in','lens-source'));
+    applyFilterScale(filter,soft);
+    filter.insertBefore(blur,filter.firstChild);defs.appendChild(filter);
+    const group=document.createElementNS(ns,'g'),picture=document.createElementNS(ns,'image');
+    group.setAttribute('filter','url(#'+id+')');
+    picture.setAttribute('href',imageSrc);picture.setAttributeNS(xlink,'xlink:href',imageSrc);
+    picture.setAttribute('preserveAspectRatio','none');group.appendChild(picture);
+    svg.classList.add('glass-lens-layer');svg.setAttribute('aria-hidden','true');svg.setAttribute('focusable','false');
+    svg.setAttribute('preserveAspectRatio','none');svg.append(defs,group);
+    node.insertBefore(svg,node.firstChild);node.classList.add('glass-lens-surface');
+    const surface={svg,filter,map:filter.querySelector('feImage'),blur,picture,group,soft};surfaces.set(node,surface);
+    return surface;
+  }
+  function attr(node,key,value){const next=String(value);if(node.getAttribute(key)!==next)node.setAttribute(key,next)}
+  function gpuRegions(width,height){
+    // 注意类名是 drawer-intent-open，不是 drawer-target-open（历史上写过错字，
+    // 导致抽屉打开的动画阶段 inDrawer 为 false，主内容区域没被剔除）。
+    const cache=new Map(),inDrawer=document.body.classList.contains('nav-open')||document.body.classList.contains('drawer-intent-open'),sidebar=document.querySelector('.sidebar'),sidebarBox=sidebar?.getBoundingClientRect();
+    // 每帧为每个 target 新建 MediaQueryList 是纯浪费，提到函数外只求值一次。
+    const narrow=narrowViewport();
+    // 不在滑动中更新 drawerRect：它会逐帧跟着侧栏移动，导致主内容的
+    // 玻璃裁切边界跟着侧栏跑，形成「透明层先开、侧栏跟着开」的观感。
+    // 抽屉完全打开后（drawerTransition=false）由 update() 置位即可。
+    if(!drawerTransition){
+      drawerRect=sidebarBox&&sidebarBox.width>0&&sidebarBox.right>0?{x:sidebarBox.x,y:sidebarBox.y,w:sidebarBox.width,h:sidebarBox.height}:null;
+    }
+    function box(node){
+      if(cache.has(node))return cache.get(node);
+      const r=node.getBoundingClientRect(),s=getComputedStyle(node);
+      // offsetWidth/clientWidth 为 0 时相除会得到 Infinity，||1 拦不住，
+      // 必须显式判有限，否则 rect 会变成 NaN/Infinity 被当成可见。
+      const ow=node.offsetWidth,oh=node.offsetHeight;
+      const sx=ow>0&&r.width>0?r.width/ow:1,sy=oh>0&&r.height>0?r.height/oh:1;
+      const rect=[r.left+node.clientLeft*sx,r.top+node.clientTop*sy,node.clientWidth*sx,node.clientHeight*sy];
+      const radii=['borderTopLeftRadius','borderTopRightRadius','borderBottomRightRadius','borderBottomLeftRadius'].map(key=>{
+        const raw=s[key],v=parseFloat(raw)||0;return Math.max(0,Math.min(rect[2]/2,rect[3]/2,(raw.includes('%')?v*Math.min(rect[2],rect[3])/100:v*Math.min(sx,sy))-node.clientLeft));
+      });
+      const value={rect,radii,style:s};cache.set(node,value);return value;
+    }
+    const regions=[];
+    targets.forEach((node,index)=>{
+      const own=box(node),r=own.rect,s=own.style;
+      if(!r[2]||!r[3]||!isFinite(r[0])||!isFinite(r[1])||r[0]+r[2]<=0||r[1]+r[3]<=0||r[0]>=width||r[1]>=height||s.visibility==='hidden')return;
+      // 侧栏永远不进 GPU 玻璃绘制：
+      //   · 抽屉关闭（窄屏）：它在屏幕外，画了纯属浪费；
+      //   · 抽屉打开：侧栏是浮层，滑动中原有的做法是按「最终矩形」提前画好折射，
+      //     于是滑入过程中会闪出一块固定不动的玻璃框（iOS 上尤其明显）。
+      //     抽屉本来就有一层不透明底色，不需要折射，直接跳过最干净。
+      // 宽屏下侧栏是常驻栏，照旧当成普通玻璃目标。
+      if(node.closest('.sidebar')&&(inDrawer||narrow))return;
+      if(node.matches('.card')&&r[3]>height&&node.querySelector('.field,.feature,.stat'))return;
+      const clipBox=[0,0,width,height],clips=[];
+      let fixed=s.position==='fixed';
+      for(let parent=node.parentElement;parent&&parent!==document.body;parent=parent.parentElement){
+        const b=box(parent),p=b.rect,ps=b.style;
+        if(ps.visibility==='hidden'||ps.display==='none')return;
+        // fixed 抽屉不受普通祖先的 overflow 裁剪；主布局没有变换 containing block。
+        if(!fixed){
+          const cx=/(hidden|clip|auto|scroll)/.test(ps.overflowX),cy=/(hidden|clip|auto|scroll)/.test(ps.overflowY);
+          if(cx){clipBox[0]=Math.max(clipBox[0],p[0]);clipBox[2]=Math.min(clipBox[2],p[0]+p[2])}
+          if(cy){clipBox[1]=Math.max(clipBox[1],p[1]);clipBox[3]=Math.min(clipBox[3],p[1]+p[3])}
+          if(cx&&cy)clips.push({rect:p,radii:b.radii});
+        }
+        if(ps.position==='fixed')fixed=true;
+      }
+      // 抽屉完全打开后，把被抽屉盖住的那一条裁掉，避免玻璃画到抽屉底下。
+      // 但**滑动过程中不要裁**：drawerRect 每帧跟着实时位置动，
+      // 主内容的玻璃区域会跟着抽屉一起平移，形成一条"清晰/模糊"的竖直边界
+      // 跟着侧栏跑 —— 用户看到的就是「一层透明的东西先开，侧栏跟着开」。
+      // 滑动途中裁切完全不需要：抽屉本身不透明，画在它底下看不见。
+      // 用稳定的抽屉完全打开状态（不依赖会变的 drawerTransition）。
+      if(inDrawer&&!drawerTransition&&drawerRect&&node.closest('.main')){
+        clipBox[0]=Math.max(clipBox[0],drawerRect.x+drawerRect.w);
+      }
+      if(Math.min(r[0]+r[2],clipBox[2])<=Math.max(r[0],clipBox[0])||Math.min(r[1]+r[3],clipBox[3])<=Math.max(r[1],clipBox[1]))return;
+      const order=node.closest('.sidebar')&&inDrawer?200:node.closest('.topbar')?100:0;
+      regions.push({rect:r,radii:own.radii,clipBox,clips,soft:node.matches('.field,.feature,.stat,.btn,.pill'),order,index,area:r[2]*r[3]});
+    });
+    // 小控件的折射肉眼几乎分辨不出，却和卡片一样贵。
+    // 先丢掉极小的药丸/按钮，再按尺寸上限截断，减少 draw call 和 overdraw。
+    const budgetCount=narrow?96:192;
+    const kept=regions.filter(x=>!(x.soft&&x.area<1200));
+    if(kept.length>budgetCount){
+      const byArea=kept.slice().sort((a,b)=>b.area-a.area).slice(0,budgetCount);
+      const keepSet=new Set(byArea);
+      for(let i=kept.length-1;i>=0;i--)if(!keepSet.has(kept[i]))kept.splice(i,1);
+    }
+    kept.sort((a,b)=>a.order-b.order||a.index-b.index);return kept;
+  }
+  // 在 Chromium 上 GPU 建不起来就直接放弃控制器，交还给 CSS 折射路径；
+  // WebKit 则退到每元素的 SVG 克隆层。两者都不能写 liquid-glass-fallback。
+  function abandonGpu(reason){
+    gpuReason=reason;
+    if(webkitTarget){engine='svg';return false}
+    engine='css';enabled=false;status='off';
+    generation++;image=null;source=null;blobUrl='';imageSrc='';coverViewport=null;
+    clear();
+    syncState();
+    return true;
+  }
+  function startGpu(serial){
+    // 外链不经 CORS 读像素，保留无需 canvas 读取权限的原生 SVG 后备。
+    if(!blobUrl){
+      abandonGpu('external-image');
+      return;
+    }
+    try{
+      gpu=createLiquidGlassGpu(image,()=>{
+        if(serial!==generation||!enabled)return;
+        if(gpu)gpu.dispose();gpu=null;
+        if(abandonGpu('context-lost'))return;
+        syncState();targetsDirty=true;schedule();
+      });
+    }catch(e){
+      if(abandonGpu(e.message))return;
+    }
+  }
+  function update(){
+    if(!enabled||status!=='ready'||!image)return;
+    const started=performance.now();
+    if(targetsDirty){
+      // 抽屉态的侧栏不进 targets：三条渲染路径（GPU / SVG 克隆 / CSS）
+      // 因此都不必再各自判断，也不会画出那块浮空的玻璃框。
+      const drawerNow=document.body.classList.contains('nav-open')||document.body.classList.contains('drawer-intent-open');
+      const narrowNow=narrowViewport();
+      const next=[...document.querySelectorAll(selector)].filter(node=>!(node.closest('.sidebar')&&(drawerNow||narrowNow))),retained=new Set(next);
+      // 同样先收集再删除（理由见下方 SVG 分支的同名处理）。
+      const stale=[];
+      surfaces.forEach((surface,node)=>{if(!retained.has(node)||!node.contains(surface.svg))stale.push([node,surface])});
+      stale.forEach(([node,surface])=>removeSurface(node,surface));
+      targets=next;targetsDirty=false;
+      resizeObserver?.disconnect();targets.forEach(node=>resizeObserver?.observe(node));
+    }
+    const blur=Math.max(0,parseFloat(getComputedStyle(root).getPropertyValue('--user-bg-blur'))||0);
+    // 卡片背景模糊度只影响玻璃内的采样模糊，不参与几何换算。
+    // 几何（cover / 缩放）必须和壁纸本身的模糊度一致，否则折射采到的区域
+    // 和元素底下真实的壁纸对不上，iOS 上就会看到明显错位。
+    const cardBlur=Math.max(0,parseFloat(getComputedStyle(root).getPropertyValue('--card-bg-blur'))||0);
+    // 玻璃内部采的是原始图片纹理，不经过壁纸那层 CSS blur；而 CSS 回退路径下
+    // 胶囊的 backdrop-filter 是在「已经模糊过的背景」上再叠一层卡片模糊。
+    // 两条路径要对齐，采样模糊就必须把两者的量叠加。
+    // 这里刻意用相加而不是 hypot：hypot(40,10)=41.2，背景模糊一大，
+    // 「卡片背景模糊度」整个滑块（0-10）就只能让结果动 1.2px，肉眼看不出变化。
+    // 相加能让滑块每一档都产生可见差异，这才是用户在调这个参数时期望的反馈。
+    const sampleBlur=blur+cardBlur;
+    const viewport=window.visualViewport;
+    const width=Math.max(1,Math.round(viewport?.width||innerWidth)),height=Math.max(1,Math.round(viewport?.height||innerHeight));
+    const nextCover=Math.max((width+blur*4)/image.naturalWidth,(height+blur*4)/image.naturalHeight);
+    if(!coverViewport||Math.abs(coverViewport.width-width)>=1||Math.abs(coverViewport.height-height)>=1||Math.abs(coverViewport.blur-blur)>=.01){
+      coverViewport={width,height,blur,scale:nextCover};
+    }
+    const scale=coverViewport.scale;
+    const imageW=image.naturalWidth*scale,imageH=image.naturalHeight*scale;
+    const baseX=(width-imageW)/2,baseY=(height-imageH)/2;
+    if(gpu){
+      const color=getComputedStyle(document.body).backgroundColor;
+      const theme=getComputedStyle(root).getPropertyValue('--bg0').trim();
+      let base=[1,1,1];
+      if(/^#[0-9a-f]{6}$/i.test(theme))base=[1,3,5].map(i=>parseInt(theme.slice(i,i+2),16)/255);
+      else if(/^#[0-9a-f]{3}$/i.test(theme))base=[1,2,3].map(i=>parseInt(theme[i]+theme[i],16)/255);
+      else{const components=(color.match(/[\d.]+/g)||[]).slice(0,3).map(Number);if(components.length===3)base=components.map(x=>x/255)}
+      gpu.draw(gpuRegions(width,height),{width,height,cover:[baseX,baseY,imageW,imageH],blur:sampleBlur,base,animating:animationTracking});
+    }else{
+    // SVG 后备路径，滤镜以面板 padding box 定域而不是整张壁纸的包围盒。
+    const drawerOpen=document.body.classList.contains('nav-open')||document.body.classList.contains('drawer-intent-open');
+    const narrowNow=narrowViewport();
+    // 与 GPU 路径一致：抽屉状态下侧栏不参与折射（见 gpuRegions 的说明）。
+    // 已经有克隆层的要顺手摘掉，否则跳过之后旧的 SVG 会留在 DOM 里继续显示。
+    // 先收集再删除：在 forEach 里直接 delete 会改动正在迭代的 Map，
+    // 后续条目可能被跳过，旧的克隆层就留在 DOM 上继续显示。
+    if(drawerOpen||narrowNow){
+      const stale=[];
+      surfaces.forEach((surface,node)=>{if(node.closest('.sidebar'))stale.push([node,surface])});
+      stale.forEach(([node,surface])=>removeSurface(node,surface));
+    }
+    const measurements=targets.map(node=>{
+      const r=node.getBoundingClientRect();
+      if(!r.width||!r.height||r.bottom<0||r.right<0||r.top>height||r.left>width)return null;
+      if(node.closest('.sidebar')&&(drawerOpen||narrowNow))return null;
+      const sx=r.width/node.offsetWidth||1,sy=r.height/node.offsetHeight||1;
+      return {node,w:node.clientWidth,h:node.clientHeight,x:(baseX-r.left)/sx-node.clientLeft,y:(baseY-r.top)/sy-node.clientTop,iw:imageW/sx,ih:imageH/sy,scrollX:node.scrollLeft,scrollY:node.scrollTop};
+    }).filter(Boolean);
+    measurements.forEach(({node,w,h,x,y,iw,ih,scrollX,scrollY})=>{
+      const s=surfaces.get(node)||makeSurface(node);if(!s)return;
+      attr(s.svg,'width',w);attr(s.svg,'height',h);attr(s.svg,'viewBox',`0 0 ${w} ${h}`);
+      attr(s.filter,'width',w);attr(s.filter,'height',h);attr(s.map,'width',w);attr(s.map,'height',h);
+      attr(s.blur,'stdDeviation',sampleBlur);
+      applyFilterScale(s.filter,s.soft);
+      attr(s.picture,'width',iw.toFixed(3));attr(s.picture,'height',ih.toFixed(3));attr(s.picture,'x',x.toFixed(3));attr(s.picture,'y',y.toFixed(3));
+      if(s.svg.style.left!==scrollX+'px')s.svg.style.left=scrollX+'px';
+      if(s.svg.style.top!==scrollY+'px')s.svg.style.top=scrollY+'px';
+    });
+    }
+    lastJsMs=Number((performance.now()-started).toFixed(2));
+    const running=!!document.getAnimations?.().some(a=>a.playState==='running'&&a.effect?.target?.matches?.(selector+',.page-anim,.chatroom,.sidebar'));
+    const wasTracking=animationTracking;
+    animationTracking=running||performance.now()<movingUntil;
+    if(!animationTracking){
+      drawerTransition=false;
+      // 动画结束时把 drawerRect 刷到最终位置，避免下一帧裁切用滑动途中的旧矩形。
+      if(document.body.classList.contains('nav-open')){
+        const sb=document.querySelector('.sidebar'),r=sb?.getBoundingClientRect();
+        drawerRect=r&&r.width>0?{x:r.x,y:r.y,w:r.width,h:r.height}:null;
+      }else{
+        drawerRect=null;
+      }
+    }
+    // 动画刚结束的那一帧必须再画一次：上面的 region 是**这次**调用用的，
+    // 而动画最后一帧的 transform 已经到位。少了这一次重绘，画布会停在
+    // 倒数第二帧的位置，卡片却已经落位 —— 视觉上就是刷新后卡片"跳一下"。
+    if(animationTracking||wasTracking)schedule();
+  }
+  function imageFailed(reason='image-error'){
+    if(blobUrl)URL.revokeObjectURL(blobUrl);
+    blobUrl='';image=null;imageSrc='';status=reason;
+    // Chromium 没有 SVG 克隆层可退，直接交还给 CSS 折射路径。
+    if(!webkitTarget){
+      engine='css';enabled=false;status='off';generation++;source=null;
+      clear();syncState();return;
+    }
+    syncState();
+  }
+  async function load(url,serial){
+    let src=url;
+    try{
+      if(new URL(url,location.href).origin===location.origin){
+        request=new AbortController();
+        const response=await fetch(url,{signal:request.signal,cache:'no-cache'});
+        if(!response.ok)throw new Error('http-'+response.status);
+        const blob=await response.blob();
+        if(serial!==generation||!enabled)return;
+        if(!blob.type.startsWith('image/'))throw new Error('image-type');
+        blobUrl=URL.createObjectURL(blob);src=blobUrl;
+      }
+      if(serial!==generation||!enabled)return;
+      const next=new Image();
+      next.onload=()=>{
+        if(serial!==generation||!enabled)return;
+        if(!next.naturalWidth||!next.naturalHeight){imageFailed();return}
+        image=next;imageSrc=src;status='ready';startGpu(serial);syncState();listen(true);schedule();
+      };
+      next.onerror=()=>{if(serial===generation&&enabled)imageFailed()};
+      next.src=src;
+    }catch(e){
+      if(serial!==generation||!enabled)return;
+      imageFailed(/^http-\d{3}$|^image-type$/.test(e.message)?e.message:'image-error');
+    }
+  }
+  return {setEnabled(value,url,svgReady){
+    const plan=liquidGlassRenderPlan(!!value,url,svgReady);
+    engine=plan.engine;
+    // off / css：控制器完全惰性，不加载图片、不建 surface。
+    // css 是 Chromium 的原生回退路径，由 CSS 自己完成，这里绝不能插手。
+    if(engine==='off'||engine==='css'){
+      const wasActive=enabled;
+      enabled=false;status='off';drawerTransition=false;drawerRect=null;
+      if(wasActive||gpu||surfaces.size||image){generation++;image=null;source=null;clear()}
+      syncState();
+      return;
+    }
+    enabled=true;
+    // GPU 不需要 SVG 位移贴图；svg 引擎才需要 svgReady。
+    const nextSource=engine==='gpu'?(url||''):(svgReady&&url?url:'');
+    if(source===nextSource){syncState();schedule();return}
+    source=nextSource;image=null;const serial=++generation;clear();
+    // svg 引擎沿用原有判定顺序：先看 SVG 位移贴图是否就绪，再看有没有壁纸。
+    // GPU 不需要贴图，只看壁纸。
+    status=engine==='svg'?(!svgReady?'no-map':!nextSource?'no-wallpaper':'loading'):(!nextSource?'no-wallpaper':'loading');
+    syncState();
+    if(nextSource)load(nextSource,serial);
+  },refresh(){schedule()},diagnostics(){return {engine,renderer:gpu?'fixed-webgl-v2':(engine==='css'?'css-backdrop':'native-svg-fallback-v2'),status,imageSize:image?[image.naturalWidth,image.naturalHeight]:null,layers:gpu?1:surfaces.size,sourceType:blobUrl?'same-origin-blob':imageSrc?'external-image':'none',drawerOpen:document.body.classList.contains('nav-open'),animationTracking,cover:coverViewport?{width:coverViewport.width,height:coverViewport.height,blur:coverViewport.blur}:null,gpu:gpu?gpu.diagnostics():null,gpuFallbackReason:gpuReason||null,lastUpdateJsMs:lastJsMs}}};
+})();
+function applyWebuiAppearance(){const v=state.bundle?.form_values||{},root=document.documentElement;const preset=String(v['WebUI.theme_preset']||'aurora');root.dataset.webuiPreset=preset;const liquid=!!v['WebUI.liquid_glass'];const disableBgBlur=liquid&&!!v['WebUI.disable_background_blur'];const blur=disableBgBlur?0:Math.max(0,Math.min(40,Number(v['WebUI.background_blur']||0)));root.style.setProperty('--user-bg-blur',blur+'px');
+    // 区分「键不存在」（bundle 还没加载完/部分刷新）与「键存在但为空」（用户主动清除）。
+    // 前者绝不能动 has-bg 与 --user-bg-image，否则切页时背景会被莫名摘掉、整片变白。
+    // 键不存在时 bgUrl 也不能给空——liquidGlassLensController.setEnabled 拿到空会重置
+    // 玻璃引擎状态。从 computed style 取回当前的 --user-bg-image 沿用。
+    const bgImageKnown=Object.prototype.hasOwnProperty.call(v,'WebUI.background_image');
+    const img=bgImageKnown?String(v['WebUI.background_image']||'').trim():'';
+    let bgUrl=img?(/^https?:\/\//i.test(img)?img:'/api/webui/background?token='+encodeURIComponent(token()||'')+'&v='+encodeURIComponent(img)):'';
+    if(bgImageKnown){
+      root.style.setProperty('--user-bg-image',bgUrl?'url("'+bgUrl.replace(/"/g,'%22')+'")':'none');
+      root.classList.toggle('has-bg',!!img);
+    }else{
+      // 沿用现有 --user-bg-image（形如 url("...") 或 none），剥掉引号供玻璃引擎用
+      const cur=(getComputedStyle(root).getPropertyValue('--user-bg-image')||'').trim();
+      const m=/^url\(["']?(.*?)["']?\)$/.exec(cur);
+      bgUrl=m?m[1]:'';
+    }
+    const refractionRaw=v['WebUI.liquid_glass_refraction'];
+    // 用 ?? 而不是 ||：滑块拖到 0 是有效值，不能被当成「未设置」回退成 5。
+    const liquidGlassRefraction=Math.max(0,Math.min(30,Number(refractionRaw??5)));root.style.setProperty('--liquid-glass-refraction',String(liquidGlassRefraction));const cardBgBlur=Math.max(0,Math.min(10,Number(v['WebUI.card_background_blur']??2)));root.style.setProperty('--card-bg-blur',cardBgBlur+'px');root.classList.toggle('liquid-glass',liquid);const svgReady=liquidGlassController.setEnabled(liquid);liquidGlassLensController.setEnabled(liquid,bgUrl,svgReady);if(liquid){liquidGlassController.syncRefraction();liquidGlassLensController.refresh()}
+    // 键不存在时不要写登录缓存：会把本还有的 src/bg 一并清掉，下次进登录页就没背景。
+    if(bgImageKnown)cacheAppearanceForLogin(preset,blur,img,bgUrl)}
+function showLiquidGlassStatus(){
+  document.getElementById('glassStatusDialog')?.remove();
+  const root=document.documentElement,sample=document.querySelector('.glass-gpu-layer')||document.querySelector('.glass-lens-surface>.glass-lens-layer');
+  const versions={};
+  document.querySelectorAll('script[src],link[rel="stylesheet"]').forEach(node=>{
+    const u=new URL(node.src||node.href,location.href),name=u.pathname.split('/').pop();
+    if(!['app.js','app.css'].includes(name))return;
+    const v=u.searchParams.get('v')||'';versions[name]=/^[a-zA-Z0-9_.-]{1,80}$/.test(v)?v:'无版本号';
+  });
+  const report={...liquidGlassLensController.diagnostics(),
+    mode:root.dataset.liquidGlassState||'unknown',cssRenderer:getComputedStyle(root).getPropertyValue('--glass-renderer-css').trim()||'旧样式/未加载',
+    enabled:root.classList.contains('liquid-glass'),webkitTarget:liquidGlassWebKitTarget(),wallpaperConfigured:root.classList.contains('has-bg'),
+    resources:versions,viewport:[innerWidth,innerHeight,devicePixelRatio],
+    sample:sample?{size:[sample.getAttribute('width'),sample.getAttribute('height')],filter:sample.querySelector('g')?.getAttribute('filter'),position:getComputedStyle(sample).position,zIndex:getComputedStyle(sample).zIndex}:null,
+    browser:navigator.userAgent.slice(0,300)};
+  const overlay=document.createElement('div');overlay.id='glassStatusDialog';overlay.className='glass-status-overlay';
+  const panel=document.createElement('section');panel.className='glass-status-panel';panel.setAttribute('role','dialog');panel.setAttribute('aria-modal','true');panel.setAttribute('aria-label','液态玻璃状态');
+  const title=document.createElement('h3');title.textContent='液态玻璃状态';
+  const note=document.createElement('p');note.textContent='ready 表示绘制已就绪，不代表真机流畅度已确认。JsMs 是主线程提交耗时，不是 GPU 耗时或帧率。可复制此信息，不含访问 Token。';
+  const text=document.createElement('textarea');text.readOnly=true;text.setAttribute('aria-label','玻璃诊断信息');text.value=JSON.stringify(report,null,2);
+  const copy=document.createElement('button');copy.type='button';copy.textContent='选中诊断信息';copy.onclick=()=>{text.focus();text.select();text.setSelectionRange(0,text.value.length)};
+  const close=document.createElement('button');close.type='button';close.textContent='关闭';close.onclick=()=>overlay.remove();
+  overlay.onclick=e=>{if(e.target===overlay)overlay.remove()};overlay.onkeydown=e=>{if(e.key==='Escape')overlay.remove()};
+  panel.append(title,note,text,copy,close);overlay.appendChild(panel);document.body.appendChild(overlay);close.focus();
+}
 // 把外观缓存下来给登录页用。登录页没有 Token，取不了任何接口，所以不能让它去
 // 请求配置或背景图——那需要开一个匿名可访问的出口，登录前多一个数据面。
 // 换成在这里（已登录、已鉴权）把结果存进 localStorage，登录页只读本地缓存。
@@ -130,7 +929,55 @@ function shrinkBackgroundForLogin(url){
 function toggleTheme(){setTheme((document.documentElement.dataset.theme||'light')==='dark'?'light':'dark')}
 // 移动端抽屉导航：窄屏下侧栏浮在内容之上，靠 body.nav-open 控制
 function isMobileNav(){return window.matchMedia('(max-width:980px)').matches}
-function setMobileNav(open){const b=document.body;if(!b)return;b.classList.toggle('nav-open',!!open);const t=el('navToggle');if(t)t.setAttribute('aria-expanded',open?'true':'false')}
+function setMobileNav(open){
+  const b=document.body;if(!b)return;
+  clearTimeout(b._drawerTransitionTimer);
+  const root=document.documentElement,sidebar=document.querySelector('.sidebar'),scrim=el('navScrim');
+
+  // 宽屏没有抽屉。但 gotoPage() 每次点菜单都会无条件调 closeMobileNav()，
+  // 以前这里不分屏幕就往下跑，等于给常驻侧栏硬刷了一层不透明底色
+  // （浅色 rgba(255,255,255,.68)、深色 rgba(6,18,28,.72)），
+  // 于是 PC 端点菜单的瞬间整条侧栏变白，320ms 后才被移除——
+  // 和液态玻璃、壁纸都无关。宽屏直接清干净并返回。
+  if(!isMobileNav()){
+    b.classList.remove('drawer-transition','drawer-intent-open','nav-open');
+    root.classList.remove('drawer-transition');
+    if(sidebar){
+      sidebar.style.removeProperty('background');
+      sidebar.style.removeProperty('backdrop-filter');
+      sidebar.style.removeProperty('-webkit-backdrop-filter');
+    }
+    if(scrim){scrim.style.opacity='';scrim.style.pointerEvents=''}
+    return;
+  }
+
+  b.classList.add('drawer-transition');
+  executeSwitch();
+
+  function executeSwitch(){
+    // iOS 首帧不能等 CSS 级联：先写底色和遮罩，再切类
+    if(sidebar){
+      const light=root.dataset.theme==='light';
+      sidebar.style.setProperty('background',light?'rgba(255,255,255,.68)':'rgba(6,18,28,.72)','important');
+      sidebar.style.setProperty('backdrop-filter','none','important');
+      sidebar.style.setProperty('-webkit-backdrop-filter','none','important');
+    }
+    if(scrim){scrim.style.opacity=open?'1':'0';scrim.style.pointerEvents=open?'auto':'none'}
+    b.classList.toggle('drawer-intent-open',!!open);
+    b.classList.toggle('nav-open',!!open);
+    const t=el('navToggle');if(t)t.setAttribute('aria-expanded',open?'true':'false');
+    b._drawerTransitionTimer=setTimeout(()=>{
+      b.classList.remove('drawer-transition');
+      root.classList.remove('drawer-transition');
+      if(sidebar&&!b.classList.contains('nav-open')){
+        sidebar.style.removeProperty('background');sidebar.style.removeProperty('backdrop-filter');
+        sidebar.style.removeProperty('-webkit-backdrop-filter');sidebar.style.removeProperty('contain');
+        sidebar.style.removeProperty('will-change');
+      }
+      liquidGlassLensController.refresh();
+    },320);
+  }
+}
 function toggleMobileNav(){setMobileNav(!document.body.classList.contains('nav-open'))}
 function closeMobileNav(){setMobileNav(false)}
 function gotoPage(k,section=''){closeMobileNav();if(state.dirty){const m=el('leaveModal');if(m){m.style.display='flex';m._pending={k,section};return}}if(state.bundle&&!isValidPage(k))k='welcome';syncCurrentPageFieldsFromDom();if(k==='chatroom'){chatState._enterBottom=true}window.__pageSwitched=true;state._navigating=true;state.dirty=false;state.lastInputAt=0;clearDraft();updateRoute(k,section);render();const live=['welcome','logs','stats','debug','chatroom','store'].includes(k);Promise.resolve(live?refreshAll(true):null).finally(()=>{state._navigating=false});if(k==='store')loadStore();if(k==='knowledge')loadKnowledge();if(k==='trace'&&!traceState.openId)traceLoad()}
@@ -138,7 +985,7 @@ function leaveCancel(){const m=el('leaveModal');if(m){m.style.display='none';m._
 function leaveConfirm(){const m=el('leaveModal');if(!m)return;const p=m._pending;m.style.display='none';m._pending=null;state.dirty=false;traceDiscardPending();if(p)gotoPage(p.k||p.page,p.section||'')}
 function renderNav(){const nav=el('nav');if(!nav)return;if(!el('navIndicator')){nav.innerHTML=`<div class="custom-nav">`+pages().map(p=>{let iconHtml='';if(p.icon&&p.icon.includes('<svg'))iconHtml=p.icon;else if(p.icon)iconHtml=p.icon;else iconHtml='•';return `<div class="custom-nav-item" data-key="${p.key}" onclick="gotoPage('${p.key}')"><div class="custom-nav-icon">${iconHtml}</div><div class="custom-nav-label">${esc(p.title)}</div></div>`}).join('')+`<div class="active-indicator-floater" id="navIndicator"></div><div class="nav-bg-floater" id="navBg"></div></div>`;}nav.querySelectorAll('.custom-nav-item').forEach(item=>{item.classList.toggle('active',item.dataset.key===state.current);});}
 const updateNavIndicator=()=>{const nav=el('nav'),items=nav?nav.querySelectorAll('.custom-nav-item'):[],floater=el('navIndicator'),floaterBg=el('navBg');if(!floater||!nav)return;const host=nav.querySelector('.custom-nav')||nav;let activeEl=null;for(let i=0;i<items.length;i++){if(items[i].classList.contains('active')){activeEl=items[i];break}}if(activeEl){const hostTop=host.getBoundingClientRect().top;const itemTop=activeEl.getBoundingClientRect().top;const top=itemTop-hostTop+host.scrollTop;floater.style.opacity='1';floater.style.top=(top+10)+'px';floater.style.height=Math.max(0,activeEl.offsetHeight-20)+'px';if(floaterBg){floaterBg.style.opacity='1';floaterBg.style.top=top+'px';floaterBg.style.height=activeEl.offsetHeight+'px'}}else{floater.style.opacity='0';if(floaterBg)floaterBg.style.opacity='0'}};
-function renderConnectionStatus(){const s=state.bundle?.status||{},cs=s.connection_status||{},cfg=s.connection||{};const statusEl=el('connectionStatus'),detailEl=el('connectionDetail');if(statusEl){const text=cs.text||'未知状态';statusEl.textContent=text;statusEl.className='pill '+((cs.state==='connected')?'ok':(cs.state==='failed'||cs.state==='disconnected'||cs.state==='stopped')?'bad':'')}if(detailEl){const lines=[];if(cs.detail)lines.push(cs.detail);const endpoint=[cfg.protocol,cfg.host&&cfg.port?`${cfg.host}:${cfg.port}`:''].filter(Boolean).join(' · ');if(endpoint)lines.push(endpoint);detailEl.textContent=lines.join(' | ')||'暂无连接详情'}}
+function renderConnectionStatus(){const s=state.bundle?.status||{},cs=s.connection_status||{},cfg=s.connection||{};const statusEl=el('connectionStatus'),detailEl=el('connectionDetail');if(statusEl){const text=cs.text||'未知状态';statusEl.textContent=text;statusEl.className='pill '+((cs.state==='connected')?'ok':(cs.state==='failed'||cs.state==='disconnected'||cs.state==='stopped')?'bad':'')}if(detailEl){const lines=[];if(cs.detail)lines.push(cs.detail);const endpoint=[cfg.host&&cfg.port?`${cfg.host}:${cfg.port}`:''].filter(Boolean).join(' · ');if(endpoint)lines.push(endpoint);detailEl.textContent=lines.join(' | ')||'暂无连接详情'}}
 function render(){if(!state.bundle)return;applyWebuiAppearance();applyRoute();const isSwitch=state._lastPage!==state.current;state._lastPage=state.current;const logScroll=captureLogScrollState();renderNav();requestAnimationFrame(updateNavIndicator);renderConnectionStatus();const ub=el('pluginUploadBtn');if(ub)ub.style.display=state.current==='store'?'':'none';const m=meta(),titleEl=el('pageTitle'),descEl=el('pageDesc'),brandEl=el('brandName'),contentEl=el('content');const isChat=state.current==='chatroom',isDebug=state.current==='debug';if(isChat&&contentEl){contentEl.classList.remove('page-anim');clearTimeout(contentEl._animTimer)}if(titleEl)titleEl.textContent=isChat?'聊天室':isDebug?'调试':m.title;if(descEl){const desc=isChat?'':isDebug?'运行资源、缓存和会话状态等可统计的全部调试信息':(Object.prototype.hasOwnProperty.call(m,'desc')?m.desc:'所有数值均可在此直接修改并保存');descEl.textContent=desc;descEl.style.display=desc?'':'none'}if(brandEl)brandEl.textContent=state.bundle.status?.project||'XcBot';if(contentEl){
   if(isSwitch&&contentEl._chatAnimRenderTimer){clearTimeout(contentEl._chatAnimRenderTimer);contentEl._chatAnimRenderTimer=null}
   // 只允许真实页面切换触发一次动画。refreshAll/chatBootstrap/hashchange 可能在同一帧内再次 render，
@@ -211,7 +1058,7 @@ function render(){if(!state.bundle)return;applyWebuiAppearance();applyRoute();co
     }
   }
 }if(isChat)afterChatroomRender();if(state.section)requestAnimationFrame(()=>scrollToRouteSection(state.section));if(state.current==='welcome'||state.current==='logs'){if(isSwitch)requestAnimationFrame(()=>{document.querySelectorAll('pre.log').forEach(x=>{x.scrollTop=x.scrollHeight})});else scheduleLogScrollAfterRender(logScroll)}}
-function renderWelcome(){const s=state.bundle.status||{},u=s.update||{},ui=s.update_install||{},cs=s.connection_status||{},cc=s.connection||{},ru=s.resource_usage||{},updateBusy=['downloading','extracting','installing','migrating','dependencies','restarting'].includes(ui.state),updatePillClass=u.status==='latest'?'ok':(u.status==='outdated'||u.status==='error'||ui.state==='error')?'bad':'';return `<div class="card"><div class="section-head"><div><h3>运行概览</h3></div><span class="pill ${cs.state==='connected'?'ok':(cs.state==='failed'||cs.state==='disconnected'||cs.state==='stopped')?'bad':''}">${esc(cs.text||'未知状态')}</span></div><div class="mini-stats"><div class="stat"><b>${esc(s.uptime_text||Math.floor((s.uptime_seconds||0)/60)+'分钟')}</b><span>运行时间</span></div><div class="stat"><b>${esc((ru.cpu_percent_normalized??ru.cpu_percent??0)+'% / '+(ru.memory_mb??0)+' MB')}</b><span>CPU/内存占用</span></div><div class="field" style="grid-column:span 2;min-height:auto;display:flex;flex-direction:column;justify-content:center"><div class="label" style="margin-bottom:6px"><span>获取更新</span><span class="pill ${updatePillClass}">${esc(ui.state&&ui.state!=='idle'?ui.text:(u.message||'暂未检查更新'))}</span></div><div class="desc" style="margin-top:0">当前 ${esc(s.version||'--')} / 最新 ${esc(u.latest_version||'--')}</div><div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px"><button class="btn" ${updateBusy?'disabled':''} onclick="checkUpdate()">检查更新</button><button class="btn primary" ${(updateBusy||!u.has_update)?'disabled':''} onclick="installUpdate()">安装更新</button></div><div class="desc">${esc(ui.detail||u.detail||u.release_name||'安装更新会自动下载、覆盖程序、迁移配置并重启。安装后需手动刷新页面。')}</div></div></div></div><div class="card half"><div class="section-head"><div><h3>详细信息</h3><p>环境与启动参数</p></div></div><div class="kv">${[['版本号',(s.project||'')+' '+(s.version||'')],['机器人名',s.bot_name],['运行目录',s.cwd],['Python',s.python],['平台',s.platform],['启动参数',JSON.stringify(s.argv||[])]].map(r=>`<div>${esc(r[0])}</div><div>${esc(r[1])}</div>`).join('')}</div></div><div class="card half"><div class="section-head"><div><h3>连接状态</h3><p>OneBot / Hyper 实时状态</p></div></div><div class="kv">${[['当前状态',cs.text||'未知状态'],['状态详情',cs.detail||'暂无'],['协议',cc.protocol||''],['连接地址',(cc.host&&cc.port)?`${cc.host}:${cc.port}`:''],['监听地址',(cc.listener_host&&cc.listener_port)?`${cc.listener_host}:${cc.listener_port}`:''],['连接模式',cc.mode||'']].map(r=>`<div>${esc(r[0])}</div><div>${esc(r[1])}</div>`).join('')}</div></div><div class="card"><div class="section-head"><div><h3>最近日志</h3></div><div style="display:flex;gap:8px;flex-wrap:wrap">${renderAutoScrollToggle()}<button class="btn" onclick="gotoPage('logs')">查看全部</button></div></div>${renderLogPre(160,'recent')}</div>`}
+function renderWelcome(){const s=state.bundle.status||{},u=s.update||{},ui=s.update_install||{},cs=s.connection_status||{},cc=s.connection||{},ru=s.resource_usage||{},updateBusy=['downloading','extracting','installing','migrating','dependencies','restarting'].includes(ui.state),updatePillClass=u.status==='latest'?'ok':(u.status==='outdated'||u.status==='error'||ui.state==='error')?'bad':'';return `<div class="card"><div class="section-head"><div><h3>运行概览</h3></div><span class="pill ${cs.state==='connected'?'ok':(cs.state==='failed'||cs.state==='disconnected'||cs.state==='stopped')?'bad':''}">${esc(cs.text||'未知状态')}</span></div><div class="mini-stats"><div class="stat"><b>${esc(s.uptime_text||Math.floor((s.uptime_seconds||0)/60)+'分钟')}</b><span>运行时间</span></div><div class="stat"><b>${esc((ru.cpu_percent_normalized??ru.cpu_percent??0)+'% / '+(ru.memory_mb??0)+' MB')}</b><span>CPU/内存占用</span></div><div class="field" style="grid-column:span 2;min-height:auto;display:flex;flex-direction:column;justify-content:center"><div class="label" style="margin-bottom:6px"><span>获取更新</span><span class="pill ${updatePillClass}">${esc(ui.state&&ui.state!=='idle'?ui.text:(u.message||'暂未检查更新'))}</span></div><div class="desc" style="margin-top:0">当前 ${esc(s.version||'--')} / 最新 ${esc(u.latest_version||'--')}</div><div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px"><button class="btn" ${updateBusy?'disabled':''} onclick="checkUpdate()">检查更新</button><button class="btn primary" ${(updateBusy||!u.has_update)?'disabled':''} onclick="installUpdate()">安装更新</button></div><div class="desc">${esc(ui.detail||u.detail||u.release_name||'安装更新会自动下载、覆盖程序、迁移配置并重启。安装后需手动刷新页面。')}</div></div></div></div><div class="card half"><div class="section-head"><div><h3>详细信息</h3><p>环境与启动参数</p></div></div><div class="kv">${[['版本号',(s.project||'')+' '+(s.version||'')],['机器人名',s.bot_name],['运行目录',s.cwd],['Python',s.python],['平台',s.platform],['启动参数',JSON.stringify(s.argv||[])]].map(r=>`<div>${esc(r[0])}</div><div>${esc(r[1])}</div>`).join('')}</div></div><div class="card half"><div class="section-head"><div><h3>连接状态</h3><p>OneBot / Hyper 实时状态</p></div></div><div class="kv">${[['当前状态',cs.text||'未知状态'],['状态详情',cs.detail||'暂无'],['连接地址',(cc.host&&cc.port)?`${cc.host}:${cc.port}`:''],['监听地址',(cc.listener_host&&cc.listener_port)?`${cc.listener_host}:${cc.listener_port}`:''],['连接模式',cc.mode||'']].map(r=>`<div>${esc(r[0])}</div><div>${esc(r[1])}</div>`).join('')}</div></div><div class="card"><div class="section-head"><div><h3>最近日志</h3></div><div style="display:flex;gap:8px;flex-wrap:wrap">${renderAutoScrollToggle()}<button class="btn" onclick="gotoPage('logs')">查看全部</button></div></div>${renderLogPre(160,'recent')}</div>`}
 function chartBars(items,max=0,unit='',color='linear-gradient(135deg,var(--accent),var(--accent2))'){const arr=Array.isArray(items)?items:[];const peak=max||Math.max(1,...arr.map(x=>Number(x.value)||0));return `<div style="display:grid;gap:10px">${arr.length?arr.map(x=>`<div><div style="display:flex;justify-content:space-between;gap:12px;margin-bottom:6px"><span style="font-weight:800">${esc(x.label||x.model||x.session||'-')}</span><span class="pill">${esc((x.value??x.tokens??0)+unit)}</span></div><div style="height:12px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden"><div style="height:100%;width:${Math.max(4,Math.round(((Number(x.value??x.tokens)||0)/peak)*100))}%;background:${color};border-radius:999px"></div></div></div>`).join(''):`<div class="desc">暂无数据</div>`}</div>`}
 function chartLine(items,unit=''){const arr=Array.isArray(items)?items:[];if(!arr.length)return '<div class="desc">暂无数据</div>';const values=arr.map(x=>Number(x.value)||0),peak=Math.max(1,...values),width=640,height=170,padX=16,padTop=16,padBottom=28,innerW=width-padX*2,innerH=height-padTop-padBottom;const points=arr.map((x,i)=>{const px=padX+(arr.length===1?innerW/2:(i/(arr.length-1))*innerW);const py=padTop+innerH-(Math.min(Number(x.value)||0,peak)/peak)*innerH;return {x:px,y:py,label:String(x.label||''),value:Number(x.value)||0}});const line=points.map((p,i)=>`${i?'L':'M'}${p.x.toFixed(2)} ${p.y.toFixed(2)}`).join(' ');const area=`M${points[0].x.toFixed(2)} ${height-padBottom} `+points.map((p,i)=>`${i?'L':'M'}${p.x.toFixed(2)} ${p.y.toFixed(2)}`).join(' ')+` L${points[points.length-1].x.toFixed(2)} ${height-padBottom} Z`;const guides=[0,.25,.5,.75,1].map(r=>{const y=(padTop+innerH-(innerH*r)).toFixed(2);return `<line x1="${padX}" y1="${y}" x2="${width-padX}" y2="${y}" stroke="rgba(255,255,255,.08)" stroke-width="1"/>`}).join('');const markers=points.map(p=>`<circle cx="${p.x.toFixed(2)}" cy="${p.y.toFixed(2)}" r="3.5" fill="var(--accent)" stroke="rgba(255,255,255,.9)" stroke-width="1.2"><title>${esc(p.label)}：${esc(p.value+unit)}</title></circle>`).join('');const labels=points.filter((_,i)=>arr.length<=8||i===0||i===arr.length-1||i%Math.ceil(arr.length/6)===0).map(p=>`<div style="font-size:11px;color:var(--muted);min-width:0;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.label)}</div>`).join('');return `<div style="display:grid;gap:10px"><div style="border:1px solid var(--line2);border-radius:18px;padding:12px;background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.025))"><svg viewBox="0 0 ${width} ${height}" width="100%" height="170" preserveAspectRatio="none" role="img" aria-label="趋势图">${guides}<path d="${area}" fill="rgba(56,213,255,.12)"></path><path d="${line}" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></path>${markers}</svg><div style="display:grid;grid-template-columns:repeat(${Math.max(2,Math.min(points.filter((_,i)=>arr.length<=8||i===0||i===arr.length-1||i%Math.ceil(arr.length/6)===0).length,6))},minmax(0,1fr));gap:8px;margin-top:8px">${labels}</div></div><div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">${[arr[0],arr[arr.length-1],arr.reduce((a,b)=>Number(a.value)>=Number(b.value)?a:b)].map((x,i)=>`<span class="pill">${esc((i===0?'起点':i===1?'终点':'峰值')+'：'+(x.label||'-')+' '+(x.value||0)+unit)}</span>`).join('')}</div></div>`}
 function donutSegments(items){const arr=(Array.isArray(items)?items:[]).filter(x=>Number(x.value)>0);if(!arr.length)return '<div class="desc">暂无数据</div>';const total=arr.reduce((s,x)=>s+(Number(x.value)||0),0)||1;let acc=0;const colors=['var(--accent)','var(--accent3,#a78bfa)','var(--accent2)','#fb7185','#f59e0b','#60a5fa'];const stops=[];arr.forEach((x,i)=>{const start=Math.round(acc/total*360);acc+=Number(x.value)||0;const end=Math.round(acc/total*360);stops.push(`${colors[i%colors.length]} ${start}deg ${end}deg`)});return `<div class="donut-layout"><div class="donut-chart" style="--donut-gradient:conic-gradient(${stops.join(',')})"><div class="donut-center"><div><strong>${total}</strong><span>消息总量</span></div></div></div><div style="display:grid;gap:10px">${arr.map((x,i)=>{const pct=Math.round((Number(x.value)||0)/total*100);return `<div style="display:grid;gap:6px"><div style="display:flex;justify-content:space-between;gap:12px;align-items:center"><div style="display:flex;align-items:center;gap:10px"><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${colors[i%colors.length]}"></span><span>${esc(x.label)}</span></div><span class="pill">${esc(x.value)} · ${pct}%</span></div><div style="height:8px;border-radius:999px;background:var(--line);overflow:hidden"><div style="height:100%;width:${Math.max(2,pct)}%;background:${colors[i%colors.length]};border-radius:999px"></div></div></div>`}).join('')}</div></div>`}
@@ -240,7 +1087,7 @@ function renderDebug(){
   const fs=rt.feature_switches;if(fs&&Object.keys(fs).length){const on=Object.keys(fs).filter(k=>fs[k]),off=Object.keys(fs).filter(k=>!fs[k]);html+=`<div class="card half"><div class="section-head"><div><h3>功能热开关</h3><p>开 ${on.length} / 关 ${off.length}</p></div></div><div style="display:flex;flex-wrap:wrap;gap:6px">${on.map(k=>`<span class="pill" style="border-color:rgba(66,230,164,.45)">${esc(k)}</span>`).join('')}${off.map(k=>`<span class="pill" style="opacity:.55">${esc(k)}:关</span>`).join('')}</div></div>`}
   const pl=rt.plugins;if(pl){html+=`<div class="card half"><div class="section-head"><div><h3>插件</h3><p>已加载 ${pl.loaded} ｜ 禁用 ${pl.disabled} ｜ 失败 ${pl.failed}</p></div></div>${(pl.loaded_names&&pl.loaded_names.length)?`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${pl.loaded_names.map(n=>`<span class="pill">${esc(n)}</span>`).join('')}</div>`:'<div class="desc">无已加载插件</div>'}${(pl.disabled_names&&pl.disabled_names.length)?`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${pl.disabled_names.map(n=>`<span class="pill" style="opacity:.6">禁用:${esc(n)}</span>`).join('')}</div>`:''}${(pl.failed_names&&pl.failed_names.length)?`<div style="display:flex;flex-wrap:wrap;gap:6px">${pl.failed_names.map(n=>`<span class="pill" style="border-color:rgba(255,120,120,.4)">失败:${esc(n)}</span>`).join('')}</div>`:''}</div>`}
   const pm=rt.permissions;if(pm){html+=`<div class="card half"><div class="section-head"><div><h3>权限 / 名单</h3></div></div>${dbgKV([['管理员数',pm.admin],['黑名单数',pm.blacklist],['管理员预览',(pm.admin_preview||[]).join(', ')||'--'],['黑名单预览',(pm.blacklist_preview||[]).join(', ')||'--']])}</div>`}
-  const cs=rt.connection_snapshot;if(cs){html+=`<div class="card half"><div class="section-head"><div><h3>连接快照</h3><p>${rt.hot_switch?'⚠️ 热切换进行中':'稳定'} ｜ WebUI: ${esc(connStateMap[conn.state]||conn.state||'--')}${conn.detail?' · '+esc(conn.detail):''}</p></div></div>${dbgKV([['协议',cs.protocol],['模式',cs.mode],['主机',(cs.host||'')+':'+(cs.port||'')],['监听',(cs.listener_host||'')+':'+(cs.listener_port||'')],['重试',cs.retries]])}</div>`}
+  const cs=rt.connection_snapshot;if(cs){html+=`<div class="card half"><div class="section-head"><div><h3>连接快照</h3><p>${rt.hot_switch?'⚠️ 热切换进行中':'稳定'} ｜ WebUI: ${esc(connStateMap[conn.state]||conn.state||'--')}${conn.detail?' · '+esc(conn.detail):''}</p></div></div>${dbgKV([['模式',cs.mode],['主机',(cs.host||'')+':'+(cs.port||'')],['监听',(cs.listener_host||'')+':'+(cs.listener_port||'')],['重试',cs.retries]])}</div>`}
   const cm=rt.cmc;if(cm){const comp=cm.compression||{};html+=`<div class="card half"><div class="section-head"><div><h3>上下文管理器</h3><p>当前内存中加载的会话</p></div></div>${dbgKV([['群上下文',cm.group_contexts],['私聊上下文',cm.private_contexts],['加载消息总数',cm.loaded_messages],['OpenAI客户端池',cm.client_pool],['压缩-会话数',comp.total_sessions],['压缩-总次数',comp.total_compressions],['压缩阈值',comp.threshold],['保留最近',comp.keep_recent],['压缩客户端池',comp.client_pool]])}</div>`}
   const topCtx=cm?.top_contexts||[];if(topCtx.length){html+=`<div class="card"><div class="section-head"><div><h3>活跃上下文 Top</h3><p>按消息数排序</p></div></div><div style="display:grid;gap:10px">${topCtx.map(c=>`<div class="field" style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap"><b>${esc(c.kind)}:${esc(c.id)}</b><span class="pill">${esc(c.messages)} 条</span><span class="pill">${esc(c.tokens)} tokens</span><span class="pill">${esc(c.calls)} 次调用</span></div>`).join('')}</div></div>`}
   const topTok=ts.top_sessions||[];if(topTok.length){html+=`<div class="card half"><div class="section-head"><div><h3>Token Top 会话</h3></div></div><div style="display:grid;gap:8px">${topTok.map(s=>`<div class="field" style="display:flex;justify-content:space-between;gap:10px"><b>${esc(s.session)}</b><span class="pill">${esc(s.tokens)} tokens</span></div>`).join('')}</div></div>`}
@@ -413,7 +1260,7 @@ function renderTraceDetail(){
       ?(f.injected_after_tool?`已注入（挂在 ${esc(f.injected_after_tool)} 结果后）`:'已注入（追加一轮对话）')
       :'未送达（循环已结束）';
     return `<div class="field" style="border-color:${cls};margin-bottom:10px">
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><b>💬 用户插话</b><span class="pill" style="border-color:${cls}">${tag}</span>${f.time?`<span class="pill">${esc(traceTs(f.time))}</span>`:''}</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><b>💬 用户插话</b><span class="pill" style="border-color:${cls}">${tag}</span>${f.images?`<span class="pill" style="border-color:rgba(120,180,255,.55)">图 ${esc(f.images)}</span>`:''}${f.time?`<span class="pill">${esc(traceTs(f.time))}</span>`:''}</div>
       <div style="display:grid;gap:6px;margin-top:6px">${f.texts.map((t,i)=>`<div class="trace-text" style="max-height:120px">${f.texts.length>1?`${i+1}. `:''}${esc(t)}</div>`).join('')}</div>
     </div>`}).join('');
   const TC_STATUS={ok:['成功','rgba(66,230,164,.45)'],error:['失败','rgba(255,120,120,.5)'],
@@ -583,13 +1430,27 @@ if(v['Others.active_personality_preset']===id)setValue('Others.active_personalit
 if(v['Others.private_personality_preset']===id)setValue('Others.private_personality_preset','');
 if(v['Others.group_personality_preset']===id)setValue('Others.group_personality_preset','');
 setPersonaPresets(next);forceRender()}
-function renderForm(m){const v=state.bundle.form_values||{};return `<div class="card" id="section_${esc(m.key||'config')}"><div class="section-head"><div><h3>${esc(m.title)}</h3><p>${esc(m.desc)}</p></div></div><div class="form-grid">${(m.fields||[]).map(f=>renderField(f,v[f.path])).join('')}</div></div>`}
+function renderForm(m){const v=state.bundle.form_values||{};const fields=m.fields||[];const byCat={},order=[];fields.forEach(f=>{const cat=f.category||'基础';if(!byCat[cat]){byCat[cat]=[];order.push(cat)}byCat[cat].push(f)});if(order.length<=1){return `<div class="card" id="section_${esc(m.key||'config')}"><div class="section-head"><div><h3>${esc(m.title)}</h3><p>${esc(m.desc)}</p></div></div><div class="form-grid">${fields.map(f=>renderField(f,v[f.path])).join('')}</div></div>`}return order.map((cat,i)=>{const sid=i===0?(m.key||'config'):('cfg_'+cat).replace(/[^a-zA-Z0-9_-]/g,'_');return `<div class="card" id="section_${esc(sid)}"><div class="section-head"><div><h3>${esc(i===0?m.title:cat)}</h3><p>${esc(i===0?m.desc:cat+'相关设置')}</p></div></div><div class="form-grid">${byCat[cat].map(f=>renderField(f,v[f.path])).join('')}</div></div>`}).join('')}
 function scrollToRouteSection(section){const safe=String(section||'').replace(/[^a-zA-Z0-9_-]/g,'_');const target=document.getElementById('section_'+safe)||document.querySelector(`[data-section="${CSS.escape(String(section||''))}"]`);if(target)target.scrollIntoView({block:'start',behavior:'smooth'})}
 function enabledEmbeddingProviders(){return providers().filter(p=>p.id&&Array.isArray(p.embedding_models)&&p.embedding_models.some(m=>m.enabled!==false&&m.name))}
 function renderEmbeddingProviderSelect(path,value,id){const items=enabledEmbeddingProviders();return `<select id="${id}" onchange="setValue('${path}',this.value);forceRender()"><option value="">请选择</option>${items.map(p=>`<option value="${esc(p.id)}" ${String(p.id)===String(value)?'selected':''}>${esc(p.id)}</option>`).join('')}</select>`}
 function enabledEmbeddingModels(){const out=[];enabledEmbeddingProviders().forEach(p=>(p.embedding_models||[]).forEach(m=>{if(m.enabled!==false&&m.name)out.push({provider_id:p.id,model:m.name,label:providerModelLabel(p.id,m.name)})}));return out}
 function renderEmbeddingModelRefSelect(path,value,id){const items=enabledEmbeddingModels();return `<select id="${id}" onchange="setValue('${path}',this.value)"><option value="">请选择向量模型</option>${items.map(m=>`<option value="${esc(m.label)}" ${String(m.label)===String(value)?'selected':''}>${esc(m.label)}</option>`).join('')}</select>`}
-function renderField(f,v,compact=false){const id='f_'+f.path.replace(/[^a-zA-Z0-9]/g,'_');let input='';if(f.type==='bool')input=`<div class="switch ${v?'on':''}" onclick="setBool('${f.path}',this)"></div>`;else if(f.type==='select')input=`<select id="${id}" onchange="setValue('${f.path}',this.value)">${(f.options||[]).map(o=>`<option value="${esc(o)}" ${String(o)===String(v)?'selected':''}>${esc(o)}</option>`).join('')}</select>`;else if(f.type==='multimodal_model')input=renderMultimodalModelSelect(f.path,v,id);else if(f.type==='embedding_model_ref')input=renderEmbeddingModelRefSelect(f.path,v,id);else if(f.type==='background_image')input=renderBackgroundImageField(f.path,v,id);else if(f.type==='list')input=`<textarea ${compact?'style="min-height:84px"':''} id="${id}" oninput="setValue('${f.path}',this.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean))">${esc(Array.isArray(v)?v.join('\n'):(v??''))}</textarea>`;else if(f.type==='textarea')input=`<textarea ${compact?'style="min-height:84px"':'style="min-height:280px"'} id="${id}" oninput="setValue('${f.path}',this.value)">${esc(v??'')}</textarea>`;else if(f.type==='endpoints')input=renderEndpointsEditor(v||[]);else{input=`<input id="${id}" type="${f.type==='password'?'password':f.type==='number'?'number':'text'}" step="any" ${f.min!=null?`min="${f.min}"`:''} ${f.max!=null?`max="${f.max}"`:''} value="${esc(v??'')}" oninput="setValue('${f.path}',${f.type==='number'?'num(this.value)':'this.value'})">`;if(f.type==='password')input=`<div class="pwd-wrap">${input}<button class="pwd-eye" type="button" title="显示" aria-label="显示或隐藏内容" onclick="togglePwdField('${id}',this)">${SVG_EYE}</button></div>`}return `<div class="field"><div class="label"><span>${esc(f.label)}</span>${f.type==='bool'?input:''}</div>${f.type==='bool'?'':input}<div class="desc">${esc(f.desc||f.path)}</div></div>`}
+// 数值滑块：拖动时实时预览，右侧显示当前值。
+// 用 input 事件而不是 change，拖到什么程度就看到什么效果。
+function renderRangeField(f,v,id){
+  const min=f.min??0,max=f.max??100,step=f.step??1;
+  const raw=v===undefined||v===null||v===''?f.default:Number(v);
+  const val=Number.isFinite(raw)?Math.max(min,Math.min(max,raw)):(f.default??min);
+  return `<div class="range-wrap"><input id="${id}" type="range" min="${min}" max="${max}" step="${step}" value="${val}" oninput="setRangeValue('${f.path}',this)"><output class="range-val" for="${id}">${val}</output></div>`;
+}
+function setRangeValue(path,input){
+  const value=Number(input.value);
+  const out=input.parentElement?.querySelector('.range-val');
+  if(out)out.textContent=String(value);
+  setValue(path,value);
+}
+function renderField(f,v,compact=false){const id='f_'+f.path.replace(/[^a-zA-Z0-9]/g,'_');let input='';if(f.type==='bool')input=`<div class="switch ${v?'on':''}" onclick="setBool('${f.path}',this)"></div>`;else if(f.type==='select')input=`<select id="${id}" onchange="setValue('${f.path}',this.value)">${(f.options||[]).map(o=>`<option value="${esc(o)}" ${String(o)===String(v)?'selected':''}>${esc(o)}</option>`).join('')}</select>`;else if(f.type==='multimodal_model')input=renderMultimodalModelSelect(f.path,v,id);else if(f.type==='embedding_model_ref')input=renderEmbeddingModelRefSelect(f.path,v,id);else if(f.type==='background_image')input=renderBackgroundImageField(f.path,v,id);else if(f.type==='list')input=`<textarea ${compact?'style="min-height:84px"':''} id="${id}" oninput="setValue('${f.path}',this.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean))">${esc(Array.isArray(v)?v.join('\n'):(v??''))}</textarea>`;else if(f.type==='textarea')input=`<textarea ${compact?'style="min-height:84px"':'style="min-height:280px"'} id="${id}" oninput="setValue('${f.path}',this.value)">${esc(v??'')}</textarea>`;else if(f.type==='endpoints')input=renderEndpointsEditor(v||[]);else if(f.type==='range')input=renderRangeField(f,v,id);else{input=`<input id="${id}" type="${f.type==='password'?'password':f.type==='number'?'number':'text'}" step="any" ${f.min!=null?`min="${f.min}"`:''} ${f.max!=null?`max="${f.max}"`:''} value="${esc(v??'')}" oninput="setValue('${f.path}',${f.type==='number'?'num(this.value)':'this.value'})">`;if(f.type==='password')input=`<div class="pwd-wrap">${input}<button class="pwd-eye" type="button" title="显示" aria-label="显示或隐藏内容" onclick="togglePwdField('${id}',this)">${SVG_EYE}</button></div>`}return `<div class="field"><div class="label"><span>${esc(f.label)}</span>${f.type==='bool'?input:''}</div>${f.type==='bool'?'':input}<div class="desc">${esc(f.desc||f.path)}</div></div>`}
 // 密码类字段的显示/隐藏。图标用 SVG 而不是 emoji，并在 CSS 里关掉 Edge 自带的
 // ::-ms-reveal，否则输入框右侧会同时出现浏览器的眼睛和我们的眼睛。
 const SVG_EYE='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>';
@@ -597,7 +1458,12 @@ const SVG_EYE_OFF='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 function togglePwdField(id,btn){const i=el(id);if(!i)return;const show=i.type==='password';i.type=show?'text':'password';if(btn){btn.innerHTML=show?SVG_EYE_OFF:SVG_EYE;btn.title=show?'隐藏':'显示'}}
 const num=v=>{const n=Number(v);return Number.isFinite(n)?n:v};
 function setValue(path,value){state.bundle.form_values[path]=value;if(path==='manage_users'){state.bundle.manage_users=Array.isArray(value)?value:[];state.bundle.super_users=Array.isArray(value)?value:[]}if(path==='black_list'){state.bundle.blacklist_file=Array.isArray(value)?value:[]}if(path.startsWith('WebUI.'))applyWebuiAppearance();state.dirty=true;state.lastInputAt=Date.now();const save=el('saveState');if(save)save.textContent='有未保存更改'}
-function syncCurrentPageFieldsFromDom(){if(!state.bundle)return;if(state.current==='providers')syncProviderFieldsFromDom();const page=meta();const values=state.bundle.form_values||{};(page.fields||[]).forEach(f=>{const id='f_'+f.path.replace(/[^a-zA-Z0-9]/g,'_');if(f.type==='bool'){return}if(f.type==='endpoints'){const arr=Array.isArray(values[f.path])?[...values[f.path]]:[];values[f.path]=arr.map((ep,i)=>{const base=document.getElementById('ep_base_'+i),model=document.getElementById('ep_model_'+i),keys=document.getElementById('ep_keys_'+i),mm=document.getElementById('ep_mm_'+i);return {base_url:base?base.value:(ep.base_url||''),model:model?model.value:(ep.model||''),supports_multimodal:mm?!!mm.checked:!!ep.supports_multimodal,keys:(keys?keys.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean):(Array.isArray(ep.keys)?ep.keys:[]))}});return}const el=document.getElementById(id);if(!el)return;if(f.type==='list')values[f.path]=el.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);else if(f.type==='textarea'||f.type==='text'||f.type==='password'||f.type==='select'||f.type==='multimodal_model'||f.type==='embedding_model_ref')values[f.path]=el.value;else if(f.type==='number')values[f.path]=num(el.value)});state.bundle.form_values=values;const manageUsers=values.manage_users;if(Array.isArray(manageUsers)){state.bundle.manage_users=manageUsers;state.bundle.super_users=manageUsers}const blackList=values.black_list;if(Array.isArray(blackList)){state.bundle.blacklist_file=blackList}}
+function syncCurrentPageFieldsFromDom(){if(!state.bundle)return;if(state.current==='providers')syncProviderFieldsFromDom();const page=meta();const values=state.bundle.form_values||{};(page.fields||[]).forEach(f=>{const id='f_'+f.path.replace(/[^a-zA-Z0-9]/g,'_');if(f.type==='bool'){return}
+    // background_image 没有可同步的文本 input——renderBackgroundImageField 只画按钮和
+    // 隐藏 file input，这里的同步逻辑把它当普通字段处理的话，会把 form_values 里的
+    // 路径改写成空串，下帧 applyWebuiAppearance 就把 has-bg 摘了，背景整片变白。
+    if(f.type==='background_image'){return}
+    if(f.type==='endpoints'){const arr=Array.isArray(values[f.path])?[...values[f.path]]:[];values[f.path]=arr.map((ep,i)=>{const base=document.getElementById('ep_base_'+i),model=document.getElementById('ep_model_'+i),keys=document.getElementById('ep_keys_'+i),mm=document.getElementById('ep_mm_'+i);return {base_url:base?base.value:(ep.base_url||''),model:model?model.value:(ep.model||''),supports_multimodal:mm?!!mm.checked:!!ep.supports_multimodal,keys:(keys?keys.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean):(Array.isArray(ep.keys)?ep.keys:[]))}});return}const el=document.getElementById(id);if(!el)return;if(f.type==='list')values[f.path]=el.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);else if(f.type==='textarea'||f.type==='text'||f.type==='password'||f.type==='select'||f.type==='multimodal_model'||f.type==='embedding_model_ref')values[f.path]=el.value;else if(f.type==='number')values[f.path]=num(el.value)});state.bundle.form_values=values;const manageUsers=values.manage_users;if(Array.isArray(manageUsers)){state.bundle.manage_users=manageUsers;state.bundle.super_users=manageUsers}const blackList=values.black_list;if(Array.isArray(blackList)){state.bundle.blacklist_file=blackList}}
 function setJsonValue(path,txt){try{setValue(path,JSON.parse(txt||'null'))}catch(e){state.dirty=true;const save=el('saveState');if(save)save.textContent='JSON 暂未通过校验'}}
 function setBool(path,el){const v=!el.classList.contains('on');el.classList.toggle('on',v);setValue(path,v)}
 function shouldAutoRefreshPage(){return state.current==='welcome'||state.current==='logs'||state.current==='stats'||state.current==='debug'||(state.current==='trace'&&!traceState.openId)}
@@ -720,7 +1586,7 @@ async function saveAll(silent=false){if(!state.bundle||state.saving)return;state
 function isEditingField(){const el=document.activeElement;return !!(el&&['INPUT','TEXTAREA','SELECT'].includes(el.tagName))}
 function shouldPauseAutoRefresh(){if(shouldAutoRefreshPage())return !!isEditingField();return !!(state.dirty||isEditingField()||(Date.now()-(state.lastInputAt||0)<15000))}
 async function refreshAll(force=false){if(!force&&!shouldAutoRefreshPage())return;if(shouldPauseAutoRefresh()&&!force)return;try{const uiPath=state.current==='logs'?'/api/ui-state?log_limit=1000':'/api/ui-state';const data=await api(uiPath);state.apiFailCount=0;if(shouldPauseAutoRefresh()&&!force)return;applyDraft(data);state.bundle=data;const installState=data?.status?.update_install?.state||'';if(['restarting','idle'].includes(installState)&&state.expectedReloadAfterUpdate){scheduleReloadAfterUpdate()}if(state.current==='chatroom'&&!force){applyWebuiAppearance();renderConnectionStatus()}else render();const save=el('saveState');if(save&&!state.dirty)save.textContent='已同步 '+new Date().toLocaleTimeString()}catch(e){state.apiFailCount=(state.apiFailCount||0)+1;if(state.expectedReloadAfterUpdate&&state.apiFailCount>=2)scheduleReloadAfterUpdate();if(!state.expectedReloadAfterUpdate)toast(e.message,false)}}
-let chatState={sessions:[],current:null,session:null,models:[],loading:false,stream:localStorage.webuiChatStream!=='0',requests:Object.create(null),errors:Object.create(null),attachments:Object.create(null),drafts:Object.create(null),reasonOpen:Object.create(null)};
+let chatState={sessions:[],current:null,session:null,models:[],personas:[],loading:false,stream:localStorage.webuiChatStream!=='0',requests:Object.create(null),errors:Object.create(null),attachments:Object.create(null),drafts:Object.create(null),reasonOpen:Object.create(null)};
 // 思维链折叠状态的 key 用「会话id:消息稳定标识」。不能用数组下标：
 // 服务端从消息数组头部裁剪旧消息、progress 消息也会插进来，下标会整体平移，
 // 旧 key 就错位到别的消息上了。这里优先用 ts+request_id 组合，实在没有才退回下标。
@@ -733,8 +1599,9 @@ const chatRequest=(id=chatState.current)=>id?chatState.requests[id]||null:null;
 const chatAttachments=(id=chatState.current)=>id?(chatState.attachments[id]||(chatState.attachments[id]=[])):[];
 function chatRememberDraft(value){if(chatState.current)chatState.drafts[chatState.current]=String(value||'')}
 async function chatApi(path,opt={}){opt.headers=Object.assign({'Content-Type':'application/json','X-WebUI-Token':token()},opt.headers||{});const r=await fetch(path,opt),j=await r.json().catch(()=>({ok:false,error:'请求失败'}));if(r.status===401){localStorage.removeItem('webuiToken');location.href='/auth/login';throw new Error('请先登录')}if(!j.ok)throw new Error(j.error||'请求失败');return j.data??j}
-function renderChatroom(){const req=chatRequest(),ownSending=!!req,error=chatState.errors[chatState.current]||'',errorHtml=error?`<div class="desc" style="margin-bottom:12px;color:var(--red,#f87171);white-space:pre-wrap">${esc(error)}</div>`:'';return `${errorHtml}<div class="chatroom"><div class="chat-side"><button class="btn primary" onclick="chatNew()">＋ 新建会话</button><div class="sess-list" id="sessList">${renderSessList()}</div></div><div class="chat-main"><div class="chat-head"><select id="chatModel" onchange="chatPickModel(this.value)">${renderModelOptions()}</select><span class="pill" style="margin-left:auto">${chatState.session?esc(chatState.session.title||'新会话'):'未选择会话'}</span></div><div class="chat-msgs" id="chatMsgs">${renderChatMsgs()}</div><div class="chat-composer"><input id="chatFileInput" type="file" multiple accept="image/*,.txt,.md,.json,.csv,.log,.py,.js,.ts,.html,.css" style="display:none" onchange="chatPickFiles(this.files);this.value=''">${renderChatFiles()}<div class="chat-input"><button class="chat-icon" title="上传文件/图片" onclick="el('chatFileInput')?.click()">＋</button><textarea id="chatInput" placeholder=" " oninput="chatRememberDraft(this.value);chatAutoGrow(this)" onpaste="chatPaste(event)" onkeydown="chatInputKey(event)" ${chatState.session?'':'disabled'}>${esc(chatState.drafts[chatState.current]||'')}</textarea><button class="chat-icon ${chatState.stream?'on':''}" title="${chatState.stream?'流式输出已开启':'流式输出已关闭'}" onclick="chatToggleStream()">~</button><button class="btn primary chat-send ${ownSending?'stop':''}" id="chatSendBtn" onclick="${ownSending?'chatStop()':'chatSend()'}" ${chatState.session?'':'disabled'} title="${ownSending?'停止':'发送'}">${ownSending?'■':'↑'}</button></div></div></div></div>`}
+function renderChatroom(){const req=chatRequest(),ownSending=!!req,error=chatState.errors[chatState.current]||'',errorHtml=error?`<div class="desc" style="margin-bottom:12px;color:var(--red,#f87171);white-space:pre-wrap">${esc(error)}</div>`:'';return `${errorHtml}<div class="chatroom"><div class="chat-side"><button class="btn primary" onclick="chatNew()">＋ 新建会话</button><div class="sess-list" id="sessList">${renderSessList()}</div></div><div class="chat-main"><div class="chat-head"><select id="chatModel" onchange="chatPickModel(this.value)">${renderModelOptions()}</select><select id="chatPersona" onchange="chatPickPersona(this.value)" ${chatState.session?'':'disabled'} title="切换人格：下一条消息起用新人格，历史对话保留">${renderPersonaOptions()}</select><span class="pill" style="margin-left:auto">${chatState.session?esc(chatState.session.title||'新会话'):'未选择会话'}</span></div><div class="chat-msgs" id="chatMsgs">${renderChatMsgs()}</div><div class="chat-composer"><input id="chatFileInput" type="file" multiple accept="image/*,.txt,.md,.json,.csv,.log,.py,.js,.ts,.html,.css" style="display:none" onchange="chatPickFiles(this.files);this.value=''">${renderChatFiles()}<div class="chat-input"><button class="chat-icon" title="上传文件/图片" onclick="el('chatFileInput')?.click()">＋</button><textarea id="chatInput" placeholder=" " oninput="chatRememberDraft(this.value);chatAutoGrow(this)" onpaste="chatPaste(event)" onkeydown="chatInputKey(event)" ${chatState.session?'':'disabled'}>${esc(chatState.drafts[chatState.current]||'')}</textarea><button class="chat-icon ${chatState.stream?'on':''}" title="${chatState.stream?'流式输出已开启':'流式输出已关闭'}" onclick="chatToggleStream()">~</button><button class="btn primary chat-send ${ownSending?'stop':''}" id="chatSendBtn" onclick="${ownSending?'chatStop()':'chatSend()'}" ${chatState.session?'':'disabled'} title="${ownSending?'停止':'发送'}">${ownSending?'■':'↑'}</button></div></div></div></div>`}
 function renderModelOptions(){const ms=chatState.models||[];if(!ms.length)return '<option value="">未配置模型</option>';const cur=chatState.session?.model||ms[0].model;return ms.map(m=>`<option value="${esc(m.model)}" ${m.model===cur?'selected':''}>${esc(m.model)}${m.supports_multimodal?' 👁':''}${m.in_rotation===false?' ·未轮换':''}</option>`).join('')}
+function renderPersonaOptions(){const ps=chatState.personas||[];const list=ps.length?ps:[{id:'',name:'跟随默认人格'}];const cur=String(chatState.session?.persona||'');return list.map(p=>`<option value="${esc(p.id)}" ${String(p.id)===cur?'selected':''}>${esc(p.name)}</option>`).join('')}
 function renderSessList(){const ss=chatState.sessions||[];if(!ss.length)return '<div class="desc" style="padding:8px">暂无会话，点击上方新建</div>';return ss.map(s=>{const busy=!!chatRequest(s.id);return `<div class="sess-item ${s.id===chatState.current?'active':''}" onclick="chatOpen('${s.id}')"><div class="t">${esc(s.title||'新会话')} ${busy?'<span class="pill">生成中</span>':''}</div><div class="m">${esc(s.model||'-')} · ${s.message_count||0} 次</div>${s.id===chatState.current?`<div class="sess-actions"><button class="btn" onclick="event.stopPropagation();chatRename('${s.id}')">重命名</button><button class="btn" onclick="event.stopPropagation();chatDelete('${s.id}')" ${busy?'disabled':''}>删除</button></div>`:''}</div>`}).join('')}
 function copyMdCode(btn){const code=btn.closest('.md-code')?.querySelector('code')?.innerText||'';navigator.clipboard?.writeText(code).then(()=>{const old=btn.textContent;btn.textContent='已复制';setTimeout(()=>btn.textContent=old,900)}).catch(()=>toast('复制失败',false))}
 function mdInline(t){return esc(t).replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noreferrer">$1</a>').replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/`([^`]+)`/g,'<code>$1</code>')}
@@ -742,19 +1609,23 @@ function mdCells(line){let x=line.trim();if(x.startsWith('|'))x=x.slice(1);if(x.
 function isMdTableSep(line){return /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line||'')}
 function chatMarkdown(s){s=String(s||'').replace(/\r\n/g,'\n');const lines=s.split('\n'),out=[];let i=0;function para(buf){if(buf.length)out.push('<p>'+mdInline(buf.join(' ').trim())+'</p>')}while(i<lines.length){let line=lines[i];if(!line.trim()){i++;continue}if(/^```/.test(line.trim())){const lang=line.trim().replace(/^```/,'').trim()||'code',buf=[];i++;while(i<lines.length&&!/^```/.test(lines[i].trim()))buf.push(lines[i++]);if(i<lines.length)i++;out.push(`<div class="md-code"><div class="md-code-head"><span>${esc(lang)}</span><button class="md-copy" onclick="copyMdCode(this)">复制</button></div><pre><code>${esc(buf.join('\n'))}</code></pre></div>`);continue}if(line.includes('|')&&lines[i+1]&&isMdTableSep(lines[i+1])){const heads=mdCells(line),rows=[];i+=2;while(i<lines.length&&lines[i].includes('|')&&lines[i].trim()){rows.push(mdCells(lines[i++]));}out.push(`<div class="md-table-wrap"><table><thead><tr>${heads.map(h=>`<th>${mdInline(h)}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${heads.map((_,idx)=>`<td>${mdInline(r[idx]||'')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);continue}if(/^---+$/.test(line.trim())){out.push('<hr>');i++;continue}const hm=line.match(/^\s{0,3}(#{1,6})\s+(.+)$/);if(hm){const lv=Math.min(3,hm[1].length);out.push(`<h${lv}>${mdInline(hm[2])}</h${lv}>`);i++;continue}if(/^>\s?/.test(line)){const buf=[];while(i<lines.length&&/^>\s?/.test(lines[i]))buf.push(lines[i++].replace(/^>\s?/,''));out.push('<blockquote>'+mdInline(buf.join('\n')).replace(/\n/g,'<br>')+'</blockquote>');continue}if(/^\s*[-*+]\s+/.test(line)){const items=[];while(i<lines.length&&/^\s*[-*+]\s+/.test(lines[i]))items.push('<li>'+mdInline(lines[i++].replace(/^\s*[-*+]\s+/,''))+'</li>');out.push('<ul>'+items.join('')+'</ul>');continue}if(/^\s*\d+[.)]\s+/.test(line)){const items=[];while(i<lines.length&&/^\s*\d+[.)]\s+/.test(lines[i]))items.push('<li>'+mdInline(lines[i++].replace(/^\s*\d+[.)]\s+/,''))+'</li>');out.push('<ol>'+items.join('')+'</ol>');continue}const buf=[];while(i<lines.length&&lines[i].trim()&&!/^(\s{0,3}#{1,6})\s+/.test(lines[i])&&!/^```/.test(lines[i].trim())&&!/^---+$/.test(lines[i].trim())&&!/^>\s?/.test(lines[i])&&!/^\s*[-*+]\s+/.test(lines[i])&&!/^\s*\d+[.)]\s+/.test(lines[i])&&!(lines[i].includes('|')&&lines[i+1]&&isMdTableSep(lines[i+1])))buf.push(lines[i++]);para(buf)}return '<div class="md">'+out.join('')+'</div>'}
 function chatPlainText(s){return esc(String(s||'')).replace(/\r\n|\r|\n/g,'<br>')}
-function renderChatMsgs(){const s=chatState.session;if(!s)return '<div class="chat-empty">选择左侧会话，或新建一个开始对话吧</div>';const req=chatRequest(s.id),msgs=(s.messages||[]).filter(m=>m.role==='user'||m.role==='assistant');if(!msgs.length&&!req)return '<div class="chat-empty">发送第一条消息开始对话吧</div>';const one=(m,i)=>`<div class="msg ${m.role}"><div class="av">${m.role==='user'?'🧑':'Xc'}</div><div class="msg-body">${m.role==='assistant'?'<div class="msg-name">XcBot</div>':''}${m.role==='assistant'?renderReasonBlock(s.id,msgReasonId(m,i),m.reasoning,false):''}<div class="bubble">${m.role==='user'?chatPlainText(m.content):chatMarkdown(m.content||'')}</div></div></div>`;const waiting=req?'思考中…':'';const live=req?`<div class="msg assistant"><div class="av">Xc</div><div class="msg-body"><div class="msg-name">XcBot</div><div id="chatPartialReason">${renderReasonBlock(s.id,'live',req.reasoning,true)}</div><div class="bubble" id="chatPartial">${chatMarkdown(req.partial||waiting)}</div></div></div>`:'';return msgs.map(one).join('')+live}
+function renderChatMsgs(){const s=chatState.session;if(!s)return '<div class="chat-empty">选择左侧会话，或新建一个开始对话吧</div>';const req=chatRequest(s.id),msgs=(s.messages||[]).filter(m=>m.role==='user'||m.role==='assistant');if(!msgs.length&&!req)return '<div class="chat-empty">发送第一条消息开始对话吧</div>';const one=(m,i)=>m.error?`<div class="msg assistant"><div class="av">⚠️</div><div class="msg-body"><div class="msg-name">生成失败</div><div class="bubble" style="border-color:var(--red,#f87171);color:var(--red,#f87171);white-space:pre-wrap">${esc(m.content||'生成失败')}</div></div></div>`:`<div class="msg ${m.role}"><div class="av">${m.role==='user'?'🧑':'Xc'}</div><div class="msg-body">${m.role==='assistant'?'<div class="msg-name">XcBot</div>':''}${m.role==='assistant'?renderReasonBlock(s.id,msgReasonId(m,i),m.reasoning,false):''}<div class="bubble">${m.role==='user'?chatPlainText(m.content):chatMarkdown(m.content||'')}</div></div></div>`;const waiting=req?'思考中…':'';const live=req?`<div class="msg assistant"><div class="av">Xc</div><div class="msg-body"><div class="msg-name">XcBot</div><div id="chatPartialReason">${renderReasonBlock(s.id,'live',req.reasoning,true)}</div><div class="bubble" id="chatPartial">${chatMarkdown(req.partial||waiting)}</div></div></div>`:'';return msgs.map(one).join('')+live}
 function renderChatFiles(){const fs=chatAttachments();if(!fs.length)return '<div class="chat-files" id="chatFiles" style="display:none"></div>';return `<div class="chat-files" id="chatFiles">${fs.map((f,i)=>`<span class="chat-file" title="${esc(f.name)}">${f.type&&f.type.startsWith('image/')?'🖼':'📎'} ${esc(f.name)}<button onclick="chatRemoveFile(${i})">×</button></span>`).join('')}</div>`}
 function chatNearBottom(){const box=el('chatMsgs');return !box||(box.scrollHeight-box.scrollTop-box.clientHeight)<80}
 function chatRender(stick){const box=el('chatMsgs');chatState._stickBottom=stick??chatNearBottom();chatState._restoreScroll=(!chatState._stickBottom&&box)?box.scrollTop:null;render()}
 async function chatReloadCurrent(){const id=chatState.current;if(!id)return;try{const obj=await chatApi('/api/chat/session?id='+encodeURIComponent(id));if(chatState.current===id)chatState.session=obj}catch(e){}}
 function afterChatroomRender(){const room=document.querySelector('.chatroom');if(room)room.classList.add('ready');const box=el('chatMsgs');if(box){if(chatState._stickBottom||chatState._enterBottom){box.scrollTop=box.scrollHeight;box.scrollTo?.(0,box.scrollHeight);if(chatState._enterBottom)setTimeout(()=>{box.scrollTop=box.scrollHeight;box.scrollTo?.(0,box.scrollHeight)},80)}else if(chatState._restoreScroll!=null)box.scrollTop=chatState._restoreScroll}chatState._enterBottom=false;chatState._stickBottom=false;chatState._restoreScroll=null;if(!chatState.session&&!chatState._booting&&!chatState._creating){chatBootstrap();return}const input=el('chatInput');if(input&&!input.disabled){if(input.value!==(chatState.drafts[chatState.current]||''))input.value=chatState.drafts[chatState.current]||'';chatAutoGrow(input)}}
-async function chatBootstrap(){if(chatState._booting)return chatState._booting;chatState._booting=(async()=>{try{const[models,sessions]=await Promise.all([chatApi('/api/chat/models'),chatApi('/api/chat/sessions')]);chatState.models=Array.isArray(models)?models:[];chatState.sessions=Array.isArray(sessions)?sessions:[];if(!chatState.sessions.length){await chatCreateSession();return}const prefer=chatState.current&&chatState.sessions.some(s=>s.id===chatState.current)?chatState.current:chatState.sessions[0].id;if(!chatState.session||chatState.current!==prefer){await chatOpen(prefer);return}if(state.current==='chatroom')render()}catch(e){chatState._bootError=String(e.message||e);toast(chatState._bootError,false)}finally{chatState._loaded=true;chatState._booting=null}})();return chatState._booting}
+async function chatBootstrap(){if(chatState._booting)return chatState._booting;chatState._booting=(async()=>{try{const[models,personas,sessions]=await Promise.all([chatApi('/api/chat/models'),chatApi('/api/chat/personas').catch(()=>[]),chatApi('/api/chat/sessions')]);chatState.models=Array.isArray(models)?models:[];chatState.personas=Array.isArray(personas)?personas:[];chatState.sessions=Array.isArray(sessions)?sessions:[];if(!chatState.sessions.length){await chatCreateSession();return}const prefer=chatState.current&&chatState.sessions.some(s=>s.id===chatState.current)?chatState.current:chatState.sessions[0].id;if(!chatState.session||chatState.current!==prefer){await chatOpen(prefer);return}if(state.current==='chatroom')render()}catch(e){chatState._bootError=String(e.message||e);toast(chatState._bootError,false)}finally{chatState._loaded=true;chatState._booting=null}})();return chatState._booting}
 async function chatRefreshSessions(){try{chatState.sessions=await chatApi('/api/chat/sessions')}catch(e){}}
+// 进入聊天室时刷新模型与人格下拉：它们只在首次 bootstrap 拉一次，
+// 用户在别的页面新建/改了人格或模型后再回聊天室，不刷新就看不到新项。
+async function chatRefreshHeaderOptions(){try{const[models,personas]=await Promise.all([chatApi('/api/chat/models').catch(()=>null),chatApi('/api/chat/personas').catch(()=>null)]);let changed=false;if(Array.isArray(models)){chatState.models=models;changed=true}if(Array.isArray(personas)){chatState.personas=personas;changed=true}if(changed&&state.current==='chatroom')chatRender(false)}catch(e){}}
 async function chatOpen(id){const target=String(id||'');if(!target||target===chatState.current&&chatState.session)return;const previous={id:chatState.current,session:chatState.session};try{chatState.current=target;chatState.session=null;chatRender(true);const obj=await chatApi('/api/chat/session?id='+encodeURIComponent(target));if(chatState.current!==target)return;chatState.session=obj;if(state.current==='chatroom')chatRender(true)}catch(e){if(chatState.current===target){chatState.current=previous.id;chatState.session=previous.session;chatState.errors[target]=String(e.message||e);toast(chatState.errors[target],false);if(state.current==='chatroom')chatRender(true)}}}
 async function chatCreateSession(forceModel){if(chatState._creating)return chatState._creating;chatState._creating=(async()=>{try{if(!chatState.models.length){try{chatState.models=await chatApi('/api/chat/models')}catch(e){toast(String(e.message||e),false)}}const model=forceModel||(chatState.models[0]&&chatState.models[0].model)||'';const obj=await chatApi('/api/chat/new',{method:'POST',body:JSON.stringify({model})});chatState.current=obj.id;chatState.session=obj;chatState.attachments[obj.id]=[];chatState.drafts[obj.id]='';delete chatState.errors[obj.id];await chatRefreshSessions();if(state.current==='chatroom')chatRender(true);return obj}catch(e){toast(String(e.message||e),false);throw e}finally{chatState._creating=null}})();return chatState._creating}
 async function chatNew(){// 用户点击新建：等初始化结束后再建，避免和默认会话抢
 if(chatState._booting){try{await chatState._booting}catch(e){}}return chatCreateSession()}
 async function chatPickModel(model){if(!chatState.session)return;const id=chatState.current;if(chatRequest(id)){const sel=el('chatModel');if(sel)sel.value=chatState.session.model||'';return toast('当前会话正在生成，完成或停止后再切换模型',false)}const previous=chatState.session.model;chatState.session.model=model;try{const obj=await chatApi('/api/chat/model',{method:'POST',body:JSON.stringify({id,model})});if(chatState.current===id)chatState.session=obj;await chatRefreshSessions()}catch(e){if(chatState.current===id&&chatState.session)chatState.session.model=previous;const sel=el('chatModel');if(sel)sel.value=previous||'';toast(e.message,false)}}
+async function chatPickPersona(persona){if(!chatState.session)return;const id=chatState.current;if(chatRequest(id)){const sel=el('chatPersona');if(sel)sel.value=String(chatState.session.persona||'');return toast('当前会话正在生成，完成或停止后再切换人格',false)}const previous=String(chatState.session.persona||'');chatState.session.persona=persona;try{const obj=await chatApi('/api/chat/persona',{method:'POST',body:JSON.stringify({id,persona})});if(chatState.current===id)chatState.session=obj}catch(e){if(chatState.current===id&&chatState.session)chatState.session.persona=previous;const sel=el('chatPersona');if(sel)sel.value=previous;toast(e.message,false)}}
 function chatAutoGrow(ta){if(!ta)return;ta.style.height='0';const h=ta.scrollHeight;ta.style.height=(h<=38||!ta.value?38:Math.min(180,h))+'px'}
 function chatToggleStream(){chatState.stream=!chatState.stream;localStorage.webuiChatStream=chatState.stream?'1':'0';chatRender(false)}
 function chatInputKey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();chatSend()}}
@@ -784,7 +1655,7 @@ function renderSessListInPlace(){const list=el('sessList');if(list)list.innerHTM
 function chatUpdatePartial(sessionId,force=false){const req=chatRequest(sessionId);if(!req||chatState.current!==sessionId)return;const node=el('chatPartial');if(!node)return;if(!force){const now=Date.now();if(req.timer||now-(req.updatedAt||0)<100){if(!req.timer)req.timer=setTimeout(()=>{req.timer=null;chatUpdatePartial(sessionId,true)},100);return}}const stick=chatNearBottom();req.updatedAt=Date.now();node.innerHTML=chatMarkdown(req.partial||'思考中…');const box=el('chatMsgs');if(box&&stick)box.scrollTop=box.scrollHeight}
 // 思维链增量只重绘折叠块本身，不动整个消息列表，避免打字时页面抖动
 function chatUpdateReason(sessionId){const req=chatRequest(sessionId);if(!req||chatState.current!==sessionId)return;const node=el('chatPartialReason');if(!node){chatRender(false);return}if(req.reasonTimer||Date.now()-(req.reasonAt||0)<150){if(!req.reasonTimer)req.reasonTimer=setTimeout(()=>{req.reasonTimer=null;chatUpdateReason(sessionId)},150);return}const stick=chatNearBottom();req.reasonAt=Date.now();node.innerHTML=renderReasonBlock(sessionId,'live',req.reasoning,true);const box=el('chatMsgs');if(box&&stick)box.scrollTop=box.scrollHeight}
-async function chatSendStream(sessionId,model,text,attachments,stream,req){let completed=false;const r=await fetch('/api/chat/send-stream',{method:'POST',headers:{'Content-Type':'application/json','X-WebUI-Token':token()},signal:req.controller.signal,body:JSON.stringify({id:sessionId,model,text,attachments,stream:!!stream})});if(r.status===401){localStorage.removeItem('webuiToken');location.href='/auth/login';throw new Error('请先登录')}if(!r.ok)throw new Error('请求失败：'+r.status);const reader=r.body.getReader(),dec=new TextDecoder('utf-8');let buf='';while(true){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const chunks=buf.split('\n\n');buf=chunks.pop()||'';for(const raw of chunks){let ev='message',data='';raw.split('\n').forEach(line=>{if(line.startsWith('event:'))ev=line.slice(6).trim();else if(line.startsWith('data:'))data+=line.slice(5).trim()});if(!data)continue;const obj=JSON.parse(data);if(req.detached){if(ev==='done'||ev==='error')return;continue}if(ev==='delta'){req.partial=(req.partial||'')+(obj.text||'');chatUpdatePartial(sessionId,false)}else if(ev==='reasoning'){req.reasoning=(req.reasoning||'')+(obj.text||'');chatUpdateReason(sessionId)}else if(ev==='progress'){const progress=String(obj.text||'').trim();if(progress){req.partial='';req.reasoning='';(req.progress||(req.progress=[])).push(progress);if(chatState.current===sessionId&&chatState.session){chatState.session.messages=chatState.session.messages||[];chatState.session.messages.push({role:'assistant',content:progress});chatRender(true)}}}else if(ev==='done'){completed=true;req.session=obj.session;if(chatState.current===sessionId){chatState.session=obj.session;chatUpdatePartial(sessionId,true)}return}else if(ev==='error'){throw new Error(obj.error||'请求失败')}}}if(!completed&&!req.detached)throw new Error(req.partial?'模型连接中断，未收到完整结果':'模型连接已结束，但没有返回内容')}
+async function chatSendStream(sessionId,model,text,attachments,stream,req){let completed=false;const r=await fetch('/api/chat/send-stream',{method:'POST',headers:{'Content-Type':'application/json','X-WebUI-Token':token()},signal:req.controller.signal,body:JSON.stringify({id:sessionId,model,text,attachments,stream:!!stream})});if(r.status===401){localStorage.removeItem('webuiToken');location.href='/auth/login';throw new Error('请先登录')}if(!r.ok)throw new Error('请求失败：'+r.status);const reader=r.body.getReader(),dec=new TextDecoder('utf-8');let buf='';while(true){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const chunks=buf.split('\n\n');buf=chunks.pop()||'';for(const raw of chunks){let ev='message',data='';raw.split('\n').forEach(line=>{if(line.startsWith('event:'))ev=line.slice(6).trim();else if(line.startsWith('data:'))data+=line.slice(5).trim()});if(!data)continue;const obj=JSON.parse(data);if(req.detached){if(ev==='done'||ev==='error')return;continue}if(ev==='delta'){req.partial=(req.partial||'')+(obj.text||'');chatUpdatePartial(sessionId,false)}else if(ev==='reasoning'){req.reasoning=(req.reasoning||'')+(obj.text||'');chatUpdateReason(sessionId)}else if(ev==='progress'){const progress=String(obj.text||'').trim();if(progress){req.partial='';req.reasoning='';(req.progress||(req.progress=[])).push(progress);if(chatState.current===sessionId&&chatState.session){chatState.session.messages=chatState.session.messages||[];chatState.session.messages.push({role:'assistant',content:progress});chatRender(true)}}}else if(ev==='done'){completed=true;req.session=obj.session;if(chatState.current===sessionId){chatState.session=obj.session;chatUpdatePartial(sessionId,true)}return}else if(ev==='error'){if(obj.session){completed=true;req.session=obj.session;if(chatState.current===sessionId){chatState.session=obj.session;req.partial='';req.reasoning='';chatUpdatePartial(sessionId,true)}return}throw new Error(obj.error||'请求失败')}}}if(!completed&&!req.detached)throw new Error(req.partial?'模型连接中断，未收到完整结果':'模型连接已结束，但没有返回内容')}
 async function chatRename(id){if(chatRequest(id))return toast('该会话正在生成，完成或停止后再重命名',false);const name=prompt('输入新的会话标题');if(name==null)return;try{const obj=await chatApi('/api/chat/rename',{method:'POST',body:JSON.stringify({id,title:name})});if(chatState.current===id)chatState.session=obj;await chatRefreshSessions();render()}catch(e){toast(e.message,false)}}
 async function chatDelete(id){if(chatRequest(id))return toast('该会话正在生成，请先停止后再删除',false);if(!confirm('确定删除该会话？此操作不可恢复。'))return;try{await chatApi('/api/chat/delete',{method:'POST',body:JSON.stringify({id})});delete chatState.errors[id];delete chatState.attachments[id];delete chatState.drafts[id];if(chatState.current===id){chatState.current=null;chatState.session=null}await chatRefreshSessions();// list 接口在空目录时会自动补默认会话
 if(!chatState.sessions.length){chatState.sessions=await chatApi('/api/chat/sessions')}if(chatState.sessions.length){await chatOpen(chatState.sessions[0].id);return}if(state.current==='chatroom')render()}catch(e){toast(e.message,false)}}
@@ -806,7 +1677,7 @@ function renderAgent(){
   const groups={};metaList.forEach(x=>(groups[x.group]||(groups[x.group]=[])).push(x));
   const order=(state.bundle.agent_tool_groups||Object.keys(groups)).filter(g=>groups[g]&&groups[g].length);
   const enabled=metaList.filter(x=>tools[x.key]&&tools[x.key].enabled).length;
-  const rounds=Number(vals['Agent.max_rounds']||2);
+  const rounds=Number(vals['Agent.max_rounds']??2);
   const on=!!vals['Agent.enabled'];
   const head=`<div class="card"><div class="section-head"><div><h3>Agent 设置</h3><p>${esc(m.desc||'')}</p></div><span class="pill ${on?'ok':''}">${on?'已启用':'未启用'} · ${enabled} 个工具</span></div>`
     +`<div class="desc" style="margin-bottom:14px">已启用 ${enabled} 个工具，最大 ${rounds} 轮：单条消息最多产生 <b>${rounds+1}</b> 次模型请求。按次计费的接口请留意这个上限。</div>`

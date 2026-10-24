@@ -462,13 +462,32 @@ def get_llm_split_config() -> dict:
     }
 
 
+# llm_split 配置热路径缓存：build_final_send_parts / split_llm_reply_for_send /
+# build_llm_system_prompt 每条回复都会调一次 get_llm_split_config，而它最终走到
+# read_runtime_config() 是同步 open()+json.load()。一次 0.2ms 看起来不多，但
+# agent 循环里一轮可能走 3-4 次（父类检查、子类检查、process_and_send），叠起来
+# 是协程路径上的无谓阻塞。5 秒 TTL 足够感知配置变更（WebUI 改完用户等几秒生效），
+# 又避免了磁盘 IO 进入热路径。
+_LLM_SPLIT_CACHE: dict = {"value": None, "expires_at": 0.0}
+_LLM_SPLIT_CACHE_TTL = 5.0
+
+
+def _get_llm_split_config_cached() -> dict:
+    import time as _time
+    now = _time.monotonic()
+    if _LLM_SPLIT_CACHE["value"] is None or now >= _LLM_SPLIT_CACHE["expires_at"]:
+        _LLM_SPLIT_CACHE["value"] = get_llm_split_config()
+        _LLM_SPLIT_CACHE["expires_at"] = now + _LLM_SPLIT_CACHE_TTL
+    return _LLM_SPLIT_CACHE["value"]
+
+
 def build_llm_user_message(message: str) -> str:
     return str(message or "")
 
 
 def build_llm_system_prompt(system_prompt: str) -> str:
     prompt = str(system_prompt or "")
-    cfg = get_llm_split_config()
+    cfg = _get_llm_split_config_cached()
     if not cfg.get("enabled"):
         return prompt
     if cfg.get("mode") != "auto_prompt":
@@ -483,7 +502,7 @@ def build_llm_system_prompt(system_prompt: str) -> str:
 
 def split_llm_reply_for_send(ai_reply: str) -> list[str]:
     text = str(ai_reply or "")
-    cfg = get_llm_split_config()
+    cfg = _get_llm_split_config_cached()
     enabled = bool(cfg.get("enabled"))
     mode = cfg.get("mode", "auto_prompt")
     filter_regex = cfg.get("filter_regex", r"\n|\r")
@@ -739,13 +758,24 @@ async def convert_image_url_to_data_url(url: str) -> str:
 
 
 async def prepare_image_inputs_for_model(image_urls: list[str], supports_multimodal: bool) -> list[str]:
+    """把 URL 列表预处理成可发给模型的形式。
+
+    返回值只保留**真正转成功**的项：
+    - 多模态：能转的转 data URL，转不动的（下载失败/不是图片/超 8MB）整条丢弃。
+      不能让转失败的 http URL 混进结果——上游会把原样 URL 当外链去拉，
+      再失败一次，污染日志且让模型看到一张不存在的图。
+    - 非多模态：返回空列表，调用方走转述路径。
+    """
     urls = [str(url).strip() for url in (image_urls or []) if str(url).strip()]
     if not supports_multimodal or not urls:
         return []
 
     prepared = []
     for url in urls:
-        prepared.append(await convert_image_url_to_data_url(url))
+        converted = await convert_image_url_to_data_url(url)
+        # convert 失败时返回原始 URL；只有真的变成 data: 才算成功
+        if converted and converted.startswith("data:"):
+            prepared.append(converted)
     return prepared
 
 
@@ -775,6 +805,47 @@ def build_image_relay_prompt(user_text: str) -> str:
     )
 
 
+class _VisionRelayConfigError(Exception):
+    """转述链路自身的配置问题，不是某个 key/模型的故障。
+
+    单独一个类型是为了把它和「API 报错」区分开：前者不该记进 key 的失败次数
+    （否则会把健康的多模态模型推进冷却），后者才需要轮换。
+    """
+
+
+# context=None 时用的客户端池。插话与 read_image 拿不到会话对象，
+# 但它们跑在工具循环/消息线程里，仍然需要 OpenAI client 才能请求转述模型。
+_standalone_llm_clients: dict = {}
+_standalone_llm_lock = threading.Lock()
+
+
+def _relay_client(context, base_url, current_key, timeout_seconds, provider_proxy):
+    """取转述用的 OpenAI 客户端；context 为 None 时用模块级池。
+
+    复用会话对象的 _get_client 有个额外好处：它按 base_url+key+proxy 缓存，
+    与主对话共用连接。拿不到 context 时退化成一份独立池，语义相同。
+    """
+    if context is not None:
+        getter = getattr(context, "_get_client", None)
+        if callable(getter):
+            return getter(base_url, current_key, timeout_seconds, provider_proxy)
+    client_timeout = int(timeout_seconds or API_REQUEST_TIMEOUT_SECONDS) + 5
+    proxy = normalize_proxy_url(provider_proxy)
+    cache_key = f"{base_url}_{current_key}_{proxy}"
+    with _standalone_llm_lock:
+        client = _standalone_llm_clients.get(cache_key)
+        if client is None:
+            client = OpenAI(
+                api_key=current_key,
+                base_url=base_url,
+                timeout=client_timeout,
+                max_retries=1,
+                http_client=get_provider_http_client(proxy, client_timeout),
+            )
+            _standalone_llm_clients[cache_key] = client
+    return client
+
+
 async def relay_images_with_multimodal_model(context, user_text: str, image_urls: list[str]) -> tuple[str, int, int, int]:
     urls = [str(url).strip() for url in (image_urls or []) if str(url).strip()]
     if not urls:
@@ -798,10 +869,14 @@ async def relay_images_with_multimodal_model(context, user_text: str, image_urls
         base_url, current_key, model, supports_multimodal, timeout_seconds, display_model, provider_proxy, model_extra = current
         tried_keys.add(key_manager.make_attempt_identity(base_url, current_key, model, provider_proxy))
 
+        # 转换失败不属于任何 key 的锅：图片链接坏了/不是图/超 8MB，换 key 也救不了。
+        # 放在 try 外、key 轮换前，直接返回空让上层走纯文本降级。
+        prepared_urls = await prepare_image_inputs_for_model(urls, supports_multimodal=True)
+        if not prepared_urls:
+            print("[Vision Relay] 所有图片都无法转成 data URL，按纯文本继续")
+            return "", 0, 0, 0
+
         try:
-            prepared_urls = await prepare_image_inputs_for_model(urls, supports_multimodal=True)
-            if not prepared_urls:
-                return "", 0, 0, 0
 
             messages = [
                 {"role": "system", "content": "你是图片转述助手，只负责把图片信息准确转成文字，供不支持多模态的主模型继续处理。"},
@@ -825,7 +900,7 @@ async def relay_images_with_multimodal_model(context, user_text: str, image_urls
                 preview="图片转述",
             )
 
-            client = context._get_client(base_url, current_key, timeout_seconds, provider_proxy)
+            client = _relay_client(context, base_url, current_key, timeout_seconds, provider_proxy)
             try:
                 response = await asyncio.wait_for(
                     asyncio.to_thread(
@@ -862,7 +937,11 @@ async def relay_images_with_multimodal_model(context, user_text: str, image_urls
         except Exception as e:
             scene = f"{getattr(context, 'session_id', 'AI')}:vision"
             log_api_failure(scene, display_model, current_key, error=str(e))
-            key_manager.mark_failure(current_key, model=model, base_url=base_url, reason=str(e))
+            # 只有「确实是这个 key/模型坏了」才记账。转述调用的异常里有一类是
+            # 我们自己传错参数（比如没有 context 时拿不到客户端），把那种算成
+            # key 失败会把好好的多模态模型推进冷却，连累主对话。
+            if not isinstance(e, _VisionRelayConfigError):
+                key_manager.mark_failure(current_key, model=model, base_url=base_url, reason=str(e))
             last_error = e
             continue
 
@@ -876,6 +955,109 @@ async def relay_images_with_multimodal_model(context, user_text: str, image_urls
 
 
 IMAGE_UNAVAILABLE_NOTICE = "[图片]"
+
+
+async def _build_follow_up_image_blocks_for_agent(urls: list[str],
+                                                  supports_multimodal: bool) -> list[dict]:
+    """把 Agent 插话里的图片转成 user 消息内容块。
+
+    支持多模态：转 data URL 后作为 image_url 块塞进 user 消息，模型直接看图。
+    不支持多模态：请配置的多模态模型转述成文字，再作为 text 块注入——
+    纯文本模型塞 image_url 会被上游 400 拒掉，转述是唯一的可行路径。
+    """
+    urls = [str(u).strip() for u in (urls or []) if str(u).strip()]
+    if not urls:
+        return []
+
+    if supports_multimodal:
+        prepared = await prepare_image_inputs_for_model(urls, True)
+        blocks = [{"type": "image_url", "image_url": {"url": url}} for url in prepared if url]
+        if not blocks:
+            # 多模态但一张图都转不出来：用文本块告诉模型，比静默丢图强。
+            return [{"type": "text", "text": f"[用户发来了 {len(urls)} 张图片，但都无法下载，看不到内容]"}]
+        return blocks
+
+    try:
+        description, _, _, _ = await relay_images_with_multimodal_model(None, "", urls)
+    except Exception as e:
+        print(f"[Follow-Up] 插话图片转述失败: {e}")
+        description = ""
+    if not description:
+        return [{"type": "text", "text": "[用户发来了图片，但当前没有可用的多模态模型，无法识别内容]"}]
+    return [{"type": "text", "text": f"[插话附带的图片转述]\n{description}"}]
+
+
+async def _prepare_read_image_blocks(path, supports_multimodal: bool) -> tuple[list[dict], str]:
+    """read_image 工具用：把本地图片转成给模型看的内容。
+
+    返回 (内容块列表, 错误文本)。内容块形如 [{"type": "text"|"image_url", ...}]，
+    由 bot/agent.py 组装成 tool 消息之后的可读返回。
+
+    本地文件不经过网络：多模态模型直接用 data URL；纯文本模型走多模态转述，
+    把本地路径当作 data URL 传入，避免再绕一圈 HTTP 下载。
+    """
+    path_str = str(path)
+    suffix = os.path.splitext(path_str)[1].lower()
+    if suffix not in _READ_IMAGE_SUFFIXES:
+        return [], (f"error: {suffix or '（无扩展名）'} 不是支持的图片格式。"
+                    f"支持：{', '.join(sorted(_READ_IMAGE_SUFFIXES))}")
+    try:
+        size = os.path.getsize(path_str)
+    except OSError as e:
+        return [], f"error: 读取图片失败：{e}"
+    if size > _READ_IMAGE_MAX_BYTES:
+        return [], (f"error: 图片太大（{size // 1048576} MB，上限 "
+                    f"{_READ_IMAGE_MAX_BYTES // 1048576} MB），无法读入上下文。")
+    try:
+        with open(path_str, "rb") as fp:
+            raw = fp.read()
+    except OSError as e:
+        return [], f"error: 读取图片失败：{e}"
+
+    mime = _sniff_image_mime(raw, path_str)
+    data_url = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+    if supports_multimodal:
+        return [{"type": "image_url", "image_url": {"url": data_url}}], ""
+
+    try:
+        description, _, _, _ = await relay_images_with_multimodal_model(None, "", [data_url])
+    except Exception as e:
+        return [], f"error: 图片转述失败：{e}"
+    if not description:
+        return [], ("error: 当前模型不支持看图，且没有配置可用的多模态模型（WebUI → "
+                    "AI 配置 → 多模态图片模型）。请告诉用户需要管理员先配置这个模型。")
+    return [{"type": "text", "text": f"[图片内容]\n{description}"}], ""
+
+
+_READ_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+_READ_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _sniff_image_mime(raw: bytes, fallback_path: str = "") -> str:
+    """按 magic bytes 探测真实图片类型，扩展名只做兜底。
+
+    扩展名可能撒谎（用户把 .png 改名 .jpg、下载下来的临时文件没有扩展名），
+    直接信扩展名会让某些多模态上游拿错 MIME 拒掉 data URL。
+    """
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw.startswith(b"GIF87a") or raw.startswith(b"GIF89a"):
+        return "image/gif"
+    if raw.startswith(b"BM"):
+        return "image/bmp"
+    # WebP 文件头至少要 12 字节：4 字节 RIFF + 4 字节大小 + 4 字节 WEBP。
+    # 短于此的文件一定是损坏的，别去切片——虽然 Python 切片越界不抛错，
+    # 但读到一半的文件被当成 WebP 交给模型会换来一句看不懂的报错。
+    if len(raw) >= 12 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+        return "image/webp"
+    if fallback_path:
+        guessed = mimetypes.guess_type(fallback_path)[0]
+        if guessed and guessed.startswith("image/"):
+            return guessed
+    return "image/jpeg"
 
 
 def merge_image_relay_into_user_content(user_content: str, image_description: str) -> str:
@@ -955,7 +1137,6 @@ def get_connection_signature(cfg=None) -> dict:
     if isinstance(cfg, dict):
         connection_cfg = cfg.get("Connection", {}) if isinstance(cfg.get("Connection", {}), dict) else {}
         return {
-            "protocol": str(cfg.get("protocol", "") or ""),
             "mode": str(connection_cfg.get("mode", "") or ""),
             "host": str(connection_cfg.get("host", "") or ""),
             "port": str(connection_cfg.get("port", "") or ""),
@@ -969,7 +1150,6 @@ def get_connection_signature(cfg=None) -> dict:
     cfg = cfg or config
     connection_cfg = getattr(cfg, "connection", None)
     return {
-        "protocol": str(getattr(cfg, "protocol", "") or ""),
         "mode": str(getattr(connection_cfg, "mode", "") or ""),
         "host": str(getattr(connection_cfg, "host", "") or ""),
         "port": str(getattr(connection_cfg, "port", "") or ""),
@@ -1027,8 +1207,6 @@ def install_onebot_ws_auth_patch(adapter_module=None) -> bool:
         if adapter_module is None:
             adapter_name = getattr(Listener.run, "__module__", "Hyper.Adapters.OneBot")
             adapter_module = sys.modules.get(adapter_name) or importlib.import_module(adapter_name)
-        if getattr(adapter_module, "__name__", "").endswith(".Satori"):
-            return False
         network = getattr(adapter_module, "Network", None)
         connection_class = getattr(network, "WebsocketConnection", None)
 
@@ -1131,7 +1309,6 @@ def apply_listener_connection_hot_update(new_cfg) -> None:
     try:
         runtime_cfg = read_runtime_config()
         connection_raw = runtime_cfg.get("Connection", {}) if isinstance(runtime_cfg.get("Connection", {}), dict) else {}
-        protocol = str(runtime_cfg.get("protocol", getattr(new_cfg, "protocol", "")) or "").strip() or "OneBot"
 
         host = str(connection_raw.get("host", getattr(getattr(new_cfg, "connection", None), "host", "")) or "").strip()
         port = int(connection_raw.get("port", getattr(getattr(new_cfg, "connection", None), "port", 0)) or 0)
@@ -1146,18 +1323,8 @@ def apply_listener_connection_hot_update(new_cfg) -> None:
         if adapter_module is None:
             adapter_module = importlib.import_module(getattr(Listener.run, "__module__", "Hyper.Adapters.OneBot"))
 
-        current_adapter_protocol = "Satori" if adapter_module.__name__.endswith(".Satori") else "OneBot"
-        if protocol != current_adapter_protocol:
-            raise RuntimeError(
-                "当前 Hyper.Listener 已加载 "
-                f"{current_adapter_protocol} 适配器，运行时不支持切换到 {protocol}；"
-                "请重启程序后生效。"
-            )
-
-        if protocol == "OneBot" and mode not in {"FWS", "HTTP", "HTTP_POST", "POST"}:
+        if mode not in {"FWS", "HTTP", "HTTP_POST", "POST"}:
             raise RuntimeError(f"不支持的 OneBot 连接模式: {mode}")
-        if protocol == "Satori" and mode != "FWS":
-            raise RuntimeError(f"Satori 运行时只支持 FWS 模式: {mode}")
 
         HOT_SWITCH_IN_PROGRESS.set()
 
@@ -1191,7 +1358,7 @@ def apply_listener_connection_hot_update(new_cfg) -> None:
 
         print(
             "✅ 已对 Hyper.Listener 应用热连接配置: "
-            f"{protocol} {mode} {host}:{port}"
+            f"OneBot {mode} {host}:{port}"
             + (f"，监听 {listener_host}:{listener_port}" if listener_host and listener_port and mode != "FWS" else "")
         )
     except Exception as e:
@@ -1300,12 +1467,12 @@ def apply_runtime_config(verbose: bool = True) -> bool:
         if old_connection != new_connection:
             endpoint_text = f"{new_connection['host']}:{new_connection['port']}"
             print(f"🔄 检测到连接配置变更，准备自动重启进程应用新连接: {old_connection} -> {new_connection}")
-            set_connection_status("connecting", "重启中", f"连接配置已更新，正在切换到 {new_connection['protocol']} · {endpoint_text}")
+            set_connection_status("connecting", "重启中", f"连接配置已更新，正在切换到 {endpoint_text}")
 
             def _hot_switch_listener_connection():
                 try:
                     time.sleep(0.5)
-                    restart_current_process(f"连接配置已更新，切换到 {new_connection['protocol']} · {endpoint_text}")
+                    restart_current_process(f"连接配置已更新，切换到 {endpoint_text}")
                 except Exception as restart_error:
                     print(f"连接配置变更后自动重启失败: {restart_error}")
                     set_connection_status("failed", "连接切换失败", str(restart_error))
@@ -1986,19 +2153,19 @@ def _short_text(text, limit: int = 60) -> str:
 
 
 def _safe_sender_name(name, fallback: str = "未知") -> str:
-    return _short_text(filter_sensitive_content(str(name or fallback)), 24)
+    return _short_text(str(name or fallback), 24)
 
 
 def _message_preview(message, limit: int = 60) -> str:
     try:
         if isinstance(message, str):
-            return _short_text(filter_sensitive_content(message), limit)
+            return _short_text(message, limit)
         text = extract_plain_text_from_message(message)
         if text:
-            return _short_text(filter_sensitive_content(text), limit)
+            return _short_text(text, limit)
         raw = str(message)
         raw = raw.replace("[", "<").replace("]", ">")
-        return _short_text(filter_sensitive_content(raw), limit)
+        return _short_text(raw, limit)
     except Exception:
         return "[消息]"
 
@@ -2037,11 +2204,9 @@ def build_final_send_parts(reply_text: str) -> list[str]:
     检查也用它。两边共用一个函数，才不会出现"检查的文本"和"发出的文本"
     悄悄分叉——之前两处各写一遍，改了一边忘另一边就会漏检。
 
-    注意顺序：敏感词替换在分段之前。屏蔽词可能把命中关键词的字样替换掉，
-    先替换再检查，才是用户真正会看到的内容。
+    屏蔽词只作用于「用户发给机器人的消息」，机器人自己的回复不再过滤。
     """
-    filtered = filter_sensitive_content(str(reply_text or ""))
-    return split_llm_reply_for_send(filtered)
+    return split_llm_reply_for_send(str(reply_text or ""))
 
 
 def _final_reply_parts_for_failover(reply_text: str) -> list[str]:
@@ -2049,16 +2214,44 @@ def _final_reply_parts_for_failover(reply_text: str) -> list[str]:
     return build_final_send_parts(reply_text)
 
 
-def ensure_llm_reply_passes_failover_check(reply_text: str):
-    """只检查即将发给用户的最终文本，命中时触发自动切换下一个 API。
+_HTTP_SEND_MAX_PARTS = 20
 
-    调用点必须在重试循环内：命中后靠抛异常换下一个模型/Key。思维链已在
-    _complete 里剥掉，所以这里看到的就是纯正文。
+
+def build_http_send_parts(reply_text: str) -> list[str]:
+    """HTTP 发送接口专用分段。
+
+    与机器人自己的回复不同，这个接口的调用方（插件、外部脚本）通常按
+    「一次请求 = 一条消息」设计，把正则分段强加给它们会凭空多出几条消息。
+    所以这里只做两件事：
+      ① 无论如何都过滤掉 <split> 标记——它是内部分段协议，不该出现在用户眼前；
+      ② 配置里若开了 auto_prompt 模式的 split 分段，就按 <split> 拆开依次发。
+    regex 模式在这里不生效。
     """
-    for part in build_final_send_parts(reply_text):
-        keyword = find_llm_reply_failover_keyword(part)
-        if keyword:
-            raise Exception(f"LLM 回复命中切换关键词: {keyword}")
+    text = str(reply_text or "")
+    cfg = _get_llm_split_config_cached()
+    split_marker_pattern = r'<\s*split\s*>'
+
+    def _strip(part: str) -> str:
+        return re.sub(split_marker_pattern, "", str(part or "")).strip()
+
+    normalized = re.sub(split_marker_pattern, "<split>", text, flags=re.IGNORECASE)
+    whole = _strip(normalized)
+    if not whole:
+        return []
+
+    max_chars_no_split = int(cfg.get("max_chars_no_split", 0) or 0)
+    if max_chars_no_split > 0 and len(whole) > max_chars_no_split:
+        return [whole]
+
+    if cfg.get("enabled") and cfg.get("mode") == "auto_prompt" and "<split>" in normalized:
+        parts = [p for p in (_strip(x) for x in normalized.split("<split>")) if p]
+        # 段数上限：每段之间要 sleep 1.5~3.5 秒，且全程持有发送锁。模型抽风
+        # 输出上千个 <split> 时会把发送通道堵死几分钟。超限就退回整条发送。
+        if parts and len(parts) <= _HTTP_SEND_MAX_PARTS:
+            return parts
+        if parts:
+            print(f"[HTTP SEND] 分段数 {len(parts)} 超过上限 {_HTTP_SEND_MAX_PARTS}，改为整条发送")
+    return [whole]
 
 
 class LoggedActions:
@@ -2460,43 +2653,65 @@ def send_qq_message_from_http(payload: dict, _bypass_feature_switch: bool = Fals
     if actions is None:
         return _qq_http_error("BOT_NOT_CONNECTED", "机器人尚未连接或连接已断开", 503)
 
-    message = Manager.Message(*segments)
-    send_kwargs = {"message": message}
-    if target_type == "group":
-        send_kwargs["group_id"] = int(target_id)
-    else:
-        send_kwargs["user_id"] = int(target_id)
+    # 纯文本单段消息才套分段规则。<split> 是内部协议标记，任何情况下都不能
+    # 原样发给用户；分段只在「发出去的东西本来就是纯文本」时才有意义——
+    # 多段/带图的消息由调用方自己排布，拆开反而会打乱顺序。
+    message_batches = [segments]
+    if len(segments) == 1 and isinstance(segments[0], Segments.Text):
+        text_parts = build_http_send_parts(segments[0].text)
+        if not text_parts:
+            return _qq_http_error("EMPTY_MESSAGE", "消息在去掉分段标记后为空", 400)
+        # 无论分成几段，都发清洗后的文本：单段分支直接发原文会把 <split>
+        # 标记漏给用户（split 关闭、regex 模式、超长不分段三种情况都会命中）。
+        message_batches = [[Segments.Text(part)] for part in text_parts]
 
     if not _qq_send_lock.acquire(timeout=3):
         return _qq_http_error("SEND_BUSY", "发送通道繁忙，请稍后重试", 429)
 
     try:
-        try:
-            ret = asyncio.run(actions.send(**send_kwargs))
-        except TimeoutError:
-            return _qq_http_error(
-                "SEND_TIMEOUT",
-                "等待发送回执超时；消息可能已发出，请勿无条件重试",
-                504,
-            )
-        except Exception as e:
-            err = str(e)
-            low = err.lower()
-            if any(x in low for x in ["not connected", "closed", "连接", "socket", "timeout"]):
-                clear_current_qq_actions()
-                return _qq_http_error("BOT_NOT_CONNECTED", f"发送失败，连接不可用: {err}", 503)
-            print(f"[HTTP SEND] 发送失败: {e}")
-            traceback.print_exc()
-            return _qq_http_error("SEND_FAILED", f"发送失败: {err}", 502)
+        message_ids = []
+        sent_segments = 0
+        for batch_index, batch in enumerate(message_batches):
+            send_kwargs = {"message": Manager.Message(*batch)}
+            if target_type == "group":
+                send_kwargs["group_id"] = int(target_id)
+            else:
+                send_kwargs["user_id"] = int(target_id)
+            try:
+                ret = asyncio.run(actions.send(**send_kwargs))
+            except TimeoutError:
+                return _qq_http_error(
+                    "SEND_TIMEOUT",
+                    "等待发送回执超时；消息可能已发出，请勿无条件重试",
+                    504,
+                )
+            except Exception as e:
+                err = str(e)
+                low = err.lower()
+                if any(x in low for x in ["not connected", "closed", "连接", "socket", "timeout"]):
+                    clear_current_qq_actions()
+                    return _qq_http_error("BOT_NOT_CONNECTED", f"发送失败，连接不可用: {err}", 503)
+                print(f"[HTTP SEND] 发送失败: {e}")
+                traceback.print_exc()
+                return _qq_http_error("SEND_FAILED", f"发送失败: {err}", 502)
 
-        message_id = _extract_send_message_id(ret)
+            message_id = _extract_send_message_id(ret)
+            if message_id is not None:
+                message_ids.append(message_id)
+            sent_segments += len(batch)
+            if batch_index < len(message_batches) - 1:
+                time.sleep(random.uniform(1.5, 3.5))
+
         data = {
             "target_type": target_type,
             "target_id": str(target_id),
-            "segment_count": len(segments),
+            "segment_count": sent_segments,
+            "message_count": len(message_batches),
         }
-        if message_id is not None:
-            data["message_id"] = message_id
+        if len(message_ids) == 1:
+            data["message_id"] = message_ids[0]
+        elif message_ids:
+            data["message_ids"] = message_ids
         return {
             "ok": True,
             "message": "消息已发送",
@@ -2660,13 +2875,13 @@ def build_welcome_message(user_id, welcome_text: str, send_avatar: bool) -> "Man
         parts = welcome_text.split(AT_MARKER)
         for idx, part in enumerate(parts):
             if part:
-                segments.append(Segments.Text(filter_sensitive_content(part)))
+                segments.append(Segments.Text(part))
             if idx < len(parts) - 1:
                 segments.append(Segments.At(user_id))
     else:
         # 向后兼容：没有 {at} 时 @ 放最前
         segments.append(Segments.At(user_id))
-        segments.append(Segments.Text(f" {filter_sensitive_content(welcome_text)}"))
+        segments.append(Segments.Text(f" {welcome_text}"))
 
     return Manager.Message(*segments)
 
@@ -2796,13 +3011,12 @@ def build_group_context_record_text(event, nickname: str, user_message: str = ""
     text = " ".join(p for p in text_parts if p).strip()
     if not text:
         text = str(user_message or "").strip()
-    text = filter_sensitive_content(text)
     return format_group_message(
         nickname,
         text,
         has_image=has_image,
         at_bot=at_bot,
-        quote_preview=filter_sensitive_content(quote_preview) if quote_preview else None,
+        quote_preview=quote_preview if quote_preview else None,
     )
 
 
@@ -2961,7 +3175,7 @@ def format_exception_for_user(e: Exception) -> str:
 
 def build_user_error_text(error: Exception, error_type: str = "program") -> str:
     """按统一格式生成发送给用户的错误文本。"""
-    error_msg = filter_sensitive_content(format_exception_for_user(error))
+    error_msg = format_exception_for_user(error)
     if error_type == "ai":
         return f"XcBot请求失败。\n{error_msg}"
     return f"XcBot出现错误\n{error_msg}"
@@ -3051,7 +3265,7 @@ async def get_nickname_by_userid(user_id, Manager, actions, group_id: int = None
                        else (sender.get('card') or sender.get('nickname'))
 
                 if name:
-                    filtered_name = filter_sensitive_content(name)
+                    filtered_name = name
                     nickname_cache[cache_key] = (filtered_name, time.time())
                     nickname_cache.move_to_end(cache_key)
                     if len(nickname_cache) > MAX_NICKNAME_CACHE:
@@ -3075,7 +3289,7 @@ async def get_nickname_by_userid(user_id, Manager, actions, group_id: int = None
                 )
                 nickname = member_info.data.raw.get('card', '') or member_info.data.raw.get('nickname', '')
                 if nickname:
-                    res = filter_sensitive_content(nickname)
+                    res = nickname
                     nickname_cache[cache_key] = (res, time.time())
                     nickname_cache.move_to_end(cache_key)
                     if len(nickname_cache) > MAX_NICKNAME_CACHE:
@@ -3086,7 +3300,7 @@ async def get_nickname_by_userid(user_id, Manager, actions, group_id: int = None
 
         user_info = await asyncio.wait_for(actions.get_stranger_info(user_id), timeout=2.0)
         nickname = user_info.data.raw.get('nickname', str(user_id))
-        res = filter_sensitive_content(nickname)
+        res = nickname
         nickname_cache[cache_key] = (res, time.time())
         nickname_cache.move_to_end(cache_key)
         if len(nickname_cache) > MAX_NICKNAME_CACHE:
@@ -3102,7 +3316,7 @@ class LimitedDeepSeekContext:
     _client_pool: dict = {}  # 类级别共享，所有实例复用同一组 OpenAI client
 
     def __init__(self, system_prompt: str):
-        self.system_prompt = filter_sensitive_content(system_prompt)
+        self.system_prompt = system_prompt
         self.max_rounds = max(1, int(user_cfg.get("context_max_messages", 60)))
         # 配置键保留旧名以兼容现有配置；值的语义改为完整对话轮数。
         self.max_messages = self.max_rounds
@@ -3417,9 +3631,13 @@ class LimitedDeepSeekContext:
 
                 result, reasoning_text = split_reasoning_output(response.choices[0].message)
                 result = result.rstrip("\n")
-                # 关键词检查放在剥离之后：思维链里出现"作为AI""角色扮演"
-                # 不该触发换模型，只看真正要发给用户的正文。
-                ensure_llm_reply_passes_failover_check(result)
+                # 纯空白回复会在 process_and_send 的 `if not parts: return` 处被静默吞掉，
+                # 用户看不到任何响应也看不到错误。在这里抛错走 key 轮询和错误提示，
+                # 与 agent 路径（5694 行 RuntimeError）的行为对齐。
+                # 这里只用 strip()——build_final_send_parts 会触发 config.json 同步读，
+                # <split> 单独成消息的边缘情况由 process_and_send 内部拦截。
+                if not result.strip():
+                    raise ValueError("模型返回了空白回复")
 
                 usage = getattr(response, "usage", None)
                 total_tokens = (getattr(usage, "total_tokens", 0) if usage else 0) + relay_total_tokens
@@ -3510,7 +3728,7 @@ class LimitedDeepSeekContext:
 
     def add_message(self, role: str, content: str, **fields):
         """添加历史消息，允许构成完整 tool-call 配对的消息。"""
-        content = filter_sensitive_content(content) if role != "tool" else content
+        content = filter_sensitive_content(content) if role == "user" else content
         if role in ("user", "assistant", "tool"):
             message = {"role": role, "content": content}
             for key in ("tool_calls", "tool_call_id"):
@@ -3836,7 +4054,7 @@ class ContextCompressor:
                     raise last_error
                 return ""
 
-            summary = filter_sensitive_content(str(summary)).strip()
+            summary = str(summary).strip()
             return summary
 
         except Exception as e:
@@ -3953,6 +4171,7 @@ from bot import knowledge_base as _knowledge_base
 # 让工具模块能读 config.json，避免它们反向 import main 造成循环依赖
 _agent_builtin_tools.bind_settings_reader(get_runtime_setting)
 _agent_fs_tools.bind(get_runtime_setting, str(BASE_DIR))
+_agent_fs_tools.bind_image_reader(_prepare_read_image_blocks)
 agent_mcp.bind(get_runtime_setting, str(BASE_DIR / "data" / "mcp_server.json"))
 
 
@@ -4179,8 +4398,8 @@ async def _agent_get_group_member_info(args: dict, ctx) -> str:
             return "未知"
     return (
         f"群 {gid} 成员 {uid}\n"
-        f"昵称：{filter_sensitive_content(str(raw.get('nickname', '') or '未知'))}\n"
-        f"群名片：{filter_sensitive_content(str(raw.get('card', '') or '（未设置）'))}\n"
+        f"昵称：{str(raw.get('nickname', '') or '未知')}\n"
+        f"群名片：{str(raw.get('card', '') or '（未设置）')}\n"
         f"身份：{role}\n群等级：{raw.get('level', '未知')}\n"
         f"加群时间：{_ts(raw.get('join_time'))}\n最后发言：{_ts(raw.get('last_sent_time'))}"
     )
@@ -4210,7 +4429,7 @@ async def _agent_get_group_info(args: dict, ctx) -> str:
     if not raw:
         return f"error: 查不到群 {gid} 的信息"
     return (
-        f"群号：{gid}\n群名：{filter_sensitive_content(str(raw.get('group_name', '') or '未知'))}\n"
+        f"群号：{gid}\n群名：{str(raw.get('group_name', '') or '未知')}\n"
         f"成员数：{raw.get('member_count', '未知')} / {raw.get('max_member_count', '未知')}"
     )
 
@@ -4453,7 +4672,7 @@ async def _agent_task_notifier(task: dict) -> bool:
             prompt,
             agent_meta={"actions": actions, "event": None, "user_id": user_id},
         )
-        text = filter_sensitive_content((reply or "").strip()) or content
+        text = (reply or "").strip() or content
     except Exception as e:
         print(f"[AgentTask] 生成提醒文案失败，退回原文: {e}")
 
@@ -4465,15 +4684,28 @@ async def _agent_task_notifier(task: dict) -> bool:
         return False
 
     try:
+        # 与正常回复走同一套分段规则：模型可能在提醒文案里插了 <split>，
+        # 这里直接整条发出去的话，标记会原样漏到用户眼前，分段也失效了。
+        # 兜底不能回退原文：build_final_send_parts 返回空说明清理后什么都不剩
+        # （例如只有 <split>），发原文等于把标记直接甩给用户。
+        parts = build_final_send_parts(text)
+
         if is_group:
-            if target_user:
-                message = Manager.Message(Segments.At(qq=str(target_user)), Segments.Text(f" {text}"))
-            else:
-                message = Manager.Message(Segments.Text(text))
-            await actions.send(group_id=target_group, message=message)
+            for idx, part in enumerate(parts):
+                # 只有第一段 @ 提醒对象，后续分段不必重复 @
+                if target_user and idx == 0:
+                    message = Manager.Message(Segments.At(qq=str(target_user)), Segments.Text(f" {part}"))
+                else:
+                    message = Manager.Message(Segments.Text(part))
+                await actions.send(group_id=target_group, message=message)
+                if idx < len(parts) - 1:
+                    await asyncio.sleep(random.uniform(1.5, 3.5))
         else:
-            await actions.send(user_id=target_user, message=Manager.Message(Segments.Text(text)))
-        print(f"[AgentTask] 任务 {task.get('id')} 已发送提醒")
+            for idx, part in enumerate(parts):
+                await actions.send(user_id=target_user, message=Manager.Message(Segments.Text(part)))
+                if idx < len(parts) - 1:
+                    await asyncio.sleep(random.uniform(1.5, 3.5))
+        print(f"[AgentTask] 任务 {task.get('id')} 已发送提醒（{len(parts)} 段）")
         return True
     except Exception as e:
         print(f"[AgentTask] 任务 {task.get('id')} 发送失败: {e}")
@@ -4527,7 +4759,7 @@ async def _agent_get_group_member_list(args: dict, ctx) -> str:
     for item in members[:limit]:
         if not isinstance(item, dict):
             continue
-        name = filter_sensitive_content(str(item.get("card") or item.get("nickname") or ""))
+        name = str(item.get("card") or item.get("nickname") or "")
         lines.append(f"{item.get('user_id', '?')} {name} [{role_map.get(str(item.get('role')), '成员')}]")
     if len(members) > limit:
         lines.append(f"...（还有 {len(members) - limit} 人未显示）")
@@ -4667,47 +4899,62 @@ async def _agent_send_message(args: dict, ctx) -> str:
     else:
         return "error: 当前没有可发送的会话目标"
 
-    text = filter_sensitive_content(content)
-    segments = []
     at_user = str(args.get("at_user_id") or "").strip()
+    at_id = 0
     if has_group and at_user:
         at_id, at_err = _agent_parse_qq(at_user, "at_user_id")
         if at_err:
             return at_err
-        segments.append(Segments.At(qq=str(at_id)))
-        segments.append(Segments.Text(f" {text}"))
-    else:
-        segments.append(Segments.Text(text))
 
     image_url = str(args.get("image_url") or "").strip()
+    image_seg = None
     if image_url:
         # 这个 URL 会交给协议端下载，它不做内网检查，所以在这里拦
         host_err = _agent_check_public_host(image_url)
         if host_err:
             return host_err
         try:
-            segments.append(Segments.Image(file=_validate_http_url(image_url, "image_url")))
+            image_seg = Segments.Image(file=_validate_http_url(image_url, "image_url"))
         except QQHttpSendError as e:
             return f"error: {e}"
         except Exception as e:
             return f"error: 图片地址不合法：{e}"
 
+    # 与最终回复走同一套分段规则：模型常把整理好的长内容用 <split> 断句，
+    # 整条发出去的话标记会原样漏给用户，分段也就白写了。图片只挂在最后一段，
+    # 避免多段时重复发同一张图。
+    parts = build_final_send_parts(content)
+    if not parts:
+        return "error: content 去掉分段标记后为空，没有可发送的内容。"
+
     try:
-        message = Manager.Message(*segments)
-        if has_group:
-            def _do():
-                return actions.send(group_id=target, message=message)
-        else:
-            def _do():
-                return actions.send(user_id=target, message=message)
-        ok, busy_err = await _agent_send_serialized(_do, "消息")
-        if not ok:
-            return busy_err
+        for idx, part in enumerate(parts):
+            segments = []
+            if at_id and idx == 0:
+                segments.append(Segments.At(qq=str(at_id)))
+                segments.append(Segments.Text(f" {part}"))
+            else:
+                segments.append(Segments.Text(part))
+            if image_seg is not None and idx == len(parts) - 1:
+                segments.append(image_seg)
+            message = Manager.Message(*segments)
+            if has_group:
+                def _do(msg=message):
+                    return actions.send(group_id=target, message=msg)
+            else:
+                def _do(msg=message):
+                    return actions.send(user_id=target, message=msg)
+            ok, busy_err = await _agent_send_serialized(_do, "消息")
+            if not ok:
+                return busy_err
+            if idx < len(parts) - 1:
+                await asyncio.sleep(random.uniform(1.5, 3.5))
     except Exception as e:
         return f"error: 发送失败：{e}"
     extra = "（含图片）" if image_url else ""
+    parts_note = f"，共 {len(parts)} 段" if len(parts) > 1 else ""
     return (
-        f"已把这条消息发到当前对话{extra}：{_short_text(text, 60)}\n"
+        f"已把这条消息发到当前对话{extra}{parts_note}：{_short_text(content, 60)}\n"
         "用户已经看到它了，不要在最终回复里把同样的内容再说一遍。"
     )
 
@@ -5059,7 +5306,7 @@ async def _agent_set_group_card(args: dict, ctx) -> str:
     uid, err = _agent_parse_qq(args.get("user_id"))
     if err:
         return err
-    card = filter_sensitive_content(str(args.get("card", "") or ""))[:60]
+    card = str(args.get("card", "") or "")[:60]
     try:
         # Hyper 未封装 set_group_card，走 custom
         await actions.custom.set_group_card(group_id=gid, user_id=uid, card=card)
@@ -5316,6 +5563,9 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
             # ==== Agent 工具循环：关闭时 agent_settings 为 None，完全不传 tools ====
             agent_settings = None
             agent_ctx = None
+            # 当前 attempt 选中的模型是否支持多模态。插话带图的处理方式取决于它，
+            # 而回调在 attempt 循环内部才被调用，用容器跨作用域传值。
+            _agent_supports_multimodal = {"flag": False}
             agent_llm_calls = 1
             agent_tool_calls = 0
             # 只认随本次调用传进来的元数据。绝不能回退到 self.agent_meta：
@@ -5351,11 +5601,19 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                             await process_and_send(
                                 agent_ctx.actions,
                                 agent_ctx.event,
-                                filter_sensitive_content(text),
+                                text,
                                 is_group=agent_ctx.is_group,
                                 reply_to_first=False,
                             )
                         agent_ctx.extra["progress_callback"] = _send_agent_progress
+                    # 插话带图：工具循环里没法同步去解析密钥和发请求，所以把
+                    # 解析逻辑作为回调注入，由 bot 层在需要时 await。
+                    # 当前这一轮用的模型是否支持多模态由 attempt 循环写入
+                    # 下面这个容器——回调被执行时工具循环已经在该 attempt 内了。
+                    async def _build_follow_up_image_blocks(urls: list[str]):
+                        return await _build_follow_up_image_blocks_for_agent(
+                            urls, bool(_agent_supports_multimodal["flag"]))
+                    candidate.follow_up_image_builder = _build_follow_up_image_blocks
                     # 工作区按会话隔离，只能在拿到 ctx 之后才知道具体路径
                     candidate.workspace = _agent_fs_tools.primary_root(agent_ctx)
                     # 该用户权限下一个工具都没开，就没必要走循环，省掉 tools 参数的 prompt 开销
@@ -5432,6 +5690,11 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
 
                 base_url, current_key, model, supports_multimodal, timeout_seconds, display_model, provider_proxy, model_extra = current
                 tried_keys.add(key_manager.make_attempt_identity(base_url, current_key, model, provider_proxy))
+                # 插话图片回调要用：让它知道本轮模型能不能直接看图
+                _agent_supports_multimodal["flag"] = bool(supports_multimodal)
+                # read_image 这类工具也靠它决定「直接给图」还是「先转述成文字」
+                if agent_ctx is not None:
+                    agent_ctx.extra["supports_multimodal"] = bool(supports_multimodal)
                 # 每次 attempt 重置：上一个模型失败后它的思维链没有意义，
                 # 累加会让追踪与聊天室看到 N 个模型思维链首尾相接、无从分辨。
                 nonlocal_reasoning["text"] = ""
@@ -5746,9 +6009,19 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                         raise Exception(f"API 请求超过 {timeout_seconds} 秒未返回，已自动切换下一个")
 
                     result = result.rstrip("\n")
-                    # 工具执行后也允许按回复关键词切换模型：已有工具链会被复用，
-                    # 下一模型只负责整理，不会重新执行工具，因此不会产生重复副作用。
-                    ensure_llm_reply_passes_failover_check(result)
+                    # 与父类 3393 行的同款检查：这里是生产路径（EnhancedLimitedDeepSeekContext
+                    # 覆盖 agen_content），纯空白必须在这里抛错走 key 轮询，不能让它
+                    # 流到 process_and_send 的 `if not parts: return` 被静默吞掉。
+                    # agent 路径的空 result 由 bot/agent.py:1035-1053 的 retry_attempts
+                    # 就地重试保护，不会走到这里；走到这里的空 result 都是"模型给了
+                    # 最终答复但答复是空白"，属于模型行为异常，按失败处理。
+                    #
+                    # 注：这里只用 strip()，不调 build_final_send_parts——后者会同步读
+                    # config.json（split 标记配置），每条消息都触发一次磁盘 IO。
+                    # "<split>" 单独成消息这种边缘情况由 process_and_send 内部
+                    # `if not parts: return` 拦截，那里已经算过 parts、零额外开销。
+                    if not result.strip():
+                        raise ValueError("模型返回了空白回复")
 
                     total_tokens = usage_total + relay_total_tokens
                     prompt_tokens = usage_prompt + relay_prompt_tokens
@@ -6113,7 +6386,7 @@ class EnhancedContextManager:
         历史快照分别写回，先完成的那份被覆盖。
         """
         try:
-            user_nickname = filter_sensitive_content(user_nickname) if user_nickname else f"用户{uin}"
+            user_nickname = user_nickname if user_nickname else f"用户{uin}"
 
             with self._manager_lock:
                 if uin == gid:
@@ -6191,8 +6464,7 @@ class EnhancedContextManager:
                 ctx.chat_id = gid
                 return ctx
 
-    def _get_system_prompt(self, user_name: str, context_type: str = "") -> str:
-        user_name = filter_sensitive_content(user_name)
+    def _get_system_prompt(self, user_name: str, context_type: str = "", preset_id_override: str = "") -> str:
         current_bot_name = bot_name
         others = get_runtime_others()
         presets = others.get("personality_presets", [])
@@ -6204,6 +6476,11 @@ class EnhancedContextManager:
         # 私聊/群聊为空串表示跟随默认人格。
         selected = str(others.get(active_key, "") or "").strip() \
             or str(others.get("active_personality_preset", "") or "").strip()
+        # 调用方（如聊天室按会话选人格）显式指定了预设就以它为准；指定的预设已被删除时
+        # 静默回退到上面的默认，避免老会话指向已删预设直接报错。
+        override = str(preset_id_override or "").strip()
+        if override and override in preset_map:
+            selected = override
         # 选中的预设存在就认它，内容为空要如实报错，不能静默回退到
         # personality_prompt——否则用户以为切了人格，实际用的是别的内容。
         if selected in preset_map:
@@ -6220,7 +6497,7 @@ class EnhancedContextManager:
         if not custom_prompt:
             raise ValueError("主对话系统提示词为空：请在 WebUI 人格设定页面填写人设")
         prompt = custom_prompt.replace("{bot_name}", current_bot_name).replace("{user_name}", user_name)
-        return filter_sensitive_content(prompt)
+        return prompt
 
     async def force_compress_current_group(self, group_id: int) -> bool:
         if group_id in self.groups:
@@ -7084,10 +7361,10 @@ async def handle_compression_commands(event, actions, is_group=True, order=""):
 
         if is_group:
             await actions.send(group_id=event.group_id,
-                               message=Manager.Message(Segments.Text(filter_sensitive_content(output))))
+                               message=Manager.Message(Segments.Text(output)))
         else:
             await actions.send(user_id=event.user_id,
-                               message=Manager.Message(Segments.Text(filter_sensitive_content(output))))
+                               message=Manager.Message(Segments.Text(output)))
         return True
 
     elif match_command(order, "查看记忆列表") and has_permission:
@@ -7221,8 +7498,6 @@ async def handle_compression_commands(event, actions, is_group=True, order=""):
 # ==================== 总结核心功能 ====================
 def add_message(group_id: str, user: str, content: str):
     global chat_db
-    # 只过滤用户消息内容
-    content = filter_sensitive_content(content)
     tokens = estimate_tokens(f"{user}: {content}")
     chat_db[group_id]["history"].append({"user": user, "content": content})
     chat_db[group_id]["token_counter"] += tokens
@@ -7257,7 +7532,7 @@ def calculate_hot_words(messages, min_count=1, max_words=5, recursion_depth=0):
     }
 
     for msg in messages:
-        content = filter_sensitive_content(msg['content'])
+        content = msg['content']
         words = re.findall(r'(?<![\u4e00-\u9fff])([\u4e00-\u9fff]{2,4})(?![\u4e00-\u9fff])', content)
         filtered_words = [word for word in words if word not in stop_words]
         all_words.extend(filtered_words)
@@ -7345,7 +7620,7 @@ async def handle_summary_request(group_id: str, match, temp_db=None):
         messages_list = list(db_to_use[group_id]["history"])[-n:]
         filtered_messages = []
         for msg in messages_list:
-            filtered_messages.append(f"{msg['user']}: {filter_sensitive_content(msg['content'])}")
+            filtered_messages.append(f"{msg['user']}: {msg['content']}")
 
         messages = "\n".join(filtered_messages)
 
@@ -7362,13 +7637,11 @@ async def handle_summary_request(group_id: str, match, temp_db=None):
 5. 总结后给出建议或方案
 6. 尽量不要使用 Markdown 格式'''
 
-        prompt = filter_sensitive_content(prompt)
-
         summary_context = LimitedDeepSeekContext(
             "你是一个专业的聊天总结助手，根据聊天记录总结摘要，请不要使用Markdown格式。请用紧凑的格式呈现总结内容。"
         )
         response, _, _, _ = await summary_context.agen_content(prompt)
-        response = filter_sensitive_content(response.rstrip("\n"))
+        response = response.rstrip("\n")
 
         if temp_db is None:
             record_summary(group_id)
@@ -7388,7 +7661,6 @@ async def handle_node_messages(data: dict, group_id: str | int = "0"):
     })
 
     def add_to_temp_db(gid: str, user: str, content: str):
-        content = filter_sensitive_content(content)
         tokens = estimate_tokens(f"{user}: {content}")
         temp_db[gid]["history"].append({"user": user, "content": content})
         temp_db[gid]["token_counter"] += tokens
@@ -7403,7 +7675,6 @@ async def handle_node_messages(data: dict, group_id: str | int = "0"):
             for message_item in data['messages']:
                 sender = message_item.get('sender', {})
                 nickname = sender.get('nickname', str(message_item.get('user_id', '')))
-                nickname = filter_sensitive_content(nickname)
                 message_list = message_item.get('message', [])
 
                 text_parts = []
@@ -7412,7 +7683,7 @@ async def handle_node_messages(data: dict, group_id: str | int = "0"):
                         text_data = message_content.get('data', {})
                         text = text_data.get('text', '')
                         if text:
-                            text_parts.append(filter_sensitive_content(text))
+                            text_parts.append(text)
 
                 full_text = ''.join(text_parts)
 
@@ -7424,7 +7695,6 @@ async def handle_node_messages(data: dict, group_id: str | int = "0"):
             for message_item in data['data']['messages']:
                 sender = message_item.get('sender', {})
                 nickname = sender.get('nickname', str(message_item.get('user_id', '')))
-                nickname = filter_sensitive_content(nickname)
                 message_list = message_item.get('message', [])
 
                 text_parts = []
@@ -7433,7 +7703,7 @@ async def handle_node_messages(data: dict, group_id: str | int = "0"):
                         text_data = message_content.get('data', {})
                         text = text_data.get('text', '')
                         if text:
-                            text_parts.append(filter_sensitive_content(text))
+                            text_parts.append(text)
 
                 full_text = ''.join(text_parts)
 
@@ -7446,7 +7716,6 @@ async def handle_node_messages(data: dict, group_id: str | int = "0"):
             if message_node.get('type') == 'node':
                 node_data = message_node.get('data', {})
                 nickname = node_data.get('nickname', node_data.get('user_id', ''))
-                nickname = filter_sensitive_content(nickname)
                 content_list = node_data.get('content', [])
 
                 text_parts = []
@@ -7455,7 +7724,7 @@ async def handle_node_messages(data: dict, group_id: str | int = "0"):
                         text_data = content_item.get('data', {})
                         text = text_data.get('text', '')
                         if text:
-                            text_parts.append(filter_sensitive_content(text))
+                            text_parts.append(text)
 
                 full_text = ''.join(text_parts)
 
@@ -7476,15 +7745,23 @@ async def process_and_send(actions, event, ai_reply: str, is_group: bool, reply_
 
     trace_id 为可选参数：传入时把分段数与 message_id 回填到对应追踪记录。
 
-    这里是发送前的最后一道关口：敏感词替换与分段都走 build_final_send_parts，
-    与回复关键词检查共用同一份规则，所以"检查过的文本"就是"发出去的文本"。
-    调用方多数已经先过了一遍 filter_sensitive_content，替换是幂等的，
-    重复一次不会改变结果，但漏掉的调用方在这里会被补上。
+    发送前统一走 build_final_send_parts 做分段。回复切换关键词只在这一刻（真正发给
+    用户的最终文本）检查，不进 agent 内部：命中就整条丢弃、不发送，也不再切换模型。
+    屏蔽词只作用于用户发给机器人的消息，机器人自己的回复不在这里过滤。
     """
     parts = build_final_send_parts(ai_reply)
+    # 回复切换关键词：命中即丢弃整条回复不发（例如模型拒答"作为AI我不能…"）。
+    for _part in parts:
+        _hit = find_llm_reply_failover_keyword(_part)
+        if _hit:
+            log_console("SEND", f"回复命中切换关键词「{_hit}」，已丢弃不发送")
+            return
     log_console("SEND", f"准备发送 {'群' if is_group else '私聊'} {len(parts)}段 {_short_text(ai_reply, 70)}")
 
     if not parts:
+        # 上方已经在主路径拦过空白/纯标记（main.py:5728），走到这里的空 parts
+        # 只可能来自插件路径或其他旁路。至少留一行日志，否则排查时无从知晓。
+        log_console("SEND", f"回复清洗后为空，已跳过发送（原文 {len(str(ai_reply or ''))} 字符）")
         return
 
     # 群聊中如果启用了 <split> 分段首段引用功能，则第一段自动引用触发者消息。
@@ -7561,12 +7838,20 @@ async def handle_private_poke_event(event, actions):
             return
         user_id = event.user_id
         user_info = await actions.get_stranger_info(user_id)
-        user_nickname = filter_sensitive_content(user_info.data.raw.get('nickname', f"用户{user_id}"))
+        user_nickname = user_info.data.raw.get('nickname', f"用户{user_id}")
 
         poke_prompt = f"用户{user_nickname}拍了拍你"
         deepseek_context = cmc.get_context(user_id, user_id, user_nickname)
 
-        response, total_tokens, prompt_tokens, completion_tokens = await deepseek_context.agen_content(poke_prompt)
+        try:
+            response, total_tokens, prompt_tokens, completion_tokens = await deepseek_context.agen_content(poke_prompt)
+        except ValueError as e:
+            # 空白回复由 agen_content 抛 ValueError（main.py:5727），
+            # 拍一拍场景不该把错误发给用户——走下方 if not response 的兜底文案。
+            if "空白回复" in str(e):
+                response = ""
+            else:
+                raise
         response = response.rstrip("\n")
 
         if not response:
@@ -7574,7 +7859,7 @@ async def handle_private_poke_event(event, actions):
         elif len(response) > 200:
             response = f"被{user_nickname}拍到了！"
 
-        await process_and_send(actions, event, filter_sensitive_content(response), is_group=False,
+        await process_and_send(actions, event, response, is_group=False,
                                trace_id=getattr(deepseek_context, "last_trace_id", ""))
 
 
@@ -7596,21 +7881,29 @@ async def handle_group_poke_event(event, actions):
             member_info = await actions.get_group_member_info(group_id=group_id, user_id=user_id)
             group_card = member_info.data.raw.get('card', '') or member_info.data.raw.get('nickname', '')
             if group_card:
-                display_name = filter_sensitive_content(group_card)
+                display_name = group_card
             else:
                 user_info = await actions.get_stranger_info(user_id)
-                display_name = filter_sensitive_content(user_info.data.raw.get('nickname', f"用户{user_id}"))
+                display_name = user_info.data.raw.get('nickname', f"用户{user_id}")
         except Exception:
             try:
                 user_info = await actions.get_stranger_info(user_id)
-                display_name = filter_sensitive_content(user_info.data.raw.get('nickname', f"用户{user_id}"))
+                display_name = user_info.data.raw.get('nickname', f"用户{user_id}")
             except Exception:
                 display_name = f"用户{user_id}"
 
         poke_prompt = f"用户{display_name}在群聊会话中拍了拍你"
         deepseek_context = cmc.get_context(user_id, group_id, display_name)
 
-        response, total_tokens, prompt_tokens, completion_tokens = await deepseek_context.agen_content(poke_prompt)
+        try:
+            response, total_tokens, prompt_tokens, completion_tokens = await deepseek_context.agen_content(poke_prompt)
+        except ValueError as e:
+            # 空白回复由 agen_content 抛 ValueError（main.py:5727），
+            # 拍一拍场景不该把错误发给用户——走下方 if not response 的兜底文案。
+            if "空白回复" in str(e):
+                response = ""
+            else:
+                raise
         response = response.rstrip("\n")
 
         if not response:
@@ -7618,7 +7911,7 @@ async def handle_group_poke_event(event, actions):
         elif len(response) > 200:
             response = f"被{display_name}拍到了！(◕ᴗ◕✿)"
 
-        await process_and_send(actions, event, filter_sensitive_content(response), is_group=True, reply_to_first=False,
+        await process_and_send(actions, event, response, is_group=True, reply_to_first=False,
                                trace_id=getattr(deepseek_context, "last_trace_id", ""))
 
     except Exception as e:
@@ -7641,7 +7934,7 @@ async def handle_private_message(event: Events.PrivateMessageEvent, actions: Lis
 
     try:
         event_user = (await actions.get_stranger_info(user_id)).data.raw
-        event_user_nickname = filter_sensitive_content(event_user['nickname'])
+        event_user_nickname = event_user['nickname']
     except:
         event_user_nickname = "用户"
 
@@ -7894,7 +8187,7 @@ async def handle_private_message(event: Events.PrivateMessageEvent, actions: Lis
         should_trigger = True
 
     if order in ("帮助", "help") or user_message in (f"{reminder}帮助", f"{reminder}help"):
-        content = f'''命令菜单
+        content = f'''{project_name} {version_name} 命令菜单
 ——————————————
 {reminder}名言 —— 把引用消息生成名言图
 /reset 或 重置 —— 清除当前对话
@@ -8021,7 +8314,7 @@ Token总计: {token_stats.total_tokens} Token（过去24小时）
             # 历史由 agen_content 在释放会话锁前写入，这里不能自己写。
             _p_session_id = agent_session_id_of(deepseek_context)
             if _has_active_session(_p_session_id):
-                if _follow_up_session(_p_session_id, final_message):
+                if _follow_up_session(_p_session_id, final_message, image_urls=image_urls):
                     print(f"[Follow-Up] 私聊 {user_id} 消息注入活跃 Agent 会话: {final_message[:60]}")
                     return
                 print(f"[Follow-Up] 私聊 {user_id} 会话已结束，回退正常 AI 请求")
@@ -8077,7 +8370,7 @@ Token总计: {token_stats.total_tokens} Token（过去24小时）
             # 历史由 agen_content 在释放会话锁前写入，这里不能自己写。
             _p2_session_id = agent_session_id_of(deepseek_context)
             if _has_active_session(_p2_session_id):
-                if _follow_up_session(_p2_session_id, final_message):
+                if _follow_up_session(_p2_session_id, final_message, image_urls=image_urls):
                     print(f"[Follow-Up] 私聊 {user_id} 消息注入活跃 Agent 会话: {final_message[:60]}")
                     return
                 print(f"[Follow-Up] 私聊 {user_id} 会话已结束，回退正常 AI 请求")
@@ -8095,7 +8388,7 @@ Token总计: {token_stats.total_tokens} Token（过去24小时）
 
             new_count = deepseek_context.get_message_count()
 
-            await process_and_send(actions, event, filter_sensitive_content(result), is_group=False,
+            await process_and_send(actions, event, result, is_group=False,
                                    trace_id=getattr(deepseek_context, "last_trace_id", ""))
 
 
@@ -8124,7 +8417,7 @@ class LegacyPluginAIAdapter:
             try:
                 sender = getattr(event, "sender", None)
                 if isinstance(sender, dict):
-                    event_user_nickname = filter_sensitive_content(
+                    event_user_nickname = (
                         sender.get("card") or sender.get("nickname") or event_user_nickname
                     )
             except Exception:
@@ -8138,13 +8431,16 @@ class LegacyPluginAIAdapter:
             final_message = f"【{event_user_nickname}】说：{filter_sensitive_content(str(getattr(event, 'message', '')))}"
             result, total_tokens, prompt_tokens, completion_tokens = await deepseek_context.agen_content(build_llm_user_message(final_message))
             result = (result or "").rstrip("\n")
-            if not result:
+            # `not result` 拦不住 " "（纯空格 rstrip 不掉换行但还是空白），
+            # 必须用 strip() 才能覆盖所有"用户看不到内容"的形态。
+            if not result.strip():
+                log_console("PLUGIN", "旧插件 AI 调用返回空，已静默跳过")
                 return None, None, False
 
             await process_and_send(
                 LegacyPluginAIAdapter._actions,
                 event,
-                filter_sensitive_content(result),
+                result,
                 is_group=bool(hasattr(event, "group_id") and getattr(event, "group_id", None)),
                 trace_id=getattr(deepseek_context, "last_trace_id", ""),
             )
@@ -8439,7 +8735,7 @@ async def handler(event: Events.Event, actions: Listener.Actions) -> None:
 
         try:
             user_info = await actions.get_stranger_info(user)
-            user_nickname = filter_sensitive_content(user_info.data.raw.get('nickname', f"用户{user}"))
+            user_nickname = user_info.data.raw.get('nickname', f"用户{user}")
 
             welcome = render_group_join_welcome_text(user, group_id, user_nickname)
             send_avatar = normalize_bool_config(
@@ -8456,7 +8752,7 @@ async def handler(event: Events.Event, actions: Listener.Actions) -> None:
                     group_id=group_id,
                     message=Manager.Message(
                         Segments.At(user),
-                        Segments.Text(f" {filter_sensitive_content(welcome)}"),
+                        Segments.Text(f" {welcome}"),
                     ),
                 )
         except Exception as e:
@@ -8534,7 +8830,7 @@ async def handler(event: Events.Event, actions: Listener.Actions) -> None:
                 await actions.set_group_add_request(flag=event.flag, sub_type=event.sub_type, approve=True, reason="")
                 await actions.send(group_id=event.group_id,
                                    message=Manager.Message(Segments.Text(
-                                       f"用户 {event.user_id} 的答案正确,已自动批准,题目数据为 {filter_sensitive_content(event.comment)}")))
+                                       f"用户 {event.user_id} 的答案正确,已自动批准,题目数据为 {event.comment}")))
                 return
 
     if isinstance(event, Events.GroupMessageEvent):
@@ -8645,14 +8941,14 @@ async def handler(event: Events.Event, actions: Listener.Actions) -> None:
                 if len(message) < 400:
                     await actions.send(group_id=event.group_id,
                                        message=Manager.Message(Segments.Reply(event.message_id),
-                                                               Segments.Text(filter_sensitive_content(message))))
+                                                               Segments.Text(message)))
                 else:
                     await actions.send_group_forward_msg(
                         group_id=event.group_id,
                         message=Manager.Message(Segments.CustomNode(
                             str(event.self_id),
                             bot_name,
-                            Manager.Message(Segments.Text(filter_sensitive_content(message)))
+                            Manager.Message(Segments.Text(message))
                         ))
                     )
 
@@ -8693,14 +8989,14 @@ async def handler(event: Events.Event, actions: Listener.Actions) -> None:
                     message=Manager.Message(Segments.CustomNode(
                         str(event.self_id),
                         bot_name,
-                        Manager.Message(Segments.Text(filter_sensitive_content(chat_summary)))
+                        Manager.Message(Segments.Text(chat_summary))
                     ))
                 )
             else:
                 chat_summary = generate_chat_summary(event.group_id)
                 await actions.send(group_id=event.group_id,
                                    message=Manager.Message(Segments.Reply(event.message_id),
-                                                           Segments.Text(filter_sensitive_content(chat_summary))))
+                                                           Segments.Text(chat_summary)))
 
             nike = await get_nickname_by_userid(event.user_id, Manager, actions, event.group_id)
             chat_db = add_message(event.group_id, nike, user_message)
@@ -9057,7 +9353,7 @@ async def handler(event: Events.Event, actions: Listener.Actions) -> None:
             return
 
         if user_message in (f"{reminder}帮助", f"{reminder}help"):
-            content = f'''命令菜单
+            content = f'''{project_name} {version_name} 命令菜单
 ——————————————
 {reminder}名言 —— 把引用消息生成名言图
 {reminder}大头照 [@某人] —— 获取头像大图
@@ -9160,7 +9456,8 @@ Rebuilt from HypeR
                     # 历史由 agen_content 在释放会话锁前写入，这里不能自己写：
                     # agen_content 全程持有 _history_lock，抢锁会一直阻塞到循环跑完。
                     if _follow_up_session(_g_session_id, final_message,
-                                          sender_level=_g_sender_level):
+                                          sender_level=_g_sender_level,
+                                          image_urls=image_urls):
                         # 本条已进 Agent，不走 consume；只丢掉自己，保留更早旁听给下次正式请求
                         discard_group_chat_context_record(event.group_id, _group_context_record_id)
                         print(f"[Follow-Up] 群聊 {event.group_id} 消息注入活跃 Agent 会话: {final_message[:60]}")
@@ -9389,7 +9686,7 @@ def handle_webui_chatroom_agent(payload: dict) -> dict:
     if not session_id:
         raise ValueError("无效的聊天室会话 ID")
     numeric_id = _webui_chat_numeric_id(session_id)
-    system_prompt = cmc._get_system_prompt("WebUI 用户", "private")
+    system_prompt = cmc._get_system_prompt("WebUI 用户", "private", str(payload.get("persona") or ""))
     ctx = EnhancedLimitedDeepSeekContext(
         system_prompt,
         compressor=cmc.compressor,
@@ -9454,12 +9751,9 @@ def handle_webui_chatroom_agent(payload: dict) -> dict:
             "reasoning_callback": _record_reasoning,
         },
     ))
-    # <split> 标记在 QQ 侧触发多段发送；聊天室没有多条消息概念，
-    # 按段落拼成一条完整回复，同时清除残留的 <split> 标记。
-    # 走 build_final_send_parts 与 QQ 侧共用同一份规则：敏感词替换也在这里
-    # 完成，聊天室不该比 QQ 少一道过滤。
-    split_parts = build_final_send_parts(result)
-    result = "\n\n".join(split_parts) if split_parts else ""
+    # 保留原始 <split> 标记：聊天室会按 QQ 侧同一套「分段回复」设置
+    # （build_final_send_parts）把回复拆成多段气泡，拆分统一在聊天室那边做，
+    # 这里不再拼成一条，否则分段边界就丢了。
     return {
         "reply": result,
         "progress_messages": progress_messages,
@@ -9533,7 +9827,7 @@ if __name__ == "__main__":
                 print(f"注册 MCP 重连回调失败（忽略）：{_e}")
         if callable(_set_chatroom_agent_callbacks):
             try:
-                _set_chatroom_agent_callbacks(handle_webui_chatroom_agent, stop_webui_chatroom_agent)
+                _set_chatroom_agent_callbacks(handle_webui_chatroom_agent, stop_webui_chatroom_agent, build_final_send_parts, find_llm_reply_failover_keyword)
             except Exception as _e:
                 print(f"注册聊天室 Agent 回调失败（忽略）：{_e}")
         start_webui(on_config_saved=lambda: apply_runtime_config(verbose=False))
@@ -9591,7 +9885,7 @@ if __name__ == "__main__":
                 print(f"注册调试自检回调失败（忽略）：{_e}")
         if callable(_set_chatroom_agent_callbacks):
             try:
-                _set_chatroom_agent_callbacks(handle_webui_chatroom_agent, stop_webui_chatroom_agent)
+                _set_chatroom_agent_callbacks(handle_webui_chatroom_agent, stop_webui_chatroom_agent, build_final_send_parts, find_llm_reply_failover_keyword)
             except Exception as _e:
                 print(f"注册聊天室 Agent 回调失败（忽略）：{_e}")
         start_webui(on_config_saved=lambda: apply_runtime_config(verbose=False))

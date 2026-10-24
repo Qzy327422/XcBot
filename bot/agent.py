@@ -62,6 +62,9 @@ class FollowUpTicket:
     seq: int
     text: str
     consumed: bool = False
+    # 插话时带的图片（原始 URL / data URL）。不能塞进 tool 消息——OpenAI 协议
+    # 只允许 user 消息携带 image_url，所以这些图会在注入时单独拼成一条 user 消息。
+    image_urls: list = field(default_factory=list)
 
 FOLLOW_UP_NOTICE_TEMPLATE = (
     "\n\n[SYSTEM NOTICE] User sent follow-up messages while tool execution "
@@ -133,14 +136,61 @@ def session_user_level(session_id: str) -> str | None:
         return str(state.get("_owner_level") or "user")
 
 
+def build_follow_up_image_blocks(image_blocks: list, notice_text: str):
+    """把插话图片块和 SYSTEM NOTICE 拼成一条合规的 user 消息内容。
+
+    OpenAI 协议要求图片只能出现在 user 消息里，且 content 是数组时每个元素
+    必须有 type。文本放最前面：模型的注意力通常在开头，先看到「用户插话了」
+    才不会把图片当成历史里的上下文。
+
+    没有图片时返回纯文本，让历史/追踪保持原来的字符串形态；只要带了图片就必须
+    返回数组——单张图 + 无通知文本也是 [image_url]，不能退回空字符串。
+    """
+    images = [b for b in (image_blocks or []) if isinstance(b, dict) and b.get("type")]
+    if not images:
+        return notice_text
+    blocks = []
+    if notice_text:
+        blocks.append({"type": "text", "text": notice_text})
+    blocks.extend(images)
+    return blocks
+
+
+async def _resolve_follow_up_image_blocks(ctx: AgentContext, urls: list[str]) -> list[dict]:
+    """把插话里的图片 URL 变成能塞进 user 消息的内容块。
+
+    转换逻辑（转 data URL / 请多模态模型转述）需要 key_manager 与网络，
+    这些依赖在 main.py，所以由它注册一个 builder 到 ctx.extra。这里只负责
+    调用并兜底——图片处理失败绝不能把整条插话丢掉，文字部分照常注入。
+    """
+    urls = [str(u).strip() for u in (urls or []) if str(u).strip()]
+    if not urls:
+        return []
+    builder = ctx.extra.get("follow_up_image_builder")
+    if not callable(builder):
+        ctx.say("插话带图，但当前运行环境没有注册图片处理器，图片已忽略", "AGENT")
+        return []
+    try:
+        blocks = builder(urls)
+        if hasattr(blocks, "__await__"):
+            blocks = await blocks
+    except Exception as e:
+        ctx.say(f"处理插话图片失败，已只注入文字：{e}", "AGENT")
+        return []
+    return [b for b in (blocks or []) if isinstance(b, dict) and b.get("type")]
+
+
 def follow_up_session(session_id: str, text: str,
-                      sender_level: str | None = None) -> bool:
+                      sender_level: str | None = None,
+                      image_urls: list[str] | None = None) -> bool:
     """向活跃的 Agent 会话注入一条 follow-up 消息。
 
     返回是否成功注入。失败时（会话不存在、已结束、或注入者权限低于会话
     持有者）返回 False，调用方应回退到正常 AI 请求。
 
     sender_level 为 None 表示跳过等级校验（私聊：会话持有者就是发送者本人）。
+    image_urls 是这条插话附带的图片；带图但会话模型不支持多模态时，调用方
+    应当先把它转述成文字再进来，不能指望模型自己看图。
     """
     if not session_id or not text:
         return False
@@ -154,7 +204,10 @@ def follow_up_session(session_id: str, text: str,
                 return False
         seq = state.get("_follow_up_seq", 0)
         state["_follow_up_seq"] = seq + 1
-        ticket = FollowUpTicket(seq=seq, text=text)
+        ticket = FollowUpTicket(
+            seq=seq, text=text,
+            image_urls=[str(u).strip() for u in (image_urls or []) if str(u).strip()],
+        )
         state_lock = state.get("_lock")
         if state_lock:
             with state_lock:
@@ -164,10 +217,11 @@ def follow_up_session(session_id: str, text: str,
     return True
 
 
-def _consume_follow_up_detail(state: dict) -> tuple[str, list[str]]:
+def _consume_follow_up_detail(state: dict) -> tuple[str, list[str], list[str]]:
     """消费队列中的 follow-up 消息。
 
-    返回 (SYSTEM NOTICE 文本, 被消费的原始文本列表)。后者供追踪记录用。
+    返回 (SYSTEM NOTICE 文本, 被消费的原始文本列表, 附带的图片列表)。
+    后两者供追踪记录与图片注入使用。
 
     同时把原文累加进 state["_delivered"]：这些话真正进了模型上下文，所以
     应当写入会话历史。写历史不能由消息线程自己做——agen_content 全程持有
@@ -183,13 +237,18 @@ def _consume_follow_up_detail(state: dict) -> tuple[str, list[str]]:
         pending = state.get("_pending_follow_ups", [])
         state["_pending_follow_ups"] = []
     if not pending:
-        return "", []
+        return "", [], []
     for ticket in pending:
         ticket.consumed = True
     texts = [t.text for t in pending]
+    images: list[str] = []
+    for ticket in pending:
+        for url in getattr(ticket, "image_urls", None) or []:
+            if url and url not in images:
+                images.append(url)
     state.setdefault("_delivered", []).extend(texts)
     lines = "\n".join(f"{idx}. {t}" for idx, t in enumerate(texts, start=1))
-    return FOLLOW_UP_NOTICE_TEMPLATE.format(follow_up_lines=lines), texts
+    return FOLLOW_UP_NOTICE_TEMPLATE.format(follow_up_lines=lines), texts, images
 
 
 # 连续重复调用的递进提示。3/4/5 次强度依次升级，5 次以后维持最强。
@@ -207,6 +266,13 @@ _STREAK_NOTICE = {
         "只有在每次调用都确实带来新信息时才继续，否则请改变策略，或者向用户说明当前的限制。"
     ),
 }
+
+# 工具返回空结果（None / "" / 纯空白）时给模型的提示。空串会让模型无法判断是
+# "工具没说话"还是"工具说话了但没内容"，必须显式告知，让它据此调整参数或换工具。
+_EMPTY_RESULT_NOTICE = (
+    "\n\n[system notice] The tool `{tool_name}` returned an empty result. "
+    "Adjust the arguments, try a different tool, or explain to the user what information is missing."
+)
 
 # 外部数据源（网页、搜索结果）的隔离声明，防 prompt injection。
 UNTRUSTED_HINT = (
@@ -384,6 +450,26 @@ class ToolRegistry:
             names.add(spec.name)
         return names
 
+    def denied_names(self, user_level: str, enabled: dict[str, bool],
+                     level_overrides: dict[str, str] | None = None) -> list[str]:
+        """已开启、但当前用户权限不够的工具名。
+
+        这些工具不会进 schema（模型看不见它有哪些参数），但必须让模型知道
+        「这些能力存在、只是你无权使用」——否则用户说「用 shell 看下磁盘」时，
+        模型只能含糊地回答「我没有这个能力」，用户也就不知道该找管理员开通。
+        提示词里声明一次，比让模型凭猜测编理由准确得多。
+        """
+        rank = _LEVEL_RANK.get(user_level, 0)
+        names = []
+        for spec in self.all():
+            gate = self.gate_of(spec.name)
+            if not enabled.get(gate, False):
+                continue
+            need = (level_overrides or {}).get(gate, spec.level)
+            if _LEVEL_RANK.get(need, 0) > rank:
+                names.append(spec.name)
+        return sorted(names)
+
     def schemas_for(self, user_level: str, enabled: dict[str, bool],
                     level_overrides: dict[str, str] | None = None) -> list[dict]:
         """按用户权限和 WebUI 开关筛选出要发给模型的 tools 列表。
@@ -542,12 +628,33 @@ def _parse_args(raw) -> tuple[dict, str]:
     return parsed, ""
 
 
+def _is_handler_failure_text(text: str) -> bool:
+    """区分「handler 主动返回的失败信号」与「外部内容恰好以 error: 开头」。
+
+    框架与 handler 的约定是「单行短文本 + error: 前缀 = handler 失败信号」；
+    外部内容（网页正文/搜索结果/文档）即使是 error: 开头，也几乎总是多行或长文本。
+    这个启发式不完美，但覆盖了 web_search 等真实失败场景（单行错误汇总），
+    同时避免把外部内容误判为失败导致丢失 untrusted 隔离（P2-I）。
+    """
+    s = str(text or "")
+    return (
+        s.startswith("error:")
+        and "\n" not in s
+        and len(s) <= 200
+    )
+
+
 async def _exec_one(spec: ToolSpec, args: dict, ctx: AgentContext,
-                    settings: "AgentSettings", on_side_effect=None) -> str:
+                    settings: "AgentSettings", on_side_effect=None) -> tuple:
     """唯一的工具执行出口。权限检查、参数过滤、超时、异常兜底全在这里。
 
     所有失败都返回 "error: ..." 文本而非抛异常——模型看到 error 能自己换策略或
     向用户解释原因，抛异常会中断整个循环让用户什么都收不到。
+
+    返回 (raw, packaged) 元组：
+    - raw 是 handler 返回的原始文本（给下游 ok 判断、tool_digest、empty 检测用）
+    - packaged 是真正发给模型的内容，对 untrusted_output 工具会套 UNTRUSTED_HINT
+      + <tool_result ...> 包装，做 prompt injection 隔离
 
     on_side_effect(name)：所有校验都通过、即将真正调用 handler 时回调一次，
     用于登记「这个副作用已经发生了，不能让外层重试」。
@@ -561,32 +668,35 @@ async def _exec_one(spec: ToolSpec, args: dict, ctx: AgentContext,
     # 在唯一的执行出口再判一次，fail-closed。
     if not settings.enabled_tools.get(gate, False):
         ctx.say(f"拒绝执行已禁用的工具 {spec.name}（模型给出了本轮未声明的工具名）", "AGENT")
-        return (
+        msg = (
             f"error: 工具 {spec.name} 当前已被管理员关闭，无法调用。"
             "请不要再尝试这个工具，改用其他方式，或如实告诉用户这个功能没有开启。"
         )
+        return msg, msg
 
     # ② 本轮允许集合。即使开关是开的，也要求它出现在这一轮为该用户算出的
     # 白名单里，防止 schema 与执行层因为条件写歧而出现偏差。
     if settings.allowed_names is not None and spec.name not in settings.allowed_names:
         ctx.say(f"拒绝执行本轮未授权的工具 {spec.name}", "AGENT")
-        return (
+        msg = (
             f"error: 工具 {spec.name} 不在本次对话可用的工具列表中。"
             "请只使用系统提示里列出的工具。"
         )
+        return msg, msg
 
     # ③ 权限等级
     need = (level_overrides or {}).get(gate, spec.level)
     if _LEVEL_RANK.get(need, 0) > _LEVEL_RANK.get(ctx.user_level, 0):
         # 把「谁、缺什么权限、
         # 怎么解决」一次说清，让模型能原话转述给用户，而不是含糊报错。
-        return (
+        msg = (
             f"error: 权限不足。工具 {spec.name} 需要管理员权限，"
             f"当前用户 ID {ctx.user_id or '未知'} 不是管理员。"
             "请直接告诉用户这个操作需要管理员权限、你无法执行，"
             "并说明可以让机器人管理员在 WebUI 的 Agent 页面把该工具调整为所有人可用。"
             "不要重复尝试这个工具，也不要改用其他工具绕开这个限制。"
         )
+        return msg, msg
 
     # 只透传 schema 里声明过的参数：模型幻觉出一个多余参数会直接 TypeError
     allowed = spec.allowed_keys()
@@ -627,14 +737,29 @@ async def _exec_one(spec: ToolSpec, args: dict, ctx: AgentContext,
         # 用 %g 而不是 %.0f：0.1 秒会被 .0f 显示成「0 秒」，看起来像配置坏了
         # 同步工具超时后线程仍在后台跑（wait_for 杀不掉线程），只是结果被丢弃。
         # 走专用池所以不会拖垮默认池，但该 worker 在函数返回前无法复用。
-        return f"error: 工具 {spec.name} 执行超过 {timeout:g} 秒未返回，已放弃。"
+        msg = f"error: 工具 {spec.name} 执行超过 {timeout:g} 秒未返回，已放弃。"
+        return msg, msg
     except Exception as e:
-        return f"error: 工具 {spec.name} 执行失败：{type(e).__name__}: {e}"
+        msg = f"error: 工具 {spec.name} 执行失败：{type(e).__name__}: {e}"
+        return msg, msg
 
     text = str(result if result is not None else "")
-    if spec.untrusted_output:
-        text = f"{UNTRUSTED_HINT}\n<tool_result source=\"external\" untrusted=\"true\">\n{text}\n</tool_result>"
-    return text
+    # 判定"handler 主动报错"还是"handler 透传的外部内容恰好以 error: 开头"：
+    # 框架与 handler 的约定是「单行短文本 + error: 前缀 = handler 失败信号」；
+    # 外部内容（网页正文/搜索结果/文档）即使是 error: 开头，也几乎总是多行或长文本。
+    # 这个启发式不完美，但覆盖了 web_search 等真实失败场景（单行错误汇总），
+    # 同时避免把外部内容误判为失败导致丢失 untrusted 隔离（P2-I）。
+    _looks_like_handler_error = _is_handler_failure_text(text)
+    if spec.untrusted_output and text.strip() and not _looks_like_handler_error:
+        # untrusted 工具的内容总是包装（prompt injection 隔离优先）；
+        # 只有明确的 handler 失败信号（单行短 error:）才跳过包装。
+        packaged = f"{UNTRUSTED_HINT}\n<tool_result source=\"external\" untrusted=\"true\">\n{text}\n</tool_result>"
+    else:
+        packaged = text
+    # 返回 (raw, packaged)：raw 给下游做"是不是失败/是不是空"的语义判断、给
+    # tool_digest 做"已完成的工具"列表（避免把 UNTRUSTED_HINT 透传给用户）；
+    # packaged 才是真的发给模型的内容，带 prompt injection 隔离。
+    return text, packaged
 
 
 # 单次 LLM 请求的就地重试等待时间。额外重试次数由 Agent.retry_attempts 配置，
@@ -668,6 +793,9 @@ def _degraded_text(partial: str, digest: "list[tuple[str, str]]", err: Exception
         for name, text in digest[-4:]:
             body = " ".join(str(text).split())
             lines.append(f"· {name}：{body[:300]}{'…' if len(body) > 300 else ''}")
+    elif lines:
+        # 有部分文本但没工具摘要：用户看到的是突然中断的话，至少说明"后面失败了"。
+        lines.append(f"（后续整理失败：{_safe_error_text(err)}）")
     if not lines:
         lines.append(f"刚才的操作已经执行完，但模型在整理最终回复时失败了：{_safe_error_text(err)}")
     return "\n".join(lines)
@@ -788,7 +916,7 @@ class AgentSettings:
     """一次 agent 循环的行为参数，来自 config.json 的 Agent 段。"""
     enabled: bool = False
     max_rounds: int = 30
-    retry_attempts: int = 1
+    retry_attempts: int = 3
     clear_workspace_on_reset: bool = True
     tool_result_max_chars: int = 8000
     parallel_tools: bool = True
@@ -803,6 +931,10 @@ class AgentSettings:
     allowed_names: "set[str] | None" = None
     # 在用户消息末尾追加当前时间标签
     show_time: bool = False
+    # 插话带图时怎么把图片转成模型能看的内容块。由 main.py 提供（它才有
+    # key_manager 和多模态转述），bot 层不反向依赖主程序，所以走依赖注入。
+    # 签名：async (urls: list[str]) -> list[dict]
+    follow_up_image_builder: Callable[[list[str]], Any] | None = None
 
 
 async def run_tool_loop(complete, messages: list[dict], ctx: AgentContext,
@@ -834,6 +966,10 @@ async def run_tool_loop(complete, messages: list[dict], ctx: AgentContext,
                                          collected, _session_id, fu_holder)
     finally:
         unregister_session(_session_id)
+        # 中断/异常退出时，read_image 写入的待注入图片还带着 base64 留在 ctx 上，
+        # 既占内存又可能在下一次复用 ctx 时被错误注入。finally 里无条件清掉：
+        # 正常路径早就被 pop 消费了，这里是兜底。
+        ctx.extra.pop("pending_user_images", None)
         _fu_state = fu_holder.get("state") or {}
         # 真正进过模型上下文的 follow-up 交给调用方写入会话历史。
         # 只登记已送达的：入队但没赶上任何一轮的不能写，否则历史里会留下
@@ -896,6 +1032,13 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
     # 一次算出本轮白名单，schema 与执行层共用，避免两处判断出现偏差
     allowed = REGISTRY.allowed_names(ctx.user_level, settings.enabled_tools, settings.level_overrides)
     settings = replace(settings, allowed_names=allowed)
+    # 插话图片处理器挂在 ctx 上，供 _resolve_follow_up_image_blocks 读取
+    if callable(settings.follow_up_image_builder):
+        ctx.extra["follow_up_image_builder"] = settings.follow_up_image_builder
+    # 每次进入循环都清空待注入图片。ctx 由外层 agen_content 的 attempt 循环复用，
+    # 上一次 attempt 若在「read_image 已登记、但循环被中断」时退出，残留会在这里
+    # 被当成新图片再注入一次——模型会看到一张它这轮没要求的旧图。
+    ctx.extra.pop("pending_user_images", None)
     tools = REGISTRY.schemas_for(ctx.user_level, settings.enabled_tools, settings.level_overrides)
     usages: list[dict] = []
     tool_calls_done = 0
@@ -961,6 +1104,21 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
         )
     if extra:
         guide += " " + " ".join(extra)
+
+    # 权限声明：已开启但当前用户用不了的工具，必须让模型知道「存在但无权」。
+    # 只写进提示词、不出现在 schema 里——模型拿不到参数定义，也就无法被提示
+    # 注入诱导去调用它们；但用户问「能不能执行个命令」时它能如实说明原因。
+    denied = REGISTRY.denied_names(ctx.user_level, settings.enabled_tools,
+                                   settings.level_overrides)
+    if denied:
+        guide += (
+            f"\nDenied for this user: {', '.join(denied)}. This user is NOT a bot admin, "
+            "so these tools are unavailable and are not in your tool list. If the user asks "
+            "for something that requires them (running shell commands, reading or writing files, "
+            "reading local images, group management, MCP tools), say plainly that the operation "
+            "needs bot admin permission and that a bot admin can grant it in the WebUI Agent page. "
+            "Do not pretend you tried it, and do not claim the feature does not exist."
+        )
 
     sys_content = str(messages[0].get('content', '') or '')
     messages[0] = {
@@ -1053,15 +1211,20 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
         if not raw_calls:
             # 模型直接给了文本回复。这时如果队列里还有没消费的 Follow-Up，
             # 说明用户在模型思考期间插了话——不能就这么结束，得再问一轮。
-            notice, fu_texts = _consume_follow_up_detail(follow_up_state)
+            notice, fu_texts, fu_images = _consume_follow_up_detail(follow_up_state)
             if notice and round_index < settings.max_rounds:
                 ctx.say(f"文本回复后检测到 {len(fu_texts)} 条 Follow-Up，追加一轮对话", "AGENT")
                 messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "user", "content": notice})
+                messages.append({
+                    "role": "user",
+                    "content": build_follow_up_image_blocks(
+                        await _resolve_follow_up_image_blocks(ctx, fu_images), notice),
+                })
                 follow_ups_trace.append({
                     "round": round_index + 1,
                     "time": time.time(),
                     "texts": list(fu_texts),
+                    "images": len(fu_images),
                     "injected_after_tool": "",
                     "delivered": True,
                 })
@@ -1069,7 +1232,19 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
             return content, usages, tool_calls_done
 
         if is_final:
-            # 已经拔掉 tools 了还在要求调用工具，说明模型不配合，直接用它的文本
+            # 已经拔掉 tools 了还在要求调用工具，说明模型不配合。
+            # content 空时不能 return 空——下游 process_and_send 的 `if not parts: return`
+            # 会静默吞掉，用户看不到任何响应也看不到错误。跟 1035-1053 重试用尽
+            # 的语义对齐：抛 RuntimeError 让外层换模型整理，degraded_text 保留
+            # 已完成的工具结果，避免副作用工具重复执行。
+            if not content.strip():
+                error = RuntimeError(
+                    f"模型在最终轮仍坚持调用工具且未给出文本（已调用 {len(raw_calls)} 个工具）"
+                )
+                if fired_side_effects or tool_digest:
+                    ctx.extra["tool_digest"] = list(tool_digest)
+                    ctx.extra["degraded_text"] = _degraded_text(content_so_far, tool_digest, error)
+                raise error
             return content, usages, tool_calls_done
 
         await _emit_user_progress(ctx, content)
@@ -1087,7 +1262,11 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
         })
 
         async def _run(call):
-            """执行一个工具调用，返回 (结果文本, 耗时毫秒)。
+            """执行一个工具调用，返回 (packaged_text, elapsed_ms, raw_text) 三元组。
+
+            - packaged_text：发给模型的内容（可能含 UNTRUSTED_HINT 包装）
+            - elapsed_ms：工具执行耗时
+            - raw_text：工具原始返回（给 failed/empty/tool_digest 判断用）
 
             开跑之前先往 trace_calls 塞一条 status=running 的占位记录：
             /停止 打在工具执行中途时，函数会直接返回，那一轮的结果循环根本不会
@@ -1128,12 +1307,20 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
                     recorded.append(_name)
 
             async def _finish(text):
+                # _exec_one 返回 (raw, packaged) 元组：raw 给 ok 判断和追踪、tool_digest
+                # 用（不含 UNTRUSTED_HINT）；packaged 才是真的发给模型的内容。
+                # 其他地方（工具不存在、参数错）直接传字符串，这里统一兼容。
+                if isinstance(text, tuple):
+                    raw, packaged = text
+                else:
+                    raw = packaged = text
                 elapsed = int((time.time() - started) * 1000)
-                pending["result"] = str(text or "")
+                pending["result"] = str(raw or "")
                 pending["duration_ms"] = elapsed
-                pending["ok"] = not str(text or "").startswith("error:")
+                pending["ok"] = not _is_handler_failure_text(raw)
                 pending["status"] = "ok" if pending["ok"] else "error"
-                return text, elapsed
+                # 返回三元组：(packaged 给模型, elapsed, raw 给下游 digest/empty 检测)
+                return packaged, elapsed, raw
 
             name = str(getattr(call.function, "name", "") or "")
             spec = REGISTRY.get(name)
@@ -1158,7 +1345,7 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
             if not ok:
                 _mark_running_as_cancelled(trace_calls)
                 return _abort_text(content_so_far), usages, tool_calls_done
-            results = [r if isinstance(r, tuple) else (f"error: 工具执行异常：{r}", 0)
+            results = [r if isinstance(r, tuple) else (f"error: 工具执行异常：{r}", 0, f"error: 工具执行异常：{r}")
                        for r in results]
         else:
             results = []
@@ -1179,12 +1366,17 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
 
         round_signatures = set()
         for slot, (call, packed) in enumerate(zip(raw_calls, results)):
-            result, elapsed_ms = packed
+            # 三元组：(packaged 给模型, elapsed_ms, raw 给下游判断)
+            result, elapsed_ms, raw_result = packed
             tool_calls_done += 1
             name = str(getattr(call.function, "name", "") or "")
-            failed = str(result or "").startswith("error:")
-            if not failed:
-                tool_digest.append((name, str(result or "")))
+            # 失败/空判断用 raw（不受 untrusted 包装影响）；发给模型的内容用 packaged
+            failed = _is_handler_failure_text(raw_result)
+            # 空结果不算"已完成"：tool_digest 用于降级文案里"已完成 N 次只读工具调用"，
+            # 把空调用算进去会让用户以为"查到了东西"，实际什么都没拿到。
+            # raw 里不含 UNTRUSTED_HINT 包装，degraded_text 摊平时不会把元指令发给用户。
+            if not failed and str(raw_result or "").strip():
+                tool_digest.append((name, str(raw_result or "")))
             signature = f"{name}::{getattr(call.function, 'arguments', '')}"
             round_signatures.add(signature)
             # 按签名各自累计，不要在签名变化时清空整个字典：模型同一轮同时请求
@@ -1202,7 +1394,16 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
                 result, settings.tool_result_max_chars, settings.overflow_dir,
                 name, str(getattr(call, "id", "")),
             )
-            sent_to_model = materialized + notice
+            # 空结果显式告知模型，避免它把空 tool_result 当成"工具没说话"，
+            # 从而无法判断要不要换参数重试。error: 开头的失败不动，那条路径
+            # 已经把自己的原因写进 materialized 了。
+            # 判断用 raw（untrusted 包装前的原始结果），否则包装后永远非空、永不触发。
+            result_text = str(raw_result or "")
+            if not result_text.strip() and not result_text.startswith("error:"):
+                empty_notice = _EMPTY_RESULT_NOTICE.format(tool_name=name)
+            else:
+                empty_notice = ""
+            sent_to_model = materialized + notice + empty_notice
 
             entry = by_call_id.get(str(getattr(call, "id", "") or ""))
             if entry is None:
@@ -1211,7 +1412,10 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
             entry.update({
                 "name": name,
                 "arguments": str(getattr(call.function, "arguments", "") or ""),
-                "result": str(result or ""),
+                # 追踪页"结果"栏展示 raw（真实工具输出），不是 packaged
+                # （含 UNTRUSTED_HINT + <tool_result> 标签的包装文本）——
+                # 包装内容是给模型看的元指令，不应出现在用户可见的追踪页。
+                "result": str(raw_result or ""),
                 "ok": not failed,
                 "status": "error" if failed else "ok",
                 "duration_ms": elapsed_ms,
@@ -1223,14 +1427,15 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
                 "notice": bool(notice),
                 # 追踪里存的原始 result 与模型实际收到的内容可能不同：超长结果
                 # 会被落盘、只回灌预览加文件路径。两者都记下来才能对着排查。
-                "raw_result_chars": len(str(result or "")),
+                # raw_result_chars 名字是 raw，长度也应是 raw 的长度（不是 packaged）。
+                "raw_result_chars": len(str(raw_result or "")),
                 # 按 mode 判断，不是比对文本是否相同：退化截断时文本也不同，
                 # 但并没有生成文件，页面不能写「结果已落盘」
                 "result_mode": mat_meta.get("mode", "raw"),
                 "materialized": mat_meta.get("mode") == "overflow_file",
                 "overflow_path": mat_meta.get("path", ""),
                 "overflow_error": mat_meta.get("error", ""),
-                "sent_to_model": sent_to_model if mat_meta.get("mode") != "raw" else "",
+                "sent_to_model": sent_to_model if sent_to_model != materialized else "",
             })
 
             messages.append({
@@ -1241,19 +1446,41 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
 
         # Follow-Up 注入点：整轮工具结果都回灌完之后，统一挂到最后一条 tool 消息
         # 末尾。挂在循环里会让同一轮的多个工具各带一份重复通知；挂在这里只有一份。
-        fu_notice, fu_texts = _consume_follow_up_detail(follow_up_state)
+        fu_notice, fu_texts, fu_images = _consume_follow_up_detail(follow_up_state)
         if fu_notice and messages and messages[-1].get("role") == "tool":
-            messages[-1]["content"] = f"{messages[-1].get('content', '')}{fu_notice}"
-            ctx.say(f"注入 {len(fu_texts)} 条 Follow-Up 补充指令", "AGENT")
+            if fu_images:
+                # 带图的插话不能塞进 tool 消息：OpenAI 协议只允许 user 消息携带
+                # image_url。tool 消息保留纯文字通知，图片另起一条 user 消息追加在
+                # 后面——顺序上紧跟工具结果，模型下一轮就能同时看到两者。
+                messages[-1]["content"] = f"{messages[-1].get('content', '')}{fu_notice}"
+                messages.append({
+                    "role": "user",
+                    "content": build_follow_up_image_blocks(
+                        await _resolve_follow_up_image_blocks(ctx, fu_images), ""),
+                })
+            else:
+                messages[-1]["content"] = f"{messages[-1].get('content', '')}{fu_notice}"
+            ctx.say(f"注入 {len(fu_texts)} 条 Follow-Up 补充指令"
+                    f"{'（含 %d 张图）' % len(fu_images) if fu_images else ''}", "AGENT")
             # 记进追踪：哪一轮、注入了什么、挂在哪个工具结果后面
             follow_ups_trace.append({
                 "round": round_index + 1,
                 "provider_attempt": int(ctx.extra.get("trace_llm_attempt_rounds") or 0) + 1,
                 "time": time.time(),
                 "texts": list(fu_texts),
+                "images": len(fu_images),
                 "injected_after_tool": str(
                     (trace_calls[-1].get("name") if trace_calls else "") or ""),
                 "delivered": True,
+            })
+
+        # read_image 之类「工具产出了图片」的挂载点：工具返回值只能是字符串，
+        # 图片必须作为后续 user 消息注入，模型才真正看得到。
+        pending_images = ctx.extra.pop("pending_user_images", None)
+        if pending_images:
+            messages.append({
+                "role": "user",
+                "content": list(pending_images),
             })
 
         # 只保留本轮出现过的签名：连续性一旦断开，计数就该归零，

@@ -230,7 +230,8 @@ async def on_message(order, actions, Manager, Segments, bot_name, reminder,
     if is_feature_enabled and not is_feature_enabled("weather", True):
         return False
 
-    clean = filter_sensitive_content or (lambda x: x)
+    # 屏蔽词只作用于用户发给机器人的消息；插件输出属机器人自己的内容，不过滤。
+    clean = (lambda x: x)
 
     async def send(text):
         msg = Manager.Message(Segments.Text(text))

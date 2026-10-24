@@ -9,7 +9,9 @@ from typing import Any
 
 
 CONFIG_VERSION_KEY = "config_version"
-# 与 config.default.json 的 config_version 保持同步；模板更高时以模板为准。
+# 本进程能迁移到的最高版本。config.default.json 模板的 config_version 可能更新，
+# 迁移时取 max(CURRENT_CONFIG_VERSION, 模板版本)——此处只声明本迁移器
+# 实际支持的版本，不需要每次升模板就改这里。
 CURRENT_CONFIG_VERSION = 3
 DEFAULT_TEMPLATE_NAME = "config.default.json"
 

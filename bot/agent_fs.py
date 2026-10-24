@@ -271,6 +271,17 @@ def bind(settings_reader, base_dir: str) -> None:
     _base_dir = Path(base_dir).resolve()
 
 
+# read_image 需要「把本地图片转成模型能看的内容」——要读密钥、必要时还要请
+# 多模态模型转述。这些能力只在 main.py 里，所以走依赖注入，bot 层不反向依赖。
+# 签名：async (path: Path, supports_multimodal: bool) -> (blocks, error_text)
+_image_reader = None
+
+
+def bind_image_reader(reader) -> None:
+    global _image_reader
+    _image_reader = reader
+
+
 def _setting(path: str, default=None):
     if callable(_settings_reader):
         try:
@@ -505,6 +516,55 @@ async def _tool_file_read(args: dict, ctx: AgentContext) -> str:
     ctx.say(f"file_read {path} [{start}:{end}]", "AGENT")
     body = "\n".join(f"{i}\t{lines[i - 1]}" for i in range(start, end + 1))
     return f"文件：{path}\n总行数：{len(lines)}，本次显示 {start}-{end} 行\n\n{body}"
+
+
+@tool(
+    name="read_image",
+    description=(
+        "读取一张本地图片文件并把它交给模型查看（截图、图表、照片都行）。"
+        "路径规则同 file_read：相对路径以会话工作目录为基准，也能填绝对路径。"
+        "支持 png / jpg / jpeg / webp / gif / bmp。"
+        "只能看到图片内容，不能编辑图片；要生成图片请用 execute_python。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "图片文件路径，绝对路径或相对机器人目录的路径"},
+        },
+        "required": ["path"],
+    },
+    level="admin",
+    timeout=90.0,
+)
+async def _tool_read_image(args: dict, ctx: AgentContext) -> str:
+    path, err = _resolve_path(args.get("path"), ctx, unrestricted=True)
+    if err:
+        return err
+    if not path.exists():
+        return f"error: 图片不存在：{path}"
+    if path.is_dir():
+        return f"error: {path} 是目录，请给出具体的图片文件路径。"
+    if _is_sensitive_path(path):
+        return f"error: {path.name} 属于敏感文件或位于凭据目录中，拒绝访问。"
+    reader = _image_reader
+    if not callable(reader):
+        return "error: 当前运行环境没有注册图片读取器，无法读图。"
+    supports_multimodal = bool(ctx.extra.get("supports_multimodal"))
+    try:
+        blocks, err = await reader(path, supports_multimodal)
+    except Exception as e:
+        return f"error: 读取图片失败：{e}"
+    if err:
+        return err
+    # 工具返回值只能是字符串，图片本身塞不进去。图片挂在 ctx 上，由工具循环
+    # 在下一轮请求前作为一条 user 消息注入——这是 OpenAI 协议里唯一允许
+    # 携带 image_url 的位置（tool 消息只能放文本）。
+    ctx.extra.setdefault("pending_user_images", []).extend(blocks or [])
+    ctx.say(f"read_image {path}", "AGENT")
+    return (
+        f"已读取图片 {path.name}，图片内容已附在接下来的消息里。"
+        "请直接描述你看到的内容，不要再去读这个文件的文本内容。"
+    )
 
 
 @tool(

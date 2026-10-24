@@ -70,7 +70,6 @@ LEGACY_CONFIG_PATHS = [
 _server: Optional[ThreadingHTTPServer] = None
 _server_thread: Optional[threading.Thread] = None
 _STATIC_ASSET_CONTENT: Dict[str, str] = {}
-_STATIC_ASSET_CONTENT: Dict[str, str] = {}
 _started_at = time.time()
 # 实时日志页需要覆盖足够长的排障窗口。这里只保存轻量行对象；完整日志仍按天落盘。
 _log_buffer = deque(maxlen=3000)
@@ -86,6 +85,8 @@ _qq_send_callback = None  # 由 main.py 注册：通过当前 OneBot / Hyper 连
 _debug_self_message_callback = None  # 由 main.py 注册：给机器人自己发调试私聊消息
 _chatroom_agent_callback = None  # 由 main.py 注册：复用统一 Agent / 上下文 / 追踪链路
 _chatroom_stop_callback = None  # 由 main.py 注册：中断聊天室 Agent 循环
+_chatroom_split_callback = None  # 由 main.py 注册：按 QQ 分段设置把回复拆成多段
+_chatroom_filter_callback = None  # 由 main.py 注册：回复过滤关键词命中检测（返回命中的关键词或 ""）
 _webui_reconfigure_lock = threading.RLock()
 _update_cache_lock = threading.RLock()
 _update_cache = {"timestamp": 0.0, "data": None}
@@ -453,7 +454,26 @@ def _chatroom_reminder() -> str:
     return str(_chatroom_others().get("reminder", "/") or "/")
 
 
-def _chatroom_system_prompt() -> str:
+def _chatroom_personas() -> list[Dict[str, Any]]:
+    """聊天室可选的人格预设：只给 id 与显示名，不外泄 prompt 正文。
+
+    首项固定为「跟随默认人格」（id 为空串），其余为 personality_presets 里的预设。
+    """
+    others = _chatroom_others()
+    presets = others.get("personality_presets", [])
+    result: list[Dict[str, Any]] = [{"id": "", "name": "跟随默认人格"}]
+    if isinstance(presets, list):
+        for item in presets:
+            if not isinstance(item, dict):
+                continue
+            pid = str(item.get("id", "") or "").strip()
+            if not pid:
+                continue
+            result.append({"id": pid, "name": str(item.get("name", "") or pid)})
+    return result
+
+
+def _chatroom_system_prompt(preset_id_override: str = "") -> str:
     others = _chatroom_others()
     presets = others.get("personality_presets", [])
     preset_map = {
@@ -463,6 +483,11 @@ def _chatroom_system_prompt() -> str:
     # 私聊人格为空串表示跟随默认人格。
     selected = str(others.get("private_personality_preset", "") or "").strip() \
         or str(others.get("active_personality_preset", "") or "").strip()
+    # 会话在聊天室里显式选了人格就以它为准；选的预设已被删除时静默回退到上面的默认，
+    # 避免老会话指向已删预设直接报错。
+    override = str(preset_id_override or "").strip()
+    if override and override in preset_map:
+        selected = override
     # 选中的预设存在就用它，即使内容为空也不要回退到 personality_prompt——
     # 那样用户会以为换了人格，实际用的是别的内容。
     if selected in preset_map:
@@ -611,8 +636,22 @@ def _chatroom_delete(session_id: str) -> bool:
 
 
 def _chatroom_pair_count(messages: list[Dict[str, Any]]) -> int:
-    """会话列表中的“条数”按一问一答计 1 次；未完成的用户消息不计入。"""
-    return sum(1 for m in (messages or []) if isinstance(m, dict) and m.get("role") == "assistant")
+    """会话列表中的“条数”按一问一答计 1 次；未完成的用户消息不计入。
+
+    一轮回复可能拆成多段气泡（含工具前说明），按 request_id 去重才不会把
+    多段算成多次；报错气泡不计入。
+    """
+    seen = set()
+    loose = 0
+    for m in (messages or []):
+        if not isinstance(m, dict) or m.get("role") != "assistant" or m.get("error"):
+            continue
+        rid = m.get("request_id")
+        if rid:
+            seen.add(rid)
+        else:
+            loose += 1
+    return len(seen) + loose
 
 
 def _chatroom_text_with_attachments(text: str, attachments: Optional[list[Dict[str, Any]]] = None) -> str:
@@ -649,9 +688,19 @@ def _chatroom_message_for_llm(role: str, content: str, attachments: Optional[lis
 def _chatroom_build_llm_messages(obj: Dict[str, Any], model: str) -> list[Dict[str, Any]]:
     ep = _chatroom_endpoint_for_model(model)
     multimodal = bool(ep and ep.get("supports_multimodal"))
-    llm_messages: list[Dict[str, Any]] = [{"role": "system", "content": _chatroom_system_prompt()}]
-    for m in obj.get("messages", []):
+    llm_messages: list[Dict[str, Any]] = [{"role": "system", "content": _chatroom_system_prompt(str(obj.get("persona", "") or ""))}]
+    msgs = obj.get("messages", [])
+    for i, m in enumerate(msgs):
+        if not isinstance(m, dict):
+            continue
         role = m.get("role")
+        # 报错气泡只用于展示，不进上下文；它前面那条失败的用户消息也一起跳过，
+        # 免得给模型留下一条没有回复的孤立用户轮次。
+        if m.get("error"):
+            continue
+        nxt = msgs[i + 1] if i + 1 < len(msgs) else None
+        if role == "user" and isinstance(nxt, dict) and nxt.get("error"):
+            continue
         if role not in ("user", "assistant"):
             continue
         llm_messages.append(_chatroom_message_for_llm(role, m.get("content", ""), m.get("attachments") or [], multimodal))
@@ -695,12 +744,13 @@ def _chatroom_list_sessions() -> list[Dict[str, Any]]:
         return result
 
 
-def _chatroom_new_session(model: str, title: str = "") -> Dict[str, Any]:
+def _chatroom_new_session(model: str, title: str = "", persona: str = "") -> Dict[str, Any]:
     now = int(time.time())
     obj = {
         "id": uuid.uuid4().hex,
         "title": (title or "新会话").strip()[:60] or "新会话",
         "model": model or "",
+        "persona": str(persona or "").strip(),
         "created_at": now,
         "updated_at": now,
         "messages": [],
@@ -1075,6 +1125,42 @@ def _chatroom_merge_aborted_reply(reply: str, streamed_parts: list[str]) -> str:
     return reply
 
 
+def _chatroom_split_reply(text: str) -> list[str]:
+    """按 QQ 侧同一套分段设置把回复拆成多段。
+
+    优先用 main.py 注册的 build_final_send_parts（尊重「分段回复」开关与正则/自动模式）；
+    没注册时兜底按 <split> 标记拆，并清掉标记。返回空列表表示无有效内容。
+    """
+    text = str(text or "")
+    if callable(_chatroom_split_callback):
+        try:
+            parts = _chatroom_split_callback(text)
+            if isinstance(parts, list):
+                return [str(p) for p in parts if str(p or "").strip()]
+        except Exception:
+            pass
+    parts = [p.strip() for p in re.split(r'<\s*split\s*>', text, flags=re.IGNORECASE)]
+    parts = [p for p in parts if p]
+    if parts:
+        return parts
+    stripped = text.strip()
+    return [stripped] if stripped else []
+
+
+def _chatroom_reply_filter_hit(text: str) -> str:
+    """回复过滤关键词命中检测：返回命中的关键词，未命中返回 ""。
+
+    只作用于最终要展示给用户的回复文本，与 QQ 侧共用同一份关键词
+    （main.py.find_llm_reply_failover_keyword）。未注册回调时不过滤。
+    """
+    if not callable(_chatroom_filter_callback):
+        return ""
+    try:
+        return str(_chatroom_filter_callback(str(text or "")) or "")
+    except Exception:
+        return ""
+
+
 def _chatroom_append_assistant(obj: Dict[str, Any], reply: str,
                                agent_state: Optional[Dict[str, Any]] = None,
                                progress_messages: Optional[list[str]] = None,
@@ -1092,17 +1178,39 @@ def _chatroom_append_assistant(obj: Dict[str, Any], reply: str,
                     "role": "assistant", "content": content, "ts": int(time.time()),
                     "request_id": request_id,
                 })
-        assistant_msg = {
-            "role": "assistant", "content": reply, "ts": int(time.time()),
-            "request_id": request_id,
-        }
-        # 思维链跟着这条回复存，但只作为独立字段——不进 content，
+        # 思维链跟着回复存，但只作为独立字段——不进 content，
         # 所以既不会被当正文渲染，也不会进 _agent_history 污染上下文。
         # 存前截断：思考模型的思维链动辄几千字，不限长会撑爆会话文件。
         reasoning = _chatroom_clip_reasoning(reasoning)
-        if reasoning:
-            assistant_msg["reasoning"] = reasoning
-        fresh.setdefault("messages", []).append(assistant_msg)
+        # 按分段设置把这条回复拆成多段气泡；每段都带上同一份思维链，
+        # 前端就能在每段上方各显示一次思考过程。分段关闭时只有一段。
+        segments = _chatroom_split_reply(reply)
+        if not segments:
+            segments = [reply]
+        # 回复过滤关键词：只在最终要展示给用户的文本上检查，命中即整条丢弃、不展示，
+        # 换成一条 error 提示气泡（同样不进 LLM 上下文）。与 QQ 侧共用同一份关键词。
+        _filter_kw = ""
+        for seg in segments:
+            _filter_kw = _chatroom_reply_filter_hit(seg)
+            if _filter_kw:
+                break
+        if _filter_kw:
+            fresh.setdefault("messages", []).append({
+                "role": "assistant",
+                "content": f"回复命中过滤关键词「{_filter_kw}」，已丢弃",
+                "error": True,
+                "ts": int(time.time()),
+                "request_id": request_id,
+            })
+        else:
+            for seg in segments:
+                assistant_msg = {
+                    "role": "assistant", "content": seg, "ts": int(time.time()),
+                    "request_id": request_id,
+                }
+                if reasoning:
+                    assistant_msg["reasoning"] = reasoning
+                fresh.setdefault("messages", []).append(assistant_msg)
         if isinstance(agent_state, dict):
             history = agent_state.get("history")
             if isinstance(history, list):
@@ -1110,6 +1218,28 @@ def _chatroom_append_assistant(obj: Dict[str, Any], reply: str,
             fresh["_agent_total_tokens"] = int(agent_state.get("total_tokens") or 0)
             fresh["_agent_total_calls"] = int(agent_state.get("total_calls") or 0)
             _chatroom_trim_agent_history(fresh)
+        _chatroom_trim_history(fresh)
+        _chatroom_save(fresh)
+        return fresh
+
+
+def _chatroom_append_error(obj: Dict[str, Any], error_text: str) -> Dict[str, Any]:
+    """生成失败时把报错原因作为一条带 error 标记的消息存进会话。
+
+    保留用户那条消息（不再删掉），报错以红色气泡形式持久化，刷新后仍在。
+    带 error 标记的消息不会进 LLM 上下文（见 _chatroom_build_llm_messages）。
+    """
+    error_text = str(error_text or "").strip() or "生成失败"
+    with _chatroom_lock:
+        fresh = _chatroom_load(obj.get("id", "")) or obj
+        request_id = next((
+            m.get("request_id") for m in reversed(fresh.get("messages", []))
+            if m.get("role") == "user" and m.get("request_id")
+        ), "")
+        fresh.setdefault("messages", []).append({
+            "role": "assistant", "content": error_text, "error": True,
+            "ts": int(time.time()), "request_id": request_id,
+        })
         _chatroom_trim_history(fresh)
         _chatroom_save(fresh)
         return fresh
@@ -1150,6 +1280,7 @@ def _chatroom_send(session_id: str, model: str, text: str,
                     "model": obj.get("model") or model,
                     "text": text,
                     "attachments": attachments or [],
+                    "persona": obj.get("persona") or "",
                     "agent_history": obj.get("_agent_history") or [],
                     "total_tokens": obj.get("_agent_total_tokens") or 0,
                     "total_calls": obj.get("_agent_total_calls") or 0,
@@ -1163,10 +1294,10 @@ def _chatroom_send(session_id: str, model: str, text: str,
             else:
                 llm_messages = _chatroom_build_llm_messages(obj, obj.get("model") or model)
                 reply, reasoning = _chatroom_complete(obj.get("model") or model, llm_messages)
-        except Exception:
-            # 同步接口也必须和 SSE 接口一致：模型/Agent 失败时删除尚未配对的 user turn，
-            # 否则下一次请求会把一条永远没有 assistant 的消息带进上下文。
-            _chatroom_remove_pending_user(session_id, request_id)
+        except Exception as e:
+            # 生成失败时保留用户消息，并把报错原因作为一条 error 气泡存进会话，
+            # 刷新后仍能看到失败原因；该 error 气泡不会进 LLM 上下文。
+            _chatroom_append_error(obj, str(e))
             raise
         obj = _chatroom_append_assistant(
             obj, reply, agent_state=agent_state,
@@ -1207,6 +1338,9 @@ def get_webui_config() -> Dict[str, Any]:
         "background_image": str(webui.get("background_image", "") or ""),
         "background_blur": int(float(webui.get("background_blur", 10) or 0)),
         "liquid_glass": normalize_bool_config(webui.get("liquid_glass", False), default=False),
+        "disable_background_blur": normalize_bool_config(webui.get("disable_background_blur", True), default=True),
+        "liquid_glass_refraction": int(float(webui.get("liquid_glass_refraction", 5) or 0)),
+        "card_background_blur": int(float(webui.get("card_background_blur", 2) or 0)),
     }
 
 
@@ -1649,8 +1783,8 @@ def deep_set(data: Dict[str, Any], path: str, value):
     cur[parts[-1]] = value
 
 
-def field(path: str, label: str, typ="text", desc="", default=None, options=None, category="基础", min=None, max=None) -> Dict[str, Any]:
-    return {"path": path, "label": label, "type": typ, "desc": desc, "default": default, "options": options or [], "category": category, "min": min, "max": max}
+def field(path: str, label: str, typ="text", desc="", default=None, options=None, category="基础", min=None, max=None, step=None) -> Dict[str, Any]:
+    return {"path": path, "label": label, "type": typ, "desc": desc, "default": default, "options": options or [], "category": category, "min": min, "max": max, "step": step}
 
 
 def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
@@ -1665,7 +1799,7 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
         ]},
         {"key": "ai", "title": "AI 配置", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>', "desc": "对话行为与分段设置", "fields": [
             field("Others.context_max_messages", "上下文最大消息数", "number"),
-            field("Others.llm_reply_failover_keywords", "回复切换关键词", "list", "一行一个。若模型回复命中其中任一关键词，则丢弃该回复并切换到下一个 API"),
+            field("Others.llm_reply_failover_keywords", "回复过滤关键词", "list", "一行一个。仅在最终要发给用户的回复上检查（不检查 Agent 中间步骤）；命中任一关键词则整条回复丢弃、不发送"),
             field("Others.llm_split.enabled", "启用 LLM 分段回复", "bool", "仅对大模型生成结果生效，不影响普通群聊回复是否引用"),
             field("Others.llm_split.mode", "LLM 分段模式", "select", "auto_prompt=大模型自主分段；regex=按正则切分模型输出", "auto_prompt", ["auto_prompt", "regex"]),
             field("Others.llm_split.prompt_suffix", "自主分段提示词", "textarea", "模式一使用。会自动追加到每次 LLM 用户消息后。建议保留 <split> 分隔符说明"),
@@ -1696,7 +1830,7 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("Others.personality_prompt", "编辑人设", "textarea", "可使用 {bot_name} 与 {user_name} 占位符"),
         ]},
         {"key": "features", "title": "功能配置", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="14" y="3" rx="1"/><path d="M10 21V8a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5a1 1 0 0 0-1-1H3"/></svg>', "desc": "配置功能", "fields": [
-            field("Others.sensitive_words", "屏蔽词", "list", "一行一条，格式「原词=替换成的词」；只写原词则删掉它。⚠️ 会替换所有出现位置，正常聊天里的同名词也会被改"),
+            field("Others.sensitive_words", "屏蔽词", "list", "一行一条，格式「原词=替换成的词」；只写原词则删掉它。只替换用户发给机器人的消息，机器人回复、昵称、人设、群聊总结等不受影响"),
             field("Others.emoji_plus_one_cooldown_seconds", "表情 +1 冷却秒数", "number", "单个表情自动复读的防抖时间"),
             field("Others.weak_blacklist_trigger_probability", "弱黑名单回复概率", "number", "0 到 1 之间，越小越容易拦截"),
             field("Others.weak_blacklist_users", "弱黑名单用户", "list", "一行一个 QQ 号"),
@@ -1717,12 +1851,12 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
         {"key": "agent", "title": "Agent", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>', "desc": "让 AI 自主调用工具：联网搜索、调用插件、操作 QQ、定时提醒、读写文件、执行代码、接入 MCP", "fields": [
             field("Agent.enabled", "启用 Agent", "bool", "总开关。关闭时完全不向模型传 tools，与旧版行为一致"),
             field("Agent.max_rounds", "最大工具轮数", "number", "越大越能完成多步骤任务（搜索→读网页→再搜→总结），代价是 token 消耗上升", 30, min=1, max=50),
-            field("Agent.retry_attempts", "失败后额外重试次数", "number", "当前模型/Key 失败后再试几次；用尽后按轮换顺序切换下一个模型/Key。默认 1，设置为 0 表示直接轮换", 1, min=0, max=5),
+            field("Agent.retry_attempts", "失败后额外重试次数", "number", "当前模型/Key 失败后再试几次；用尽后按轮换顺序切换下一个模型/Key。空回复（模型既没调工具也没给文本）也算失败。默认 3，设置为 0 表示直接轮换", 3, min=0, max=5),
             field("Agent.clear_workspace_on_reset", "/reset 命令清空工作区", "bool", "开启后 /reset 会同时清空当前会话的 Agent 工作区；关闭后仍清除聊天记忆，但保留工作区文件"),
             field("Agent.tool_result_max_chars", "工具结果最大字数", "number", "超出部分写入 data/agent_overflow，只回灌预览+路径，AI 可用 file_read 读全文", 8000, min=500, max=60000),
             field("Agent.tool_timeout", "工具超时秒数", "number", "单个工具的执行上限", 120, min=10, max=600),
             field("Agent.parallel_tools", "并发执行工具", "bool", "同一轮多个工具并发跑，更快且不增加模型请求次数"),
-field("Agent.show_time", "显示当前时间", "bool", "开启后每次对话在用户消息末尾附加当前时间，让 AI 知道现在几点"),
+            field("Agent.show_time", "显示当前时间", "bool", "开启后每次对话在用户消息末尾附加当前时间，让 AI 知道现在几点"),
             field("Agent.search.provider", "搜索源", "select", "auto=有 Key 优先付费源，否则回落百度/DuckDuckGo", "auto", ["auto", "tavily", "bocha", "baidu", "duckduckgo"]),
             field("Agent.search.tavily_api_key", "Tavily API Key", "password", "https://tavily.com 有免费额度，留空则不使用"),
             field("Agent.search.bocha_api_key", "博查 API Key", "password", "国内搜索源，留空则不使用"),
@@ -1740,8 +1874,7 @@ field("Agent.show_time", "显示当前时间", "bool", "开启后每次对话在
             field("Connection.listener_host", "监听地址", "text"),
             field("Connection.listener_port", "监听端口", "number"),
             field("Connection.retries", "重试次数", "number"),
-            field("Connection.access_token", "OneBot 连接 Token", "password", "NapCat / OneBot WebSocket 认证 Token；仅 protocol=OneBot 时使用，保存后会重启连接。"),
-            field("protocol", "协议", "select", options=["OneBot", "Satori"]),
+            field("Connection.access_token", "OneBot 连接 Token", "password", "NapCat / OneBot WebSocket 认证 Token，保存后会重启连接。"),
             field("Log_level", "日志等级", "select", options=["DEBUG", "INFO", "WARNING", "ERROR"]),
         ]},
         {"key": "webui", "title": "WebUI", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>', "desc": "Web 管理界面自身参数和外观", "fields": [
@@ -1753,8 +1886,11 @@ field("Agent.show_time", "显示当前时间", "bool", "开启后每次对话在
             field("Others.http_proxy", "HTTP 代理", "text", "格式 http://127.0.0.1:7890，影响 GitHub 更新检查 / 插件市场与 Agent 联网（搜索、抓网页）；模型调用请在「提供商」里为每个提供商单独填代理。留空不使用代理"),
             field("WebUI.theme_preset", "主题色", "select", "选择一套背景主题色", "aurora", ["aurora", "midnight", "sakura", "forest", "sunset", "ocean"]),
             field("WebUI.background_image", "自定义背景图片", "background_image", "从本机选一张图，点「保存设置」时上传"),
-            field("WebUI.background_blur", "背景模糊度", "number", "0 到 40，数值越大越柔和", 10, min=0, max=40),
-            field("WebUI.liquid_glass", "液态玻璃UI", "bool", "⚠️ 低配机可能会出现卡顿，请自行决定是否开启"),
+            field("WebUI.background_blur", "背景模糊度", "range", "0 到 40，数值越大越柔和", 10, min=0, max=40, step=1),
+            field("WebUI.liquid_glass", "液态玻璃UI", "bool", "⚠️ 低配机可能会出现卡顿，请自行决定是否开启", category="液态玻璃UI"),
+            field("WebUI.disable_background_blur", "禁用背景模糊", "bool", "仅在液态玻璃UI开启时生效，开启后将忽略「背景模糊度」选项", True, category="液态玻璃UI"),
+            field("WebUI.liquid_glass_refraction", "液态玻璃折射强度", "range", "0 到 30，数值越大折射扭曲越明显", 5, category="液态玻璃UI", min=0, max=30, step=1),
+            field("WebUI.card_background_blur", "卡片背景模糊度", "range", "0 到 10，控制液态玻璃卡片背景的模糊程度", 2, category="液态玻璃UI", min=0, max=10, step=1),
         ]},
         {"key": "trace", "title": "追踪", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></svg>', "desc": "最近 24 小时每次 AI 对话的发送链路、模型调用链路、系统提示词与 token 明细", "fields": []},
         {"key": "logs", "title": "实时日志", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg>', "desc": "查看完整运行日志", "fields": []},
@@ -2469,11 +2605,13 @@ def set_debug_self_message_callback(fn) -> None:
 
 
 
-def set_chatroom_agent_callbacks(send_fn, stop_fn=None) -> None:
-    """供 main.py 注册统一聊天室 Agent 入口与中断入口。"""
-    global _chatroom_agent_callback, _chatroom_stop_callback
+def set_chatroom_agent_callbacks(send_fn, stop_fn=None, split_fn=None, filter_fn=None) -> None:
+    """供 main.py 注册统一聊天室 Agent 入口、中断入口、回复分段与回复过滤关键词检测。"""
+    global _chatroom_agent_callback, _chatroom_stop_callback, _chatroom_split_callback, _chatroom_filter_callback
     _chatroom_agent_callback = send_fn
     _chatroom_stop_callback = stop_fn
+    _chatroom_split_callback = split_fn
+    _chatroom_filter_callback = filter_fn
 
 
 def is_feature_enabled_now(key: str, default: bool = True) -> bool:
@@ -2893,7 +3031,8 @@ def _debug_runtime_snapshot() -> Dict[str, Any]:
             "update_cache_age_seconds": int(max(0, time.time() - float(_update_cache.get("timestamp") or 0))) if _update_cache.get("timestamp") else None,
             "server_alive": _server is not None,
             "host": get_webui_config().get("host"),
-            "port": get_webui_config().get("port"),
+            "port": get_actual_webui_port(),
+            "configured_port": get_webui_config().get("port"),
             "has_access_token": bool(str(get_webui_config().get("access_token") or "").strip()),
         },
         # 前端读 debug.resource_usage；原先只放在 status 顶层导致调试页资源全是 0
@@ -3555,7 +3694,6 @@ def get_status() -> Dict[str, Any]:
         "resource_usage": _get_resource_usage(),
         "webui": get_webui_config(),
         "connection": {
-            "protocol": cfg.get("protocol", "OneBot"),
             "mode": connection_cfg.get("mode", ""),
             "host": connection_cfg.get("host", ""),
             "port": connection_cfg.get("port", ""),
@@ -3640,11 +3778,11 @@ def save_uploaded_background(filename: str, raw: bytes) -> str:
 
 
 def _configured_background_image_response(handler: BaseHTTPRequestHandler):
-    parsed = urllib.parse.urlparse(handler.path)
-    qs = urllib.parse.parse_qs(parsed.query)
-    path_text = str((qs.get("v") or [""])[0] or "").strip()
-    if not path_text:
-        path_text = str((read_json(CONFIG_PATH, {}).get("WebUI") or {}).get("background_image", "") or "").strip()
+    # 始终以服务端 config 当前配置的背景图为准；URL 上的 v 只用于换图后触发浏览器重取，
+    # 不参与选择文件。这样任何设备（哪怕本地 bundle 还是旧的、带着旧 v，甚至旧文件已被
+    # 换图时删掉）都能直接拿到当前最新壁纸，不用重启程序、也不用等对端刷新配置。
+    # 顺带堵掉旧实现里「v 可传任意路径读盘」的口子。
+    path_text = str((read_json(CONFIG_PATH, {}).get("WebUI") or {}).get("background_image", "") or "").strip()
     if not path_text or re.match(r"^https?://", path_text, flags=re.I):
         _json_response(handler, {"ok": False, "error": "未配置本地背景图片"}, 404)
         return
@@ -3656,13 +3794,39 @@ def _configured_background_image_response(handler: BaseHTTPRequestHandler):
     except Exception:
         _json_response(handler, {"ok": False, "error": "背景图片路径无效"}, 400)
         return
+    # 只允许读程序目录内的图，避免配置被写入越界路径时读到别的文件
+    try:
+        resolved.relative_to(BASE_DIR.resolve())
+    except Exception:
+        _json_response(handler, {"ok": False, "error": "背景图片路径越界"}, 400)
+        return
     if not resolved.exists() or not resolved.is_file() or resolved.suffix.lower() not in BACKGROUND_EXTS:
         _json_response(handler, {"ok": False, "error": "背景图片不存在或格式不支持"}, 404)
         return
     content_type = BACKGROUND_EXTS.get(resolved.suffix.lower(), "application/octet-stream")
-    # 文件名带内容哈希，换图必然换 URL，所以可以放心让浏览器长期缓存。
-    _binary_response(handler, resolved.read_bytes(), content_type,
-                     cache="public, max-age=31536000, immutable")
+    # 文件名带内容哈希，拿它当 ETag：内容没变则 304 省流量，换图后 ETag 变化自动重取。
+    # 用 no-cache（每次带条件请求校验）而不是 immutable，才能在忽略 v 的前提下始终最新。
+    etag = '"' + resolved.name + '"'
+    if handler.headers.get("If-None-Match") == etag:
+        try:
+            handler.send_response(304)
+            handler.send_header("ETag", etag)
+            handler.send_header("Cache-Control", "no-cache")
+            handler.end_headers()
+        except Exception:
+            pass
+        return
+    body = resolved.read_bytes()
+    try:
+        handler.send_response(200)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("ETag", etag)
+        handler.end_headers()
+        handler.wfile.write(body)
+    except Exception:
+        pass
 
 
 def _binary_response(handler: BaseHTTPRequestHandler, body: bytes, content_type="application/octet-stream",
@@ -3994,6 +4158,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"ok": True, "data": {"upload_path": "/api/knowledge/documents/upload", "version": 1}})
             elif parsed.path == "/api/chat/models":
                 _json_response(self, {"ok": True, "data": _chatroom_models()})
+            elif parsed.path == "/api/chat/personas":
+                _json_response(self, {"ok": True, "data": _chatroom_personas()})
             elif parsed.path == "/api/chat/sessions":
                 _json_response(self, {"ok": True, "data": _chatroom_list_sessions()})
             elif parsed.path == "/api/chat/session":
@@ -4307,7 +4473,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     _json_response(self, {"ok": True, "message": f"重载失败: {e}，请手动发送 /重载插件"})
             elif parsed.path == "/api/chat/new":
                 payload = data or {}
-                obj = _chatroom_new_session(str(payload.get("model", "") or ""), str(payload.get("title", "") or ""))
+                obj = _chatroom_new_session(str(payload.get("model", "") or ""), str(payload.get("title", "") or ""), str(payload.get("persona", "") or ""))
                 _json_response(self, {"ok": True, "data": _chatroom_public(obj)})
             elif parsed.path == "/api/chat/send-stream":
                 payload = data or {}
@@ -4381,6 +4547,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                                 "model": obj.get("model") or model,
                                 "text": full_text,
                                 "attachments": attachments,
+                                "persona": obj.get("persona") or "",
                                 "agent_history": obj.get("_agent_history") or [],
                                 "total_tokens": obj.get("_agent_total_tokens") or 0,
                                 "total_calls": obj.get("_agent_total_calls") or 0,
@@ -4437,10 +4604,19 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     if not saved:
                         _chatroom_remove_pending_user(sid, request_id)
                 except Exception as e:
-                    _chatroom_remove_pending_user(sid, request_id)
+                    # 保留用户消息，把报错原因作为 error 气泡持久化（刷新后仍在），
+                    # 并把带上报错的最新会话随 error 事件推给前端。
+                    err_session = None
+                    try:
+                        if obj is not None:
+                            err_session = _chatroom_public(_chatroom_append_error(obj, str(e)))
+                    except Exception:
+                        err_session = None
+                    if err_session is None:
+                        _chatroom_remove_pending_user(sid, request_id)
                     _append_log(f"[聊天室] 模型调用失败：{e}", "webui")
                     try:
-                        _sse("error", {"error": str(e), "detail": traceback.format_exc(limit=3)})
+                        _sse("error", {"error": str(e), "detail": traceback.format_exc(limit=3), "session": err_session})
                     except Exception:
                         pass
                 finally:
@@ -4473,6 +4649,27 @@ class WebUIHandler(BaseHTTPRequestHandler):
                             _json_response(self, {"ok": False, "error": "会话不存在"}, 404)
                         else:
                             obj["model"] = model
+                            _chatroom_save(obj)
+                            _json_response(self, {"ok": True, "data": _chatroom_public(obj)})
+
+            elif parsed.path == "/api/chat/persona":
+                payload = data or {}
+                sid = str(payload.get("id", "") or "")
+                persona = str(payload.get("persona", "") or "").strip()
+                available_personas = {str(item.get("id", "") or "") for item in _chatroom_personas()}
+                if _chatroom_is_generating(sid):
+                    _json_response(self, {"ok": False, "error": "该会话正在生成，完成或停止后再切换人格"}, 409)
+                elif persona and persona not in available_personas:
+                    _json_response(self, {"ok": False, "error": "所选人格不可用，请刷新人格列表"}, 400)
+                else:
+                    with _chatroom_session_lock(sid):
+                        obj = _chatroom_load(sid)
+                        if obj is None:
+                            _json_response(self, {"ok": False, "error": "会话不存在"}, 404)
+                        else:
+                            # 只改 persona、不动 messages：切人格后带着原有对话历史继续，
+                            # 下一条消息就用新人格的系统提示，上一句还是旧人格的回复。
+                            obj["persona"] = persona
                             _chatroom_save(obj)
                             _json_response(self, {"ok": True, "data": _chatroom_public(obj)})
 
@@ -4580,6 +4777,73 @@ class WebUIHandler(BaseHTTPRequestHandler):
             _json_response(self, {"ok": False, "error": str(e), "traceback": traceback.format_exc()}, 500)
 
 
+# 端口被占用时向后顺延的次数。同一台机器上跑多份 XcBot 时，第二份会从
+# 7891 试到 7892、7893……；上限设小一点，避免配置写错时一路试到天荒地老。
+WEBUI_PORT_FALLBACK_LIMIT = 10
+# 实际监听的端口（与配置里的 port 可能不同）。调试页与 /api/ui-state 展示它，
+# 否则用户看到配置是 7891、实际在 7892，会以为 WebUI 没起来。
+_actual_port: Optional[int] = None
+
+
+class _WebUIServer(ThreadingHTTPServer):
+    """禁用地址复用 —— Windows 上这是多实例互相抢端口的关键。
+
+    http.server 默认 allow_reuse_address = 1，在 Windows 上会被映射成
+    SO_REUSEADDR，而 Windows 的 SO_REUSEADDR 是「强制复用」语义：它允许
+    另一个进程绑定到**已被监听**的同一个端口，两个服务同时监听成功、请求
+    随机落到其中一个。Linux 上 SO_REUSEADDR 只影响 TIME_WAIT，不会这样。
+    结果是第二份 XcBot 启动时不会报错，而是静默地和第一份抢 7891——
+    用户看到的是「WebUI 时好时坏」，而不是「端口冲突」。
+
+    关掉它之后绑定被占用的端口会正常抛错，_bind_webui_server 才能据此顺延。
+    """
+
+    allow_reuse_address = False
+    daemon_threads = True
+
+
+def _bind_webui_server(host: str, port: int, token: str) -> Optional[ThreadingHTTPServer]:
+    """在 port 上绑定 WebUI 服务，被占用时按 +1 依次顺延。
+
+    注意只处理「端口被占用」（errno 类 EADDRINUSE）——地址不可用、权限不足
+    这类错误顺延也没用，直接报错让用户去改配置。
+    """
+    global _actual_port
+    last_error = None
+    for offset in range(WEBUI_PORT_FALLBACK_LIMIT):
+        candidate_port = port + offset
+        try:
+            server = _WebUIServer((host, candidate_port), WebUIHandler)
+        except OSError as e:
+            last_error = e
+            # Windows 上是 WinError 10048，类 Unix 是 errno 98；直接按消息判断更省事
+            message = str(e).lower()
+            in_use = (
+                getattr(e, "errno", None) in (98, 48, 10048)
+                or "address already in use" in message
+                or "only one usage of each socket address" in message
+            )
+            if not in_use:
+                print(f"[WebUI] 无法监听 {host}:{candidate_port}：{e}")
+                return None
+            print(f"[WebUI] 端口 {candidate_port} 已被占用，尝试 {candidate_port + 1}")
+            continue
+        if offset > 0:
+            print(f"[WebUI] 已改用 {candidate_port}（配置端口 {port} 被占用）")
+        _actual_port = candidate_port
+        return server
+    print(f"[WebUI] 连续 {WEBUI_PORT_FALLBACK_LIMIT} 个端口都被占用，服务未启动：{last_error}")
+    return None
+
+
+def get_actual_webui_port() -> int:
+    """当前实际监听的端口。服务未启动时退回配置值，供界面展示。"""
+    if _actual_port:
+        return int(_actual_port)
+    cfg = get_webui_config()
+    return int(cfg.get("port", 7891))
+
+
 def start_webui(host: Optional[str] = None, port: Optional[int] = None, on_config_saved=None) -> Optional[ThreadingHTTPServer]:
     """启动 WebUI 后台线程。重复调用不会启动多个实例。"""
     global _server, _server_thread, _config_saved_callback
@@ -4597,10 +4861,14 @@ def start_webui(host: Optional[str] = None, port: Optional[int] = None, on_confi
     port = int(port or cfg["port"])
     token = cfg.get("access_token", "")
 
-    _server = ThreadingHTTPServer((host, port), WebUIHandler)
+    _server = _bind_webui_server(host, port, token)
+    if _server is None:
+        return None
+    # 实际监听端口可能和配置不同（原端口被占用时自动顺延）
+    actual_port = int(_server.server_address[1])
     _server_thread = threading.Thread(target=_server.serve_forever, name="XcBot-WebUI", daemon=True)
     _server_thread.start()
-    url = f"http://{host}:{port}/" + (f"?token={urllib.parse.quote(token)}" if token else "")
+    url = f"http://{host}:{actual_port}/" + (f"?token={urllib.parse.quote(token)}" if token else "")
     print(f"🌐 WebUI 已启动: {url}")
     if not str(token).strip():
         print("⚠️ 未设置 WebUI 访问 Token，打开页面后会引导你设置一个。")
@@ -4611,11 +4879,12 @@ def start_webui(host: Optional[str] = None, port: Optional[int] = None, on_confi
 
 
 def stop_webui():
-    global _server, _server_thread
+    global _server, _server_thread, _actual_port
     server = _server
     thread = _server_thread
     _server = None
     _server_thread = None
+    _actual_port = None
 
     if server:
         try:
@@ -4697,10 +4966,10 @@ LOGIN_HTML = r'''<!doctype html>
     html.has-bg[data-theme="light"] .login{background:linear-gradient(145deg,rgba(255,255,255,.74),rgba(255,255,255,.6))}.login{position:relative;z-index:1;width:min(360px,calc(100vw - 40px));padding:24px 26px 28px;border:1px solid var(--line);border-radius:26px;background:linear-gradient(145deg,var(--glass),var(--glass2));box-shadow:var(--shadow);backdrop-filter:blur(24px) saturate(145%);overflow:hidden;--cardY:12vh;transform:translateY(var(--cardY))}.login:before{content:"";position:absolute;inset:-1px;border-radius:inherit;pointer-events:none;background:radial-gradient(circle at 20% 0%,rgba(124,247,200,.18),transparent 36%),radial-gradient(circle at 88% 8%,rgba(56,213,255,.16),transparent 36%)}.login>*{position:relative}.head{display:flex;justify-content:space-between;align-items:center;gap:12px}.logo{width:54px;height:54px;border-radius:17px;overflow:hidden;background:linear-gradient(135deg,var(--accent),var(--accent3));display:grid;place-items:center;box-shadow:0 14px 34px rgba(56,213,255,.25)}.logo img{width:100%;height:100%;object-fit:cover}.theme svg{width:17px;height:17px;display:block}.theme{width:38px;height:38px;border-radius:14px;border:1px solid var(--line);background:linear-gradient(180deg,var(--glass),var(--glass2));color:var(--text);cursor:pointer;display:grid;place-items:center;padding:0;box-shadow:inset 0 1px 0 rgba(255,255,255,.10)}h1{font-size:23px;margin:16px 0 6px;font-weight:900;letter-spacing:.2px}.sub{font-size:13px;color:var(--muted);margin-bottom:22px}.field{height:54px;border:1px solid var(--line);border-radius:16px;margin:0 0 14px;display:grid;grid-template-columns:34px 1fr 30px;align-items:center;padding:0 11px;color:var(--muted);background:rgba(5,12,25,.24);box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}html[data-theme="light"] .field{background:rgba(255,255,255,.55)}.field:focus-within{border-color:rgba(56,213,255,.55);box-shadow:0 0 0 4px rgba(56,213,255,.12),inset 0 1px 0 rgba(255,255,255,.10)}.field svg{width:18px;height:18px;opacity:.72}.field input{width:100%;height:38px;align-self:center;border:0;outline:0;background:transparent;color:var(--text);font:inherit;padding:0;line-height:38px;display:block;transform:translateY(2px)}.field input::placeholder{color:var(--muted)}.eye{width:30px;height:30px;border:0;background:transparent;color:var(--muted);cursor:pointer;display:grid;place-items:center;line-height:1;padding:0;border-radius:9px;transition:.16s ease}.eye:hover{color:var(--text);background:rgba(255,255,255,.10)}.eye svg{width:17px;height:17px;display:block}
     /* 关掉 Edge / Chrome 自带的密码显示按钮，否则和我们的眼睛并排出现两个 */
     .field input::-ms-reveal,.field input::-ms-clear{display:none!important;width:0;height:0}/* 登录按钮跟主界面的「保存设置」对齐：accent→accent2 渐变、文字用 --text、
-    字重 800。原先是 accent→accent3、写死深色文字 #031018、字重 900 —— 浅色模式下
-    「登录」二字不随主题变色，按钮配色也和主界面不是一套。浅色主题下渐变掺白，
-    与 app.css 的 color-mix 处理保持一致，深色文字才压得住。 */
-    .btn{width:100%;height:42px;border:0;border-radius:15px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:var(--text);font-weight:800;cursor:pointer;margin-top:12px;box-shadow:0 12px 26px rgba(var(--accent-rgb),.20),inset 0 1px 0 rgba(255,255,255,.24);transition:.2s ease}
+    字重 800。浅色主题下渐变掺白，与 app.css 的 color-mix 处理保持一致。
+    文字必须固定深色 #031018：深色主题下 --text 是近白色，白字压浅青渐变
+    会糊成一片（主界面的「保存设置」曾经犯过同样的错）。 */
+    .btn{width:100%;height:42px;border:0;border-radius:15px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#031018;font-weight:800;cursor:pointer;margin-top:12px;box-shadow:0 12px 26px rgba(var(--accent-rgb),.20),inset 0 1px 0 rgba(255,255,255,.24);transition:.2s ease}
     html[data-theme="light"] .btn{background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 72%,white),color-mix(in srgb,var(--accent2) 72%,white))}
     .btn:hover{transform:translateY(-1px);box-shadow:0 16px 32px rgba(var(--accent-rgb),.26),inset 0 1px 0 rgba(255,255,255,.28)}.btn:disabled{opacity:.65;cursor:not-allowed}.msg{min-height:18px;margin-top:-4px;color:var(--bad);font-size:12px}/* 出错抖动。原来是 ±4px 抖两轮、linear，晃得很凶；收敛成单轮 ±2px、
     ease-out 衰减，够醒目又不刺眼。注意卡片本身带 translateY(--cardY) 定位，
@@ -4749,14 +5018,6 @@ def _static_asset_version(filename: str) -> str:
         prog = ""
     return f"{prog}-{digest}" if prog else digest
 
-
-# 启动时冻结静态资源内容，使带内容 hash 的 URL 始终对应同一份文件。
-# 自动更新覆盖磁盘文件但旧进程尚未重启时，不会出现“新 app.js 调旧后端路由”。
-for _asset_name in ("app.css", "app.js", "login.js"):
-    try:
-        _STATIC_ASSET_CONTENT[_asset_name] = (BASE_DIR / "static" / _asset_name).read_text(encoding="utf-8")
-    except Exception:
-        pass
 
 # 启动时冻结静态资源内容，使带内容 hash 的 URL 始终对应同一份文件。
 # 自动更新覆盖磁盘文件但旧进程尚未重启时，不会出现“新 app.js 调旧后端路由”。

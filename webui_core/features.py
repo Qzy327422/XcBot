@@ -15,7 +15,7 @@ FEATURE_META = [
     {"key": "ai_chat", "title": "AI 对话", "desc": "AI 回复总开关", "group": "对话"},
     {"key": "private_chat", "title": "私聊响应", "desc": "允许私聊直接触发 AI", "group": "对话"},
     {"key": "group_chat", "title": "群聊响应", "desc": "允许群内 @ / 名字 / 前缀触发 AI", "group": "对话"},
-    {"key": "sensitive_filter", "title": "屏蔽词过滤", "desc": "对消息、人设、日志展示等文本执行敏感词替换", "group": "对话"},
+    {"key": "sensitive_filter", "title": "屏蔽词过滤", "desc": "只对用户发给机器人的消息执行屏蔽词替换", "group": "对话"},
     {"key": "plugin_admin_commands", "title": "插件/模型命令", "desc": "允许使用 /插件视角、/model、/重载插件 等命令", "group": "功能配置"},
     {"key": "group_chat_context", "title": "群聊上下文感知", "desc": "旁听群消息，触发 AI 时注入上次回复后的群聊内容；默认关闭", "group": "功能配置"},
     {"key": "summary", "title": "群聊总结", "desc": "总结群聊记录与数据看板", "group": "功能配置"},

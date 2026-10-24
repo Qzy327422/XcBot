@@ -80,6 +80,8 @@ AGENT_TOOL_META = [
              "无沙箱，等同于给出机器权限，仅在完全信任时开启"},
     {"key": "file_read", "level": "admin", "default_enabled": True,
      "group": "其他", "card": "fs", "title": "读文件", "desc": ""},
+    {"key": "read_image", "level": "admin", "default_enabled": True,
+     "group": "其他", "card": "fs", "title": "读图片", "desc": ""},
     {"key": "file_edit", "level": "admin", "default_enabled": True,
      "group": "其他", "card": "fs", "title": "编辑文件", "desc": ""},
     {"key": "file_list", "level": "admin", "default_enabled": True,
@@ -139,7 +141,7 @@ def configurable_keys() -> set:
 DEFAULT_AGENT_CONFIG = {
     "enabled": True,
     "max_rounds": 30,
-    "retry_attempts": 1,
+    "retry_attempts": 3,
     "clear_workspace_on_reset": True,
     "tool_result_max_chars": 8000,
     "tool_timeout": 120,

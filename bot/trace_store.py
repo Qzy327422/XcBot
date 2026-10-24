@@ -435,6 +435,9 @@ class TraceStore:
                 "provider_attempt": int(item.get("provider_attempt") or 1),
                 "time": float(item.get("time") or 0.0),
                 "texts": clipped,
+                # 插话附带的图片张数：追踪页用它提示「这条插话还带了图」，
+                # 否则用户只看到文字，会以为图片被静默丢弃了。
+                "images": int(item.get("images") or 0),
                 "injected_after_tool": str(item.get("injected_after_tool") or ""),
                 "delivered": bool(item.get("delivered", True)),
             })

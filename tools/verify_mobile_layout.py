@@ -145,12 +145,18 @@ def run(pg, page_html: str, glass: bool) -> None:
     ok("打开时锁 body 滚动",
        pg.evaluate("getComputedStyle(document.body).overflow") == "hidden")
 
-    # 抽屉是浮层，底色必须不透明；否则会透出正文
+    # 普通/降级模式的抽屉必须有实底；GPU/SVG 液态模式由固定画布或侧栏自身背景绘制，
+    # 侧栏伪元素可以关闭，但边框必须保留。
     for theme in ("dark", "light"):
         pg.evaluate(f"document.documentElement.setAttribute('data-theme','{theme}')")
         pg.wait_for_timeout(80)
         bg = pg.evaluate("getComputedStyle(document.querySelector('.sidebar')).backgroundColor")
-        ok(f"{theme} 抽屉底色不透明", alpha_of(bg) >= .99, f"background={bg}")
+        if glass:
+            border = pg.evaluate("getComputedStyle(document.querySelector('.sidebar')).borderTopColor")
+            warp = pg.evaluate("getComputedStyle(document.querySelector('.sidebar'),'::before').display")
+            ok(f"{theme} 液态抽屉保留玻璃层", bool(border) and (warp != 'none' or alpha_of(bg) > 0), f"background={bg} border={border} warp={warp}")
+        else:
+            ok(f"{theme} 普通抽屉底色不透明", alpha_of(bg) >= .99, f"background={bg}")
     pg.evaluate("document.documentElement.setAttribute('data-theme','dark')")
 
     # 抽屉里点导航项应当收起

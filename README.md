@@ -22,7 +22,7 @@
 
 </div>
 
-<a href="https://tutu.to/image/4XGI" target="_blank"><img src="https://t.tutu.to/img/4XGI" alt="图片" /></a>
+<img src="https://picui.ogmua.cn/s1/2026/09/05/6a9ba288119ab.webp" alt="XcBot WebUI" />
 
 XcBot 是一款基于 NapCat + OneBot + hyper-bot 的 QQ 机器人。除了 AI 对话、
 多模型切换、WebUI 管理和插件热加载之外，v3.0 起内置了 **Agent 能力**——
