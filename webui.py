@@ -4786,19 +4786,19 @@ _actual_port: Optional[int] = None
 
 
 class _WebUIServer(ThreadingHTTPServer):
-    """禁用地址复用 —— Windows 上这是多实例互相抢端口的关键。
+    """allow_reuse_address 必须按平台区分，不能一刀切关掉。
 
-    http.server 默认 allow_reuse_address = 1，在 Windows 上会被映射成
-    SO_REUSEADDR，而 Windows 的 SO_REUSEADDR 是「强制复用」语义：它允许
-    另一个进程绑定到**已被监听**的同一个端口，两个服务同时监听成功、请求
-    随机落到其中一个。Linux 上 SO_REUSEADDR 只影响 TIME_WAIT，不会这样。
-    结果是第二份 XcBot 启动时不会报错，而是静默地和第一份抢 7891——
-    用户看到的是「WebUI 时好时坏」，而不是「端口冲突」。
+    Windows：SO_REUSEADDR 是「强制复用」语义，允许另一个进程绑定到**已被监听**
+    的同一个端口，两个服务同时监听成功、请求随机落到其中一个。关掉它之后
+    多开抢 7891 会正常抛错，_bind_webui_server 才能据此顺延，而不是静默双开。
 
-    关掉它之后绑定被占用的端口会正常抛错，_bind_webui_server 才能据此顺延。
+    Linux/macOS：SO_REUSEADDR 只影响 TIME_WAIT，不会有「强制复用」问题。
+    关掉它反而有害——重启/热更新时旧 WebUI 的 SSE 长连接残留 TIME_WAIT
+    （默认 60s），新进程 bind 原端口会被 EADDRINUSE 挡下，误触发端口顺延，
+    WebUI 从 7891 漂到 7892。开着它即可快速重绑原端口。
     """
 
-    allow_reuse_address = False
+    allow_reuse_address = (os.name != "nt")
     daemon_threads = True
 
 
