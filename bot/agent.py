@@ -612,20 +612,189 @@ def materialize_large_result(text: str, max_chars: int, overflow_dir: str,
     return tip, {"mode": "overflow_file", "path": path, "error": ""}
 
 
-def _parse_args(raw) -> tuple[dict, str]:
-    """解析 tool_call.arguments。返回 (args, 错误说明)；错误说明非空表示解析失败。"""
+def _parse_args(raw, allowed: set | None = None) -> tuple[dict, str, bool]:
+    """解析 tool_call.arguments。返回 (args, 错误说明, 是否解包过嵌套)；错误说明非空表示解析失败。
+
+    第三个返回值 unwrapped 让调用点能在日志里区分「模型本就发对」与
+    「模型多包了一层被框架纠正」，避免以后排查格式问题时无法定位。
+
+    另外宽容处理两类模型常见错误：
+    1. 把整个参数对象多包一层 arguments/args/params；
+    2. Windows 路径写成单反斜杠（"C:\\Users\\..."），导致 JSON 转义出错。
+    两者都只在确有必要时介入，正常调用完全不受影响。
+    """
     if isinstance(raw, dict):
-        return raw, ""
-    text = str(raw or "").strip()
-    if not text:
-        return {}, ""
-    try:
-        parsed = json.loads(text)
-    except Exception as e:
-        return {}, f"参数不是合法 JSON：{e}"
-    if not isinstance(parsed, dict):
-        return {}, f"参数必须是 JSON 对象，实际是 {type(parsed).__name__}"
-    return parsed, ""
+        parsed = raw
+    else:
+        text = str(raw or "").strip()
+        if not text:
+            return {}, "", False
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            # 模型常把 Windows 路径写成单反斜杠，例如 "C:\Users\test"。
+            # JSON 里 \U 直接非法；而 \t 是合法转义，会被解析成制表符——
+            # 只补非法转义是不够的，路径照样会被吃坏。
+            #
+            # 这里只在「首次解析已经失败」时才走修复，因此对于本来就合法的
+            # JSON（比如真的想传换行的 content），行为完全不变。
+            #
+            # 修复规则：只保留 JSON 里真正有语义的转义 \\ \" \/ \uXXXX，
+            # 其余反斜杠一律当字面量补成 \\。于是 C:\Users\test 得到
+            # C:\Users\test，而 C:\\Users\\test 也仍是 C:\Users\test。
+            repaired = re.sub(r'\\(?!["\\/u])', r'\\\\', text)
+            try:
+                parsed = json.loads(repaired)
+            except Exception as e:
+                return {}, f"参数不是合法 JSON：{e}", False
+        if not isinstance(parsed, dict):
+            return {}, f"参数必须是 JSON 对象，实际是 {type(parsed).__name__}", False
+
+    unwrapped = False
+    # 容错：模型偶尔会把整个参数对象再包一层 arguments/args/params。
+    # 只在「外层仅此一个键 + 内层是非空 dict + 内层至少命中一个合法参数」时解包，
+    # 免得把某个真实名叫 args 的参数误当包裹层（当前没有工具这样命名，
+    # 但保留这个保护，以后新增参数名时不会悄悄改变行为）。
+    if allowed and len(parsed) == 1:
+        key, value = next(iter(parsed.items()))
+        if key in ("arguments", "args", "params") and isinstance(value, dict) and value and (set(value) & allowed):
+            parsed = value
+            unwrapped = True
+    return parsed, "", unwrapped
+
+
+# ==================== 文本形式的工具调用（DSML / 原生特殊 token） ====================
+# 部分 DeepSeek 系接口在 tool_calls 字段为空时，会把调用直接写进 content：
+#   <｜DSML｜tool_calls>
+#   <｜DSML｜invoke name="file_read">
+#   <｜DSML｜parameter name="path">/etc/hosts</｜DSML｜parameter>
+#   </｜DSML｜invoke>
+#   </｜DSML｜tool_calls>
+# 不处理的话，这些标记会原样发给用户，工具也不会执行。
+# 这里把它们解析成与 SDK tool_call 相同形状的对象，走正常执行路径；
+# 解析不了的标记也会被剥离，至少不会把内部标记暴露给用户。
+_DELIM = r"[｜|]{1,}"
+
+
+class _TextFunctionCall:
+    """把文本形式的工具调用包装成与 SDK tool_call 相同的形状。"""
+
+    class _Fn:
+        __slots__ = ("name", "arguments")
+
+        def __init__(self, name: str, arguments: str):
+            self.name = name
+            self.arguments = arguments
+
+    __slots__ = ("id", "type", "function")
+
+    def __init__(self, index: int, name: str, arguments: str):
+        self.id = f"textcall_{index}"
+        self.type = "function"
+        self.function = self._Fn(name, arguments)
+
+
+def _extract_text_tool_calls(text: str) -> tuple[list, str, bool]:
+    """从模型文本里提取 DSML / 特殊 token 形式的工具调用。
+
+    返回 (calls, 清洗后的文本, 是否检测到调用标记)。
+    只要检测到标记即 detected=True；calls 为空表示标记存在但无法解析。
+    """
+    if not isinstance(text, str) or not text:
+        return [], text, False
+
+    # ① DSML 形式（<｜DSML｜invoke ...>）
+    dsml_invoke = re.compile(
+        rf"<\s*{_DELIM}\s*DSML\s*{_DELIM}\s*invoke\s+name\s*=\s*[\"']([^\"']+)[\"'][^>]*>"
+        rf"(.*?)"
+        rf"<\s*/\s*{_DELIM}\s*DSML\s*{_DELIM}\s*invoke\s*>",
+        re.S | re.I,
+    )
+    dsml_param = re.compile(
+        rf"<\s*{_DELIM}\s*DSML\s*{_DELIM}\s*parameter\s+name\s*=\s*[\"']([^\"']+)[\"'][^>]*>"
+        rf"(.*?)"
+        rf"<\s*/\s*{_DELIM}\s*DSML\s*{_DELIM}\s*parameter\s*>",
+        re.S | re.I,
+    )
+    # 外层包裹标签：calls / tool_calls / function_calls
+    dsml_outer = re.compile(
+        rf"<\s*{_DELIM}\s*DSML\s*{_DELIM}\s*(?:tool_|function_)?calls\s*>"
+        rf".*?"
+        rf"<\s*/\s*{_DELIM}\s*DSML\s*{_DELIM}\s*(?:tool_|function_)?calls\s*>",
+        re.S | re.I,
+    )
+    # ② DeepSeek 原生特殊 token 形式（<｜tool▁calls▁begin｜>）
+    native_begin = "<｜tool▁calls▁begin｜>"
+    # 形如：<｜tool▁call▁begin｜>function<｜tool▁sep｜>file_read\n{...}<｜tool▁call▁end｜>
+    native_call = re.compile(
+        r"<｜tool▁call▁begin｜>\s*(?:function\s*<｜tool▁sep｜>\s*)?([\w.\-]+)\s*"
+        r"(.*?)<｜tool▁call▁end｜>",
+        re.S,
+    )
+    native_outer = re.compile(
+        r"<｜tool▁calls▁begin｜>.*?<｜tool▁calls▁end｜>", re.S)
+
+    # 只有真的出现标记标签才算检测到；正文里单纯提到 “DSML” 不误判。
+    detected = bool(re.search(rf"<\s*/?\s*{_DELIM}\s*DSML\b", text)) \
+        or (native_begin in text) or ("<｜tool▁" in text)
+    if not detected:
+        return [], text, False
+
+    calls: list[_TextFunctionCall] = []
+    cleaned = text
+
+    # --- DSML invoke 块 ---
+    for m in dsml_invoke.finditer(text):
+        name = m.group(1).strip()
+        body = m.group(2)
+        args: dict = {}
+        params = list(dsml_param.finditer(body))
+        if params:
+            for p in params:
+                args[p.group(1).strip()] = p.group(2).strip()
+        else:
+            # 没有 parameter 标签时，退而求其次找 JSON 对象
+            lb, rb = body.find("{"), body.rfind("}")
+            if 0 <= lb < rb:
+                try:
+                    parsed = json.loads(body[lb:rb + 1])
+                    if isinstance(parsed, dict):
+                        args = parsed
+                except Exception:
+                    args = {}
+        calls.append(_TextFunctionCall(
+            len(calls) + 1, name, json.dumps(args, ensure_ascii=False)))
+
+    # --- 原生 token 块 ---
+    if not calls and native_begin in text:
+        for m in native_call.finditer(text):
+            name = m.group(1).strip()
+            raw = m.group(2).strip()
+            lb, rb = raw.find("{"), raw.rfind("}")
+            args_text = raw[lb:rb + 1] if 0 <= lb < rb else "{}"
+            try:
+                parsed = json.loads(args_text)
+                if not isinstance(parsed, dict):
+                    parsed = {}
+            except Exception:
+                parsed = {}
+            calls.append(_TextFunctionCall(
+                len(calls) + 1, name, json.dumps(parsed, ensure_ascii=False)))
+
+    # --- 清洗：把工具调用标记从给用户看的文本里移除 ---
+    if native_outer.search(cleaned):
+        cleaned = native_outer.sub("", cleaned)
+    if dsml_outer.search(cleaned):
+        cleaned = dsml_outer.sub("", cleaned)
+    else:
+        cleaned = dsml_invoke.sub("", cleaned)
+    # 残留的孤立标记（没有配对、或格式不认识）
+    cleaned = re.sub(
+        rf"<\s*/?\s*{_DELIM}\s*DSML\s*{_DELIM}\s*[\w_]+\b[^>]*>", "", cleaned)
+    cleaned = re.sub(r"<｜tool▁[^｜>]*｜>", "", cleaned)
+    cleaned = cleaned.strip()
+
+    return calls, cleaned, detected
 
 
 def _is_handler_failure_text(text: str) -> bool:
@@ -1205,6 +1374,22 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
 
         raw_calls = list(getattr(message, "tool_calls", None) or [])
         content = str(getattr(message, "content", "") or "")
+
+        # 有些接口（部分 DeepSeek 系）不把调用放进 tool_calls，而是直接写进
+        # content 的 DSML/特殊 token 标记里。这里解析成正常调用，避免
+        # “标记原样发给用户、工具一次都没执行”。解析不了的也会被剥离。
+        if not raw_calls and content.strip():
+            text_calls, cleaned, saw_markup = _extract_text_tool_calls(content)
+            if saw_markup:
+                content = cleaned
+                if text_calls:
+                    raw_calls = text_calls
+                    ctx.say(
+                        f"模型以文本形式发起了 {len(text_calls)} 个工具调用，已解析执行："
+                        f"{[c.function.name for c in text_calls]}", "AGENT")
+                else:
+                    ctx.say("检测到工具调用标记但无法解析，已从回复中剥离", "AGENT")
+
         if content.strip():
             content_so_far = content
 
@@ -1330,7 +1515,12 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
                     f"{', '.join(t['function']['name'] for t in tools) or '（无）'}。"
                     "请只使用列表里的工具名。"
                 )
-            args, parse_err = _parse_args(getattr(call.function, "arguments", ""))
+            args, parse_err, unwrapped = _parse_args(
+                getattr(call.function, "arguments", ""), spec.allowed_keys())
+            if unwrapped:
+                # 模型把整个参数对象又包了一层 arguments/args/params，已纠正。
+                # 记一条，否则日志里模型发的格式和实际执行的对不上，排查困难。
+                ctx.say(f"{name} 的参数被多包了一层包裹键，已自动解包", "AGENT")
             if parse_err:
                 return await _finish(
                     f"error: 调用 {name} 的{parse_err}。请重新生成合法的 JSON 参数。")

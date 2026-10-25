@@ -2695,20 +2695,26 @@ def _restart_current_process_after_update() -> None:
             # 新进程必须脱离旧会话，否则会出现“安装完成后窗口没了、服务没起来”。
             log_dir = BASE_DIR / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
-            with open(os.devnull, "rb") as stdin, open(log_dir / "update-restart.log", "ab", buffering=0) as log_file:
-                # 日志内容是新进程 stdout 的原样重定向，本身没有时间戳；
-                # 这里在每次重启前写一行带时间的分隔头，方便区分每次重启的输出。
-                stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                log_file.write(f"\n===== [{stamp}] 自动更新重启，启动新进程 =====\n".encode("utf-8"))
-                subprocess.Popen(
-                    argv,
-                    cwd=str(BASE_DIR),
-                    stdin=stdin,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    close_fds=True,
-                    start_new_session=True,
-                )
+            # 注意：log_file 必须保持打开，不能放在 with 里随 Popen 后关闭。
+            # 否则新进程启动时 stdout 指向已关闭的 fd，会直接崩溃退出。
+            stdin = open(os.devnull, "rb")
+            log_file = open(log_dir / "update-restart.log", "ab", buffering=0)
+            # 日志内容是新进程 stdout 的原样重定向，本身没有时间戳；
+            # 这里在每次重启前写一行带时间的分隔头，方便区分每次重启的输出。
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            log_file.write(f"\n===== [{stamp}] 自动更新重启，启动新进程 =====\n".encode("utf-8"))
+            subprocess.Popen(
+                argv,
+                cwd=str(BASE_DIR),
+                stdin=stdin,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+                start_new_session=True,
+            )
+            # 父进程不再需要使用这两个 fd，关闭自己的副本；新进程继承的副本不受影响。
+            stdin.close()
+            log_file.close()
     except Exception as e:
         raise RuntimeError(f"启动新进程失败: {e}") from e
 
