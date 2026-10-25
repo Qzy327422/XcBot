@@ -282,8 +282,8 @@
     "background_blur": 10,
     "liquid_glass": false,
     "disable_background_blur": true,
-    "liquid_glass_refraction": 5,
-    "card_background_blur": 2
+    "liquid_glass_refraction": 1,
+    "card_background_blur": 3
   },
   "FeatureSwitches": {
     "_comment": "功能热开关。可在 WebUI 中直接切换，保存后无需重启即可生效。",

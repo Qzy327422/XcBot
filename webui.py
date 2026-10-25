@@ -1339,8 +1339,8 @@ def get_webui_config() -> Dict[str, Any]:
         "background_blur": int(float(webui.get("background_blur", 10) or 0)),
         "liquid_glass": normalize_bool_config(webui.get("liquid_glass", False), default=False),
         "disable_background_blur": normalize_bool_config(webui.get("disable_background_blur", True), default=True),
-        "liquid_glass_refraction": int(float(webui.get("liquid_glass_refraction", 5) or 0)),
-        "card_background_blur": int(float(webui.get("card_background_blur", 2) or 0)),
+        "liquid_glass_refraction": int(float(webui.get("liquid_glass_refraction", 1) or 0)),
+        "card_background_blur": int(float(webui.get("card_background_blur", 3) or 0)),
     }
 
 
@@ -1889,8 +1889,8 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("WebUI.background_blur", "背景模糊度", "range", "0 到 40，数值越大越柔和", 10, min=0, max=40, step=1),
             field("WebUI.liquid_glass", "液态玻璃UI", "bool", "⚠️ 低配机可能会出现卡顿，请自行决定是否开启", category="液态玻璃UI"),
             field("WebUI.disable_background_blur", "禁用背景模糊", "bool", "仅在液态玻璃UI开启时生效，开启后将忽略「背景模糊度」选项", True, category="液态玻璃UI"),
-            field("WebUI.liquid_glass_refraction", "液态玻璃折射强度", "range", "0 到 30，数值越大折射扭曲越明显", 5, category="液态玻璃UI", min=0, max=30, step=1),
-            field("WebUI.card_background_blur", "卡片背景模糊度", "range", "0 到 10，控制液态玻璃卡片背景的模糊程度", 2, category="液态玻璃UI", min=0, max=10, step=1),
+            field("WebUI.liquid_glass_refraction", "液态玻璃折射强度", "range", "0 到 30，数值越大折射扭曲越明显", 1, category="液态玻璃UI", min=0, max=30, step=1),
+            field("WebUI.card_background_blur", "卡片背景模糊度", "range", "0 到 10，控制液态玻璃卡片背景的模糊程度", 3, category="液态玻璃UI", min=0, max=10, step=1),
         ]},
         {"key": "trace", "title": "追踪", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></svg>', "desc": "最近 24 小时每次 AI 对话的发送链路、模型调用链路、系统提示词与 token 明细", "fields": []},
         {"key": "logs", "title": "实时日志", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg>', "desc": "查看完整运行日志", "fields": []},

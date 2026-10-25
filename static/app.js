@@ -852,9 +852,9 @@ function applyWebuiAppearance(){const v=state.bundle?.form_values||{},root=docum
     }
     const refractionRaw=v['WebUI.liquid_glass_refraction'];
     // 用 ?? 而不是 ||：滑块拖到 0 是有效值，不能被当成「未设置」回退成 5。
-    const liquidGlassRefraction=Math.max(0,Math.min(30,Number(refractionRaw??5)));root.style.setProperty('--liquid-glass-refraction',String(liquidGlassRefraction));const cardBgBlur=Math.max(0,Math.min(10,Number(v['WebUI.card_background_blur']??2)));root.style.setProperty('--card-bg-blur',cardBgBlur+'px');root.classList.toggle('liquid-glass',liquid);const svgReady=liquidGlassController.setEnabled(liquid);liquidGlassLensController.setEnabled(liquid,bgUrl,svgReady);if(liquid){liquidGlassController.syncRefraction();liquidGlassLensController.refresh()}
+    const liquidGlassRefraction=Math.max(0,Math.min(30,Number(refractionRaw??1)));root.style.setProperty('--liquid-glass-refraction',String(liquidGlassRefraction));const cardBgBlur=Math.max(0,Math.min(10,Number(v['WebUI.card_background_blur']??3)));root.style.setProperty('--card-bg-blur',cardBgBlur+'px');root.classList.toggle('liquid-glass',liquid);const svgReady=liquidGlassController.setEnabled(liquid);liquidGlassLensController.setEnabled(liquid,bgUrl,svgReady);if(liquid){liquidGlassController.syncRefraction();liquidGlassLensController.refresh()}
     // 键不存在时不要写登录缓存：会把本还有的 src/bg 一并清掉，下次进登录页就没背景。
-    if(bgImageKnown)cacheAppearanceForLogin(preset,blur,img,bgUrl)}
+    if(bgImageKnown){saveAppearanceCache({preset:preset,blur:blur,bgUrl:bgUrl,cardBlur:cardBgBlur,refraction:liquidGlassRefraction});cacheAppearanceForLogin(preset,blur,img,bgUrl)}}
 function showLiquidGlassStatus(){
   document.getElementById('glassStatusDialog')?.remove();
   const root=document.documentElement,sample=document.querySelector('.glass-gpu-layer')||document.querySelector('.glass-lens-surface>.glass-lens-layer');
@@ -884,6 +884,28 @@ function showLiquidGlassStatus(){
 // 请求配置或背景图——那需要开一个匿名可访问的出口，登录前多一个数据面。
 // 换成在这里（已登录、已鉴权）把结果存进 localStorage，登录页只读本地缓存。
 // 缓存不到就退回渐变色，功能不受影响。
+// 主界面外观缓存：刷新后先用上次的壁纸/参数立即画一帧，
+// 等 /api/ui-state 回来再按真实配置覆盖。否则刷新后会有一段时间
+// 只有主题渐变、壁纸和玻璃都还没出现。
+const APPEARANCE_CACHE_KEY='xcbotAppearanceCache';
+function saveAppearanceCache(o){
+  try{localStorage.setItem(APPEARANCE_CACHE_KEY,JSON.stringify(o))}catch(e){}
+}
+function applyCachedAppearance(){
+  try{
+    const o=JSON.parse(localStorage.getItem(APPEARANCE_CACHE_KEY)||'null');
+    if(!o)return;
+    const root=document.documentElement;
+    if(o.preset)root.dataset.webuiPreset=o.preset;
+    if(typeof o.blur==='number')root.style.setProperty('--user-bg-blur',o.blur+'px');
+    if(o.bgUrl){
+      root.style.setProperty('--user-bg-image','url("'+String(o.bgUrl).replace(/"/g,'%22')+'")');
+      root.classList.add('has-bg');
+    }
+    if(typeof o.cardBlur==='number')root.style.setProperty('--card-bg-blur',o.cardBlur+'px');
+    if(typeof o.refraction==='number')root.style.setProperty('--liquid-glass-refraction',String(o.refraction));
+  }catch(e){}
+}
 const LOGIN_LOOK_KEY='xcbotLoginLook';
 function cacheAppearanceForLogin(preset,blur,img,bgUrl){
   try{
@@ -980,9 +1002,9 @@ function setMobileNav(open){
 }
 function toggleMobileNav(){setMobileNav(!document.body.classList.contains('nav-open'))}
 function closeMobileNav(){setMobileNav(false)}
-function gotoPage(k,section=''){closeMobileNav();if(state.dirty){const m=el('leaveModal');if(m){m.style.display='flex';m._pending={k,section};return}}if(state.bundle&&!isValidPage(k))k='welcome';syncCurrentPageFieldsFromDom();if(k==='chatroom'){chatState._enterBottom=true}window.__pageSwitched=true;state._navigating=true;state.dirty=false;state.lastInputAt=0;clearDraft();updateRoute(k,section);render();const live=['welcome','logs','stats','debug','chatroom','store'].includes(k);Promise.resolve(live?refreshAll(true):null).finally(()=>{state._navigating=false});if(k==='store')loadStore();if(k==='knowledge')loadKnowledge();if(k==='trace'&&!traceState.openId)traceLoad()}
+function gotoPage(k,section='',opts={}){closeMobileNav();if(state.dirty){const m=el('leaveModal');if(m){m.style.display='flex';m._pending={k,section};return}}if(state.bundle&&!isValidPage(k))k='welcome';if(!opts.discard)syncCurrentPageFieldsFromDom();if(k==='chatroom'){chatState._enterBottom=true}window.__pageSwitched=true;state._navigating=true;state.dirty=false;state.lastInputAt=0;clearDraft();updateRoute(k,section);render();const live=['welcome','logs','stats','debug','chatroom','store'].includes(k);/* 确认放弃改动时也要强制回读服务端，否则非 live 页面会继续显示未保存的编辑值 */Promise.resolve((live||opts.discard)?refreshAll(true):null).finally(()=>{state._navigating=false});if(k==='store')loadStore();if(k==='knowledge')loadKnowledge();if(k==='trace'&&!traceState.openId)traceLoad()}
 function leaveCancel(){const m=el('leaveModal');if(m){m.style.display='none';m._pending=null}}
-function leaveConfirm(){const m=el('leaveModal');if(!m)return;const p=m._pending;m.style.display='none';m._pending=null;state.dirty=false;traceDiscardPending();if(p)gotoPage(p.k||p.page,p.section||'')}
+function leaveConfirm(){const m=el('leaveModal');if(!m)return;const p=m._pending;m.style.display='none';m._pending=null;state.dirty=false;traceDiscardPending();/* 确认离开=丢弃未保存改动：不同步 DOM，并强制从服务端重载 */if(p)gotoPage(p.k||p.page,p.section||'',{discard:true})}
 function renderNav(){const nav=el('nav');if(!nav)return;if(!el('navIndicator')){nav.innerHTML=`<div class="custom-nav">`+pages().map(p=>{let iconHtml='';if(p.icon&&p.icon.includes('<svg'))iconHtml=p.icon;else if(p.icon)iconHtml=p.icon;else iconHtml='•';return `<div class="custom-nav-item" data-key="${p.key}" onclick="gotoPage('${p.key}')"><div class="custom-nav-icon">${iconHtml}</div><div class="custom-nav-label">${esc(p.title)}</div></div>`}).join('')+`<div class="active-indicator-floater" id="navIndicator"></div><div class="nav-bg-floater" id="navBg"></div></div>`;}nav.querySelectorAll('.custom-nav-item').forEach(item=>{item.classList.toggle('active',item.dataset.key===state.current);});}
 const updateNavIndicator=()=>{const nav=el('nav'),items=nav?nav.querySelectorAll('.custom-nav-item'):[],floater=el('navIndicator'),floaterBg=el('navBg');if(!floater||!nav)return;const host=nav.querySelector('.custom-nav')||nav;let activeEl=null;for(let i=0;i<items.length;i++){if(items[i].classList.contains('active')){activeEl=items[i];break}}if(activeEl){const hostTop=host.getBoundingClientRect().top;const itemTop=activeEl.getBoundingClientRect().top;const top=itemTop-hostTop+host.scrollTop;floater.style.opacity='1';floater.style.top=(top+10)+'px';floater.style.height=Math.max(0,activeEl.offsetHeight-20)+'px';if(floaterBg){floaterBg.style.opacity='1';floaterBg.style.top=top+'px';floaterBg.style.height=activeEl.offsetHeight+'px'}}else{floater.style.opacity='0';if(floaterBg)floaterBg.style.opacity='0'}};
 function renderConnectionStatus(){const s=state.bundle?.status||{},cs=s.connection_status||{},cfg=s.connection||{};const statusEl=el('connectionStatus'),detailEl=el('connectionDetail');if(statusEl){const text=cs.text||'未知状态';statusEl.textContent=text;statusEl.className='pill '+((cs.state==='connected')?'ok':(cs.state==='failed'||cs.state==='disconnected'||cs.state==='stopped')?'bad':'')}if(detailEl){const lines=[];if(cs.detail)lines.push(cs.detail);const endpoint=[cfg.host&&cfg.port?`${cfg.host}:${cfg.port}`:''].filter(Boolean).join(' · ');if(endpoint)lines.push(endpoint);detailEl.textContent=lines.join(' | ')||'暂无连接详情'}}
@@ -1668,7 +1690,7 @@ async function storeUninstall(name){const btn=el('storeBtn_'+name);if(btn){btn.d
 async function storeReload(name){const btn=el('storeReload_'+name);if(btn){btn.disabled=true;btn.textContent='重载中…'}try{const r=await api('/api/plugins/reload',{method:'POST',body:JSON.stringify({name})});toast(r.message||'重载成功')}catch(e){toast(e.message,false)}finally{if(btn){btn.disabled=false;btn.textContent='重载'}}}
 function storeSubmit(){const name=(el('submitName')||{}).value?.trim();const author=(el('submitAuthor')||{}).value?.trim();const desc=(el('submitDesc')||{}).value?.trim();if(!name||!author||!desc){toast('请填写插件名、作者和描述',false);return}const body=`## 插件提交\n\n**插件名**：${name}\n**作者**：${author}\n\n**功能描述**：\n${desc}\n\n**插件压缩包**：（请将 zip 文件拖拽到下方评论框上传）`;const params=new URLSearchParams({title:`[插件提交] ${name}`,body,labels:'plugin-submission'});window.open(`https://github.com/Qzy327422/XcBot-Plugins/issues/new?${params}`,'_blank')}
 async function storeUploadFile(input){const file=input.files[0];if(!file)return;if(file.size>12*1024*1024){toast('插件包过大（上限 12MB）',false);input.value='';return}const name=file.name.replace(/\.zip$/i,'');const buf=await file.arrayBuffer();const bytes=new Uint8Array(buf);let bin='';const chunk=0x8000;for(let i=0;i<bytes.length;i+=chunk){bin+=String.fromCharCode.apply(null,bytes.subarray(i,i+chunk))}const b64=btoa(bin);input.value='';try{const r=await api('/api/plugins/upload',{method:'POST',body:JSON.stringify({name,zip_b64:b64})});toast(r.message||'安装成功');await loadStore()}catch(e){toast(e.message,false)}}
-setTheme(localStorage.webuiTheme||'light');window.addEventListener('hashchange',()=>{if(state._navigating)return;if(state.dirty){const m=el('leaveModal');if(m){m.style.display='flex';const r=splitHashRoute();m._pending={k:normalizeRoutePage(r.page),section:r.section||''};history.replaceState(null,'',routeForPage(state.current,state.section));return}}applyRoute();render()});window.addEventListener('beforeunload',e=>{if(state.dirty){e.preventDefault();e.returnValue=''}});applyRoute();if(state.current==='chatroom')chatState._enterBottom=true;if(!location.hash)updateRoute(state.current,'',true);refreshAll(true).then(checkAuthState);setInterval(()=>refreshAll(false),5000);setInterval(()=>{if(state.current==='trace'&&!traceState.openId&&!traceState.loading&&!traceTogglePending())traceLoad(true)},5000);setInterval(()=>{if(state.current==='welcome'||state.current==='logs')scrollLogsToBottom()},500);
+setTheme(localStorage.webuiTheme||'light');window.addEventListener('hashchange',()=>{if(state._navigating)return;if(state.dirty){const m=el('leaveModal');if(m){m.style.display='flex';const r=splitHashRoute();m._pending={k:normalizeRoutePage(r.page),section:r.section||''};history.replaceState(null,'',routeForPage(state.current,state.section));return}}applyRoute();render()});window.addEventListener('beforeunload',e=>{if(state.dirty){e.preventDefault();e.returnValue=''}});applyRoute();if(state.current==='chatroom')chatState._enterBottom=true;if(!location.hash)updateRoute(state.current,'',true);applyCachedAppearance();refreshAll(true).then(checkAuthState);setInterval(()=>refreshAll(false),5000);setInterval(()=>{if(state.current==='trace'&&!traceState.openId&&!traceState.loading&&!traceTogglePending())traceLoad(true)},5000);setInterval(()=>{if(state.current==='welcome'||state.current==='logs')scrollLogsToBottom()},500);
 
 const AGENT_LEVEL_LABEL={user:'所有人',admin:'仅管理员'};
 function renderAgent(){

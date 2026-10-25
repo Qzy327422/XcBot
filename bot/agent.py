@@ -1384,9 +1384,6 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
                 content = cleaned
                 if text_calls:
                     raw_calls = text_calls
-                    ctx.say(
-                        f"模型以文本形式发起了 {len(text_calls)} 个工具调用，已解析执行："
-                        f"{[c.function.name for c in text_calls]}", "AGENT")
                 else:
                     ctx.say("检测到工具调用标记但无法解析，已从回复中剥离", "AGENT")
 
@@ -1515,12 +1512,8 @@ async def _run_tool_loop_inner(complete, messages: list[dict], ctx: AgentContext
                     f"{', '.join(t['function']['name'] for t in tools) or '（无）'}。"
                     "请只使用列表里的工具名。"
                 )
-            args, parse_err, unwrapped = _parse_args(
+            args, parse_err, _unwrapped = _parse_args(
                 getattr(call.function, "arguments", ""), spec.allowed_keys())
-            if unwrapped:
-                # 模型把整个参数对象又包了一层 arguments/args/params，已纠正。
-                # 记一条，否则日志里模型发的格式和实际执行的对不上，排查困难。
-                ctx.say(f"{name} 的参数被多包了一层包裹键，已自动解包", "AGENT")
             if parse_err:
                 return await _finish(
                     f"error: 调用 {name} 的{parse_err}。请重新生成合法的 JSON 参数。")
