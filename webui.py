@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import copy
+import math
 import hashlib
 import hmac
 import ipaddress
@@ -123,11 +125,18 @@ _connection_status = {
 from webui_core.resources import format_uptime as _format_uptime
 from webui_core.resources import get_resource_usage as _get_resource_usage
 
-from webui_core.features import DEFAULT_FEATURE_SWITCHES, FEATURE_META
+from webui_core.features import DEFAULT_FEATURE_SWITCHES, FEATURE_META as _FEATURE_META, compression_trigger_rounds
 from webui_core.agent_meta import (
     AGENT_TOOL_META, AGENT_TOOL_GROUPS,
     visible_tools, card_members, configurable_keys,
 )
+
+# 展示文案单独覆盖，不修改共享元数据或功能开关的默认值。
+FEATURE_META = [
+    {**item, "desc": "全局按概率允许弱黑名单用户获得 AI 回复，不影响命令和插件；群聊主动仅在引用他人消息时检查该作者，未引用或引用自己不套用用户弱名单"}
+    if item["key"] == "weak_blacklist" else item
+    for item in _FEATURE_META
+]
 
 # Hyper 库自己往 stdout 打的噪音行，直接吞掉不进控制台/日志。
 # 典型是每轮重连都出现的 "🔴 *CRIT  重试次数达到最大值(5)，退出"——它描述的是
@@ -554,7 +563,7 @@ def _chatroom_rotation_endpoints(model: str) -> list[Dict[str, Any]]:
         return []
     selected = str(model or "").strip()
     if not selected:
-        return endpoints
+        return [ep for ep in endpoints if bool(ep.get("enabled", True))]
     start = None
     for idx, ep in enumerate(endpoints):
         display_model = ep.get("display_model") or _provider_display_model(ep.get("provider_id", ""), ep.get("model", ""))
@@ -744,12 +753,21 @@ def _chatroom_list_sessions() -> list[Dict[str, Any]]:
         return result
 
 
+def _chatroom_rotation_signature():
+    others = _chatroom_others()
+    return [[str(item.get("provider_id", "") or "").strip(),
+             str(item.get("model", "") or "").strip()]
+            for item in (build_llm_endpoints_from_providers(others) or
+                         _normalize_webui_llm_endpoints(others.get("llm_endpoints", [])))]
+
+
 def _chatroom_new_session(model: str, title: str = "", persona: str = "") -> Dict[str, Any]:
     now = int(time.time())
     obj = {
         "id": uuid.uuid4().hex,
         "title": (title or "新会话").strip()[:60] or "新会话",
         "model": model or "",
+        "_rotation_signature": _chatroom_rotation_signature(),
         "persona": str(persona or "").strip(),
         "created_at": now,
         "updated_at": now,
@@ -781,16 +799,16 @@ def _webui_short_text(value: Any, limit: int = 50) -> str:
 def _chatroom_log_api_request(scene: str, model: str, base_url: str, current_key: str, message_count: int, preview: str):
     host = urllib.parse.urlparse(base_url).netloc or base_url
     key_mask = (current_key[:6] + "...") if current_key else "none"
-    _append_log(f"[API] {scene} -> {model} @{host} key={key_mask} msg={message_count} q={_webui_short_text(preview, 50)}", "webui")
+    _append_log(f"[API] {scene} -> {model} @{host} key={key_mask} msg={message_count} q={preview}", "webui")
 
 
 def _chatroom_log_api_success(scene: str, model: str, total_tokens: int, reply: str):
-    _append_log(f"[API] {scene} <- {model} ok tokens={int(total_tokens or 0)} a={_webui_short_text(reply, 50)}", "webui")
+    _append_log(f"[API] {scene} <- {model} ok tokens={int(total_tokens or 0)} a={reply}", "webui")
 
 
 def _chatroom_log_api_failure(scene: str, model: str, current_key: str, error: Any):
     key_mask = (current_key[:6] + "...") if current_key else "none"
-    _append_log(f"[API] {scene} xx {model} key={key_mask} err={_webui_short_text(error, 90)}", "webui")
+    _append_log(f"[API] {scene} xx {model} key={key_mask} err={error}", "webui")
 
 
 def _chatroom_response_tokens(data: Dict[str, Any]) -> int:
@@ -856,6 +874,12 @@ def _chatroom_complete(model: str, messages: list[Dict[str, Any]]) -> str:
             # 思考模型：思维链单独取出，不混进正文
             content, reasoning = split_reasoning_output(message_obj, str(content or ""))
             content = content.rstrip("\n")
+            hit = next((_chatroom_reply_filter_hit(part) for part in _chatroom_split_reply(content)
+                        if _chatroom_reply_filter_hit(part)), "")
+            if hit:
+                last_error = RuntimeError(f"LLM 回复命中切换关键词: {hit}")
+                _chatroom_log_api_failure(_chatroom_scene(model), display_model, key, last_error)
+                break  # 当前模型槽的其它 Key 不再尝试
             _chatroom_log_api_success(_chatroom_scene(model), display_model, _chatroom_response_tokens(data), content)
             return content, reasoning
     raise last_error or RuntimeError("所有模型均失败")
@@ -892,6 +916,8 @@ def _chatroom_stream_complete(model: str, messages: list[Dict[str, Any]]):
             )
             emitted = False
             reply_parts = []
+            buffered_chunks = []
+            total_tokens = 0
             # 流式下 <think> 标签会被切碎，交给 splitter 跨 chunk 缝合
             splitter = ThinkStreamSplitter()
             try:
@@ -907,15 +933,15 @@ def _chatroom_stream_complete(model: str, messages: list[Dict[str, Any]]):
                                 if tail_visible:
                                     emitted = True
                                     reply_parts.append(tail_visible)
-                                yield tail_visible, tail_reasoning
+                                buffered_chunks.append((tail_visible, tail_reasoning))
                             if reply_parts:
-                                _chatroom_log_api_success(_chatroom_scene(model), display_model, 0, "".join(reply_parts))
-                                return
+                                break
                             last_error = RuntimeError("模型返回空内容")
                             _chatroom_log_api_failure(_chatroom_scene(model), display_model, key, last_error)
                             break
                         try:
                             obj = json.loads(data)
+                            total_tokens = _chatroom_response_tokens(obj) or total_tokens
                             delta_obj = obj.get("choices", [{}])[0].get("delta", {}) or {}
                             # 独立字段形式的思维链：直接转发，不进正文
                             field_reasoning = ""
@@ -925,7 +951,7 @@ def _chatroom_stream_complete(model: str, messages: list[Dict[str, Any]]):
                                     field_reasoning = value
                                     break
                             if field_reasoning:
-                                yield "", field_reasoning
+                                buffered_chunks.append(("", field_reasoning))
                             delta = delta_obj.get("content")
                             if delta:
                                 visible, reasoning = splitter.feed(str(delta))
@@ -933,11 +959,19 @@ def _chatroom_stream_complete(model: str, messages: list[Dict[str, Any]]):
                                     emitted = True
                                     reply_parts.append(visible)
                                 if visible or reasoning:
-                                    yield visible, reasoning
+                                    buffered_chunks.append((visible, reasoning))
                         except Exception:
                             continue
                     if emitted:
-                        _chatroom_log_api_success(_chatroom_scene(model), display_model, 0, "".join(reply_parts))
+                        content = "".join(reply_parts)
+                        hit = next((_chatroom_reply_filter_hit(part) for part in _chatroom_split_reply(content)
+                                    if _chatroom_reply_filter_hit(part)), "")
+                        if hit:
+                            last_error = RuntimeError(f"LLM 回复命中切换关键词: {hit}")
+                            _chatroom_log_api_failure(_chatroom_scene(model), display_model, key, last_error)
+                            break
+                        _chatroom_log_api_success(_chatroom_scene(model), display_model, total_tokens, content)
+                        yield from buffered_chunks
                         return
                     last_error = RuntimeError("模型流式响应未返回文本")
                     _chatroom_log_api_failure(_chatroom_scene(model), display_model, key, last_error)
@@ -1055,11 +1089,17 @@ def _chatroom_prepare_user_message(session_id: str, model: str, text: str, attac
         obj = _chatroom_load(session_id)
         if obj is None:
             raise ValueError("会话不存在")
-        if model:
+        signature = _chatroom_rotation_signature()
+        previous = obj.get("_rotation_signature")
+        if previous != signature:
+            obj["model"] = ""
+            model = ""  # 页面携带的旧选择同样失效，实际请求前复核。
+        elif model:
             obj["model"] = model
+        obj["_rotation_signature"] = signature
         now = int(time.time())
         request_id = uuid.uuid4().hex
-        msg = {"role": "user", "content": text, "ts": now, "request_id": request_id}
+        msg = {"id": uuid.uuid4().hex, "role": "user", "content": text, "ts": now, "request_id": request_id}
         if attachments:
             msg["attachments"] = attachments[:8]
         obj["messages"].append(msg)
@@ -1175,6 +1215,7 @@ def _chatroom_append_assistant(obj: Dict[str, Any], reply: str,
             content = str(content or "").strip()
             if content:
                 fresh.setdefault("messages", []).append({
+                    "id": uuid.uuid4().hex,
                     "role": "assistant", "content": content, "ts": int(time.time()),
                     "request_id": request_id,
                 })
@@ -1196,6 +1237,7 @@ def _chatroom_append_assistant(obj: Dict[str, Any], reply: str,
                 break
         if _filter_kw:
             fresh.setdefault("messages", []).append({
+                "id": uuid.uuid4().hex,
                 "role": "assistant",
                 "content": f"回复命中过滤关键词「{_filter_kw}」，已丢弃",
                 "error": True,
@@ -1205,6 +1247,8 @@ def _chatroom_append_assistant(obj: Dict[str, Any], reply: str,
         else:
             for seg in segments:
                 assistant_msg = {
+                    # 同轮分段会共用时间戳和请求号，独立 ID 才能稳定区分各气泡。
+                    "id": uuid.uuid4().hex,
                     "role": "assistant", "content": seg, "ts": int(time.time()),
                     "request_id": request_id,
                 }
@@ -1237,6 +1281,7 @@ def _chatroom_append_error(obj: Dict[str, Any], error_text: str) -> Dict[str, An
             if m.get("role") == "user" and m.get("request_id")
         ), "")
         fresh.setdefault("messages", []).append({
+            "id": uuid.uuid4().hex,
             "role": "assistant", "content": error_text, "error": True,
             "ts": int(time.time()), "request_id": request_id,
         })
@@ -1277,7 +1322,7 @@ def _chatroom_send(session_id: str, model: str, text: str,
             elif callable(_chatroom_agent_callback):
                 result = _chatroom_agent_callback({
                     "id": session_id,
-                    "model": obj.get("model") or model,
+                    "model": obj.get("model", ""),
                     "text": text,
                     "attachments": attachments or [],
                     "persona": obj.get("persona") or "",
@@ -1292,8 +1337,8 @@ def _chatroom_send(session_id: str, model: str, text: str,
                 reasoning = str(result.get("reasoning") or "")
                 agent_state = result
             else:
-                llm_messages = _chatroom_build_llm_messages(obj, obj.get("model") or model)
-                reply, reasoning = _chatroom_complete(obj.get("model") or model, llm_messages)
+                llm_messages = _chatroom_build_llm_messages(obj, obj.get("model", ""))
+                reply, reasoning = _chatroom_complete(obj.get("model", ""), llm_messages)
         except Exception as e:
             # 生成失败时保留用户消息，并把报错原因作为一条 error 气泡存进会话，
             # 刷新后仍能看到失败原因；该 error 气泡不会进 LLM 上下文。
@@ -1548,6 +1593,98 @@ def collect_config_bundle() -> Dict[str, Any]:
     }
 
 
+def _merge_config_patch(existing: dict, incoming: dict) -> dict:
+    result = copy.deepcopy(existing)
+    for key, value in incoming.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _merge_config_patch(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _safe_plugin_config_name(name) -> bool:
+    # 这些名称也用于以点分隔的表单路径和 JS 处理函数。
+    return isinstance(name, str) and bool(re.fullmatch(r"[\w-]+", name))
+
+
+def _validate_schema_value(value, spec: dict, path: str) -> None:
+    typ = str(spec.get("type", "string")).lower()
+    valid = True
+    if typ in {"bool", "boolean"}:
+        valid = isinstance(value, bool)
+    elif typ in {"number", "int", "integer", "float", "range"}:
+        try:
+            valid = type(value) in (int, float) and math.isfinite(value)
+        except OverflowError:
+            valid = False
+        if valid and typ in {"int", "integer"}:
+            valid = float(value).is_integer()
+        if valid:
+            valid = (spec.get("min") is None or value >= spec["min"]) and (spec.get("max") is None or value <= spec["max"])
+    elif typ in {"list", "array"}:
+        valid = isinstance(value, list) and all(isinstance(x, str) for x in value)
+        if valid and isinstance(spec.get("items"), dict):
+            for item in value:
+                _validate_schema_value(item, spec["items"], path)
+    elif typ in {"string", "text", "textarea", "password", "select"}:
+        valid = isinstance(value, str)
+    if not valid:
+        raise ValueError(f"{path} 的类型或取值范围无效")
+    options = spec.get("options")
+    if isinstance(options, list) and options:
+        selected = value if typ in {"list", "array"} else [value]
+        if any(item not in options for item in selected):
+            raise ValueError(f"{path} 不在可选值中")
+
+
+def _validate_plugin_configs(cfg: dict, existing: dict) -> None:
+    if "PluginConfigs" not in cfg:
+        return
+    configs = cfg["PluginConfigs"]
+    if not isinstance(configs, dict):
+        raise ValueError("PluginConfigs 必须是对象")
+    schemas = _collect_plugin_schemas()
+    old_configs = existing.get("PluginConfigs", {})
+    old_configs = old_configs if isinstance(old_configs, dict) else {}
+    for name, values in configs.items():
+        if not _safe_plugin_config_name(name) or not isinstance(values, dict):
+            if name in old_configs and values == old_configs[name]:
+                continue
+            raise ValueError("插件配置名称或内容无效")
+        schema = schemas.get(name, {}).get("schema", {})
+        old_values = old_configs.get(name, {})
+        old_values = old_values if isinstance(old_values, dict) else {}
+        for key, value in values.items():
+            if key in schema and isinstance(schema[key], dict):
+                _validate_schema_value(value, schema[key], f"PluginConfigs.{name}.{key}")
+            elif key in old_values and value == old_values[key] and type(value) is type(old_values[key]):
+                continue
+            if not _safe_plugin_config_name(key):
+                raise ValueError("插件配置字段名称无效")
+
+
+def _validate_proactive_config(raw) -> None:
+    if not isinstance(raw, dict):
+        raise ValueError("ProactiveReply 必须是对象")
+    for kind in ("group", "private"):
+        if kind in raw and not isinstance(raw[kind], dict):
+            raise ValueError(f"ProactiveReply.{kind} 必须是对象")
+        section = raw.get(kind, {})
+        if "observation" in section and not isinstance(section["observation"], dict):
+            raise ValueError(f"ProactiveReply.{kind}.observation 必须是对象")
+    missing = object()
+    for section in build_ui_schema({}):
+        for spec in section.get("fields", []):
+            path = spec["path"]
+            if not path.startswith("ProactiveReply."):
+                continue
+            value = deep_get({"ProactiveReply": raw}, path, missing)
+            if value is not missing and spec["type"] != "list":
+                _validate_schema_value(value, spec, path)
+            # QQ 号列表及 observation 跨字段约束由真实 normalize_config 校验并归一化。
+
+
 def save_config_bundle(data: Dict[str, Any]):
     """保存整份配置。整段读-改-写必须在同一把锁内：ThreadingHTTPServer 会并发
     处理保存请求，两个请求各读一份旧配置、各改不同字段再写回，
@@ -1558,11 +1695,29 @@ def save_config_bundle(data: Dict[str, Any]):
 
 def _save_config_bundle_locked(data: Dict[str, Any]):
     old_webui_cfg = get_webui_config()
-    cfg = data.get("config_json", read_json(CONFIG_PATH, {}))
-    if not isinstance(cfg, dict):
-        cfg = read_json(CONFIG_PATH, {})
-        if not isinstance(cfg, dict):
-            cfg = {}
+    existing = read_json(CONFIG_PATH, {})
+    if not isinstance(existing, dict):
+        existing = {}
+    incoming = data.get("config_json", {})
+    if not isinstance(incoming, dict):
+        raise ValueError("config_json 必须是对象")
+    # 局部保存不能清除无关的顶层字段或未加载插件的配置。
+    cfg = _merge_config_patch(existing, incoming)
+    # 显式提交统一键即为新值；否则迁移旧双阈值，避免旧门槛反复覆盖新设置。
+    others = cfg.get("Others")
+    if isinstance(others, dict) and ("compression_threshold" in others or "auto_compress_after_messages" in others):
+        incoming_others = incoming.get("Others", {})
+        if isinstance(incoming_others, dict) and "auto_compress_after_messages" in incoming_others and "compression_threshold" not in incoming_others:
+            others["auto_compress_after_messages"] = max(1, int(incoming_others["auto_compress_after_messages"]))
+        else:
+            others["auto_compress_after_messages"] = compression_trigger_rounds(others)
+        others.pop("compression_threshold", None)
+        others.pop("_comment_compression_threshold", None)
+    _validate_plugin_configs(cfg, existing)
+    if "ProactiveReply" in cfg:
+        _validate_proactive_config(cfg["ProactiveReply"])
+        from bot.proactive_reply import normalize_config
+        cfg["ProactiveReply"] = normalize_config(cfg["ProactiveReply"])
 
     feature_switches = dict(DEFAULT_FEATURE_SWITCHES)
     raw = cfg.get("FeatureSwitches", {})
@@ -1637,7 +1792,7 @@ def _save_config_bundle_locked(data: Dict[str, Any]):
         others = {}
         cfg["Others"] = others
 
-    raw_providers = others.get("llm_providers", [])
+    raw_providers = others.get("llm_providers")
     if isinstance(raw_providers, list):
         seen_provider_ids = set()
         cleaned_providers = []
@@ -1648,7 +1803,12 @@ def _save_config_bundle_locked(data: Dict[str, Any]):
             # 完全空白的渠道是初始化占位，保存时自动移除。
             raw_models = provider.get("models", []) if isinstance(provider.get("models", []), list) else []
             raw_embedding_models = provider.get("embedding_models", []) if isinstance(provider.get("embedding_models", []), list) else []
+            raw_planner_models = provider.get("planner_models", []) if isinstance(provider.get("planner_models", []), list) else []
             has_model_name = any(
+                isinstance(item, str) and item.strip()
+                or isinstance(item, dict) and str(item.get("name", "") or item.get("model", "") or "").strip()
+                for item in raw_planner_models
+            ) or any(
                 isinstance(item, str) and item.strip()
                 or isinstance(item, dict) and str(item.get("name", "") or item.get("model", "") or "").strip()
                 for item in raw_embedding_models
@@ -1797,18 +1957,20 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("Others.reminder", "命令前缀", "text", "例如 /帮助 中的 /"),
             field("Others.robot_name_triggers", "触发词", "list", "一行一个，群里提到会触发回复"),
         ]},
-        {"key": "ai", "title": "AI 配置", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>', "desc": "对话行为与分段设置", "fields": [
-            field("Others.context_max_messages", "上下文最大消息数", "number"),
-            field("Others.llm_reply_failover_keywords", "回复过滤关键词", "list", "一行一个。仅在最终要发给用户的回复上检查（不检查 Agent 中间步骤）；命中任一关键词则整条回复丢弃、不发送"),
-            field("Others.llm_split.enabled", "启用 LLM 分段回复", "bool", "仅对大模型生成结果生效，不影响普通群聊回复是否引用"),
-            field("Others.llm_split.mode", "LLM 分段模式", "select", "auto_prompt=大模型自主分段；regex=按正则切分模型输出", "auto_prompt", ["auto_prompt", "regex"]),
-            field("Others.llm_split.prompt_suffix", "自主分段提示词", "textarea", "模式一使用。会自动追加到每次 LLM 用户消息后。建议保留 <split> 分隔符说明"),
-            field("Others.llm_split.split_regex", "分段正则表达式", "textarea", "模式二使用。用于识别分段点。建议：.*?[。？！~]+|.+$"),
-            field("Others.llm_split.filter_regex", "内容过滤正则表达式", "textarea", "仅模式二使用。对每段文本做清理，例如移除换行：\\n|\\r。模式一不受它影响，模型自己排的换行会原样保留"),
-            field("Others.llm_split.max_chars_no_split", "超过多少字不分段", "number", "最终要发送的整条内容超过[ ]字时，忽略 <split>/正则分段，改为单条发送；填 0 表示不限制", 0),
+        {"key": "ai", "title": "AI 配置", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>', "desc": "配置上下文、回复过滤与分段回复", "fields": [
+            field("Others.auto_compress_after_messages", "自动压缩触发轮数", "number", "完整对话达到此轮数时自动尝试压缩，也是手动压缩的最低准入轮数；仍需满足保留轮数与冷却条件", 40, category="上下文与记忆", min=1),
+            field("Others.compression_keep_recent", "保留近期对话轮数", "number", "压缩时保留最近的完整对话轮次，其余较早对话生成摘要", 20, category="上下文与记忆", min=1),
+            field("Others.context_max_messages", "上下文保留上限（轮）", "number", "按完整对话轮次计算，超限裁掉较早对话；建议上限大于自动压缩触发轮数，避免触发前就被裁剪", 60, category="上下文与记忆", min=1),
+            field("Others.llm_reply_failover_keywords", "回复过滤关键词", "list", "一行一个。仅在最终要发给用户的回复上检查（不检查 Agent 中间步骤）；命中任一关键词则跳过当前模型的全部 Key，按轮换列表尝试下一模型；全部命中则失败、不发送", category="上下文与过滤"),
+            field("Others.llm_split.enabled", "启用 LLM 分段回复", "bool", "仅对大模型生成结果生效，不影响普通群聊回复是否引用", category="分段回复"),
+            field("Others.llm_split.mode", "LLM 分段模式", "select", "auto_prompt=大模型自主分段；regex=按正则切分模型输出", "auto_prompt", ["auto_prompt", "regex"], category="分段回复"),
+            field("Others.llm_split.prompt_suffix", "自主分段提示词", "textarea", "模式一使用。会自动追加到每次 LLM 用户消息后。建议保留 <split> 分隔符说明", category="分段回复"),
+            field("Others.llm_split.split_regex", "分段正则表达式", "textarea", "模式二使用。用于识别分段点。建议：.*?[。？！~]+|.+$", category="分段回复"),
+            field("Others.llm_split.filter_regex", "内容过滤正则表达式", "textarea", "仅模式二使用。对每段文本做清理，例如移除换行：\\n|\\r。模式一不受它影响，模型自己排的换行会原样保留", category="分段回复"),
+            field("Others.llm_split.max_chars_no_split", "超过多少字不分段", "number", "最终要发送的整条内容超过[ ]字时，忽略 <split>/正则分段，改为单条发送；填 0 表示不限制", 0, category="分段回复"),
         ]},
-        {"key": "providers", "title": "提供商", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>', "desc": "配置提供商、对话模型、嵌入模型并设置轮换顺序", "fields": [
-            field("Others.llm_providers", "提供商（对话 / 嵌入）", "providers", "对话模型与嵌入模型共用同一提供商的 Base URL 和 Key；嵌入模型在提供商卡片的“嵌入”区域配置。"),
+        {"key": "providers", "title": "提供商", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>', "desc": "配置提供商、对话模型、嵌入模型和判断模型", "fields": [
+            field("Others.llm_providers", "提供商（对话 / 嵌入 / 判断）", "providers", "对话、嵌入和判断模型共用同一提供商的 Base URL、Key 和代理。判断模型用于主动回复是否发言的判断，正文由对话模型生成；嵌入和判断模型不参与对话模型轮换。"),
             field("Others.llm_rotation", "模型轮换", "rotation"),
             field("Others.api_multimodal_model", "多模态图片模型", "multimodal_model", "主模型不支持多模态且用户发送图片时使用的多模态模型"),
             field("Others.api_multimodal_image_mode", "图片处理模式", "select", "relay=多模态模型先转述图片，再交给主模型回复；direct=直接由多模态模型回复图片消息", "relay", ["relay", "direct"]),
@@ -1832,37 +1994,67 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
         {"key": "features", "title": "功能配置", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="14" y="3" rx="1"/><path d="M10 21V8a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5a1 1 0 0 0-1-1H3"/></svg>', "desc": "配置功能", "fields": [
             field("Others.sensitive_words", "屏蔽词", "list", "一行一条，格式「原词=替换成的词」；只写原词则删掉它。只替换用户发给机器人的消息，机器人回复、昵称、人设、群聊总结等不受影响"),
             field("Others.emoji_plus_one_cooldown_seconds", "表情 +1 冷却秒数", "number", "单个表情自动复读的防抖时间"),
-            field("Others.weak_blacklist_trigger_probability", "弱黑名单回复概率", "number", "0 到 1 之间，越小越容易拦截"),
-            field("Others.weak_blacklist_users", "弱黑名单用户", "list", "一行一个 QQ 号"),
+            field("Others.weak_blacklist_trigger_probability", "弱黑名单回复概率", "number", "全局 AI 回复的放行概率，支持 0~1，也兼容 0~100；0=不回复，1=全部放行，越小越容易拦截。群聊和私聊均生效，不影响命令和插件；群聊主动仅在引用他人消息时检查该作者，未引用或引用自己不套用用户弱名单", 0.3, min=0, max=100, step=0.05),
+            field("Others.weak_blacklist_users", "弱黑名单用户", "list", "一行一个 QQ 号。全局限制这些用户的 AI 回复，不影响命令和插件；群聊主动仅在引用他人消息时检查该作者，未引用或引用自己不套用用户弱名单"),
             field("Others.group_random_reply_probability", "群聊概率触发概率", "number", "普通群消息命中该概率时，机器人会主动接话。支持 0~1，也兼容 0~100；填 0 表示关闭"),
             field("Others.group_random_reply_quote", "群聊概率触发时引用消息", "bool", "开启后，概率触发的回复会引用原消息；关闭则直接发送"),
             field("Others.group_chat_context_max_messages", "群聊上下文最大条数", "number", "功能配置里开启「群聊上下文感知」后，每个群旁听缓冲最多保留多少条", 30, min=1, max=300),
             field("Others.poke_cooldown_seconds", "拍一拍冷却秒数", "number", "拍一拍自动回复的防抖时间"),
             field("Others.group_join_welcome_text", "入群欢迎语", "textarea", "完整欢迎语，支持换行。占位符：{at} @新成员、{user_nickname} 昵称、{user_id} QQ号、{group_id} 群号、{bot_name} 机器人名字。留空则使用默认文案"),
             field("Others.group_join_welcome_send_avatar", "欢迎时发送头像图片", "bool", "开启后在欢迎消息中附上新成员头像；关闭后只发 @ + 欢迎语"),
-            field("Others.summary_per_day_limit", "每日总结次数", "number", "每个群每天允许总结的次数"),
             field("Others.summary_max_messages", "每次最多总结消息数", "number", "单次群聊总结最多读取多少条消息"),
-            field("Others.compression_threshold", "压缩触发阈值", "number", "消息达到多少条后允许触发压缩"),
-            field("Others.compression_keep_recent", "压缩保留最近消息", "number", "压缩时保留最近多少轮（完整对话轮次）"),
-            field("Others.auto_compress_after_messages", "自动压缩消息数", "number", "消息累计到多少条时自动尝试压缩"),
             field("Others.system.log_retention_days", "日志保留天数", "number", "data/webui 下超出天数的 runtime-*.log 会被自动删除。每小时检查一次，保存配置时立即执行一次", 7, category="系统设置", min=1, max=365),
             field("Others.system.trace_max_records", "追踪保存条数", "number", "AI 对话追踪最多保留多少条记录，超出丢最旧的。条数越多占用磁盘和内存越大", 100, category="系统设置", min=1, max=1000),
         ]},
-        {"key": "agent", "title": "Agent", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>', "desc": "让 AI 自主调用工具：联网搜索、调用插件、操作 QQ、定时提醒、读写文件、执行代码、接入 MCP", "fields": [
-            field("Agent.enabled", "启用 Agent", "bool", "总开关。关闭时完全不向模型传 tools，与旧版行为一致"),
-            field("Agent.max_rounds", "最大工具轮数", "number", "越大越能完成多步骤任务（搜索→读网页→再搜→总结），代价是 token 消耗上升", 30, min=1, max=50),
-            field("Agent.retry_attempts", "失败后额外重试次数", "number", "当前模型/Key 失败后再试几次；用尽后按轮换顺序切换下一个模型/Key。空回复（模型既没调工具也没给文本）也算失败。默认 3，设置为 0 表示直接轮换", 3, min=0, max=5),
-            field("Agent.clear_workspace_on_reset", "/reset 命令清空工作区", "bool", "开启后 /reset 会同时清空当前会话的 Agent 工作区；关闭后仍清除聊天记忆，但保留工作区文件"),
-            field("Agent.tool_result_max_chars", "工具结果最大字数", "number", "超出部分写入 data/agent_overflow，只回灌预览+路径，AI 可用 file_read 读全文", 8000, min=500, max=60000),
-            field("Agent.tool_timeout", "工具超时秒数", "number", "单个工具的执行上限", 120, min=10, max=600),
-            field("Agent.parallel_tools", "并发执行工具", "bool", "同一轮多个工具并发跑，更快且不增加模型请求次数"),
-            field("Agent.show_time", "显示当前时间", "bool", "开启后每次对话在用户消息末尾附加当前时间，让 AI 知道现在几点"),
-            field("Agent.search.provider", "搜索源", "select", "auto=有 Key 优先付费源，否则回落百度/DuckDuckGo", "auto", ["auto", "tavily", "bocha", "baidu", "duckduckgo"]),
-            field("Agent.search.tavily_api_key", "Tavily API Key", "password", "https://tavily.com 有免费额度，留空则不使用"),
-            field("Agent.search.bocha_api_key", "博查 API Key", "password", "国内搜索源，留空则不使用"),
-            field("Agent.exec_timeout", "代码执行超时秒数", "number", "execute_shell / execute_python 的执行上限", 60, min=5, max=600),
+        {"key": "proactive", "title": "主动回复", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M8 9h8"/><path d="M8 13h6"/></svg>', "desc": "群聊与私聊的主动回复", "fields": [
+            field("ProactiveReply.group.enabled", "群聊：启用主动回复", "bool", "仅控制群聊主动回复，不影响私聊开关；同时受「群聊响应」总闸门约束，关闭后需通过 WebUI 恢复。开启后按下方参数检查群聊，由判断模型决定是否发言", False, category="群聊"),
+            field("ProactiveReply.group.trigger_probability", "群聊：触发概率", "number", "0~1，命中概率后才会真正叫醒 AI；调高更活跃，调低更省资源", 0.3, category="群聊", min=0, max=1, step=0.05),
+            field("ProactiveReply.group.check_interval_seconds", "群聊：检查间隔（秒）", "number", "调度器对同一个群的最小检查间隔，过小会反复空判", 60, category="群聊", min=10, max=3600),
+            field("ProactiveReply.group.idle_threshold_seconds", "群聊：群空闲阈值（秒）", "number", "群里最后一条消息距现在超过这个时长才考虑主动发言", 900, category="群聊", min=60, max=86400),
+            field("ProactiveReply.group.max_consecutive_bot_messages", "群聊：连发熔断", "number", "AI 连发 N 条没人接话就停，等有真人说话才会再主动", 3, category="群聊", min=1, max=10),
+            field("ProactiveReply.group.min_interval_between_proactive_seconds", "群聊：最小主动间隔（秒）", "number", "同一群两次主动消息的最小间隔，防止刷屏", 1800, category="群聊", min=300, max=86400),
+            field("ProactiveReply.group.whitelist", "群聊：白名单", "list", "一行一个群号。非空时只对白名单内的群主动，留空 = 全部群都开（除黑名单）", category="群聊"),
+            field("ProactiveReply.group.blacklist", "群聊：黑名单", "list", "一行一个群号。命中黑名单的群永不主动", category="群聊"),
+            field("ProactiveReply.group.observation.enabled", "群聊：发完后继续观察", "bool", "仅在群聊主动回复已开启时生效。普通回复或首次主动发言成功后，按下方观察概率决定是否进入观察，再由规划器判断是否续聊；不额外抽冷场触发概率。AI 每次自行选择等多久再判断，等到期只是再次判断，不是必须发送；无人说话不催发，仍受原连发熔断限制。普通一问一答不等这些计时，不会延迟正常回复", True, category="群聊观察"),
+            field("ProactiveReply.group.observation.trigger_probability", "群聊：发言后继续观察概率", "number", "0~1，普通回复或首次主动发言成功后，只在开启新观察时抽一次；0=不进入，1=全部进入。已进入观察的等待和续聊不重复抽取，与冷场触发概率独立", 0.5, category="群聊观察", min=0, max=1, step=0.05),
+            field("ProactiveReply.group.observation.default_wait_seconds", "默认等多久再判断（秒）", "number", "首次也由规划器自主选择等待时长；返回无效或超过此默认值时回退此值，此值也是规划器等待上限，不是固定总观察窗口", 60, category="群聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.group.observation.min_wait_seconds", "最少等多久再判断（秒）", "number", "AI 每次选择等待时长的下限，不能超过默认等待时长", 10, category="群聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.group.observation.max_wait_seconds", "最多等多久再判断（秒）", "number", "主模型等待工具的时长上限，不能小于默认等待时长；规划器另以默认时长为上限，超过则回退默认值；到期不会强制发言", 600, category="群聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.group.observation.debounce_seconds", "有人接话后合并几秒再判断", "number", "把短时间内的群消息合并后再交给 AI 判断，填 0 表示不额外合并等待", 8, category="群聊观察", min=0, max=300, step=1),
+            field("ProactiveReply.group.observation.max_debounce_seconds", "最多合并等待几秒", "number", "从第一条新消息起最多合并等待多久，避免不断有人说话导致一直不判断；不能小于合并秒数", 20, category="群聊观察", min=0, max=300, step=1),
+            field("ProactiveReply.group.observation.min_continuation_interval_seconds", "续聊最小发言间隔（秒）", "number", "观察续聊的两次主动发言至少相隔多久，最少 1 秒；原有熔断仍生效", 30, category="群聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.private.enabled", "私聊：启用主动回复", "bool", "仅控制私聊主动回复，不影响群聊开关；同时受「私聊响应」总闸门约束，关闭后需通过 WebUI 恢复。开启后由判断模型决定是否主动开口，可能打扰用户，请谨慎启用", False, category="私聊"),
+            field("ProactiveReply.private.trigger_probability", "私聊：触发概率", "number", "0~1。仅控制满足冷场条件时是否调用规划器主动搭话，不影响普通回复成功后的观察及观察续聊。建议比群聊低很多，私聊主动消息更容易打扰人", 0.1, category="私聊", min=0, max=1, step=0.05),
+            field("ProactiveReply.private.check_interval_seconds", "私聊：检查间隔（秒）", "number", "对同一个用户的最小检查间隔", 120, category="私聊", min=30, max=7200),
+            field("ProactiveReply.private.idle_threshold_seconds", "私聊：用户沉默阈值（秒）", "number", "用户最后一条消息距现在超过这个时长才考虑主动开口。建议至少半天，否则像催回复", 43200, category="私聊", min=3600, max=604800),
+            field("ProactiveReply.private.max_unanswered_messages", "私聊：未回复熔断", "number", "AI 主动发了 N 条用户都没回，就再也不会主动开口，直到用户回复任何消息", 3, category="私聊", min=1, max=10),
+            field("ProactiveReply.private.min_interval_between_proactive_seconds", "私聊：最小主动间隔（秒）", "number", "同一用户两次主动消息的最小间隔，建议至少几小时", 86400, category="私聊", min=3600, max=604800),
+            field("ProactiveReply.private.whitelist", "私聊：白名单", "list", "一行一个 QQ 号。非空时只对白名单内用户主动，留空 = 全部用户都开（除黑名单）", category="私聊"),
+            field("ProactiveReply.private.blacklist", "私聊：黑名单", "list", "一行一个 QQ 号。命中黑名单的用户永不主动", category="私聊"),
+            field("ProactiveReply.private.observation.enabled", "私聊：发完后继续观察", "bool", "仅在私聊主动回复已开启时生效。普通回复或首次主动发言成功后，按下方观察概率决定是否进入观察，再由规划器判断是否续聊；与冷场触发概率独立。AI 每次自行选择等多久再判断，等到期只是再次判断，不是必须发送；无人说话不催发，仍受原未回复熔断限制。普通一问一答不等这些计时，不会延迟正常回复", True, category="私聊观察"),
+            field("ProactiveReply.private.observation.trigger_probability", "私聊：发言后继续观察概率", "number", "0~1，普通回复或首次主动发言成功后，只在开启新观察时抽一次；0=不进入，1=全部进入。已进入观察的等待和续聊不重复抽取，与冷场触发概率独立", 0.5, category="私聊观察", min=0, max=1, step=0.05),
+            field("ProactiveReply.private.observation.default_wait_seconds", "默认等多久再判断（秒）", "number", "首次也由规划器自主选择等待时长；返回无效或超过此默认值时回退此值，此值也是规划器等待上限，不是固定总观察窗口", 60, category="私聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.private.observation.min_wait_seconds", "最少等多久再判断（秒）", "number", "AI 每次选择等待时长的下限，不能超过默认等待时长", 10, category="私聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.private.observation.max_wait_seconds", "最多等多久再判断（秒）", "number", "主模型等待工具的时长上限，不能小于默认等待时长；规划器另以默认时长为上限，超过则回退默认值；到期不会强制发言", 600, category="私聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.private.observation.debounce_seconds", "有人接话后合并几秒再判断", "number", "把短时间内的私聊消息合并后再交给 AI 判断，填 0 表示不额外合并等待", 8, category="私聊观察", min=0, max=300, step=1),
+            field("ProactiveReply.private.observation.max_debounce_seconds", "最多合并等待几秒", "number", "从第一条新消息起最多合并等待多久，避免连续消息导致一直不判断；不能小于合并秒数", 20, category="私聊观察", min=0, max=300, step=1),
+            field("ProactiveReply.private.observation.min_continuation_interval_seconds", "续聊最小发言间隔（秒）", "number", "观察续聊的两次主动发言至少相隔多久，最少 1 秒；原有熔断仍生效", 30, category="私聊观察", min=1, max=3600, step=1),
         ]},
-        {"key": "store", "title": "插件商店", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" x2="21" y1="6" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>', "desc": "浏览并安装来自插件商店的插件", "fields": []},
+        {"key": "agent", "title": "Agent", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>', "desc": "配置 AI 自主调用工具的基本设置、执行限制与联网搜索", "fields": [
+            field("Agent.enabled", "启用 Agent", "bool", "总开关。关闭时完全不向模型传 tools，与旧版行为一致", category="基本设置"),
+            field("Agent.max_rounds", "最大工具轮数", "number", "越大越能完成多步骤任务（搜索→读网页→再搜→总结），代价是 token 消耗上升", 30, category="基本设置", min=1, max=50),
+            field("Agent.retry_attempts", "失败后额外重试次数", "number", "当前模型/Key 失败后再试几次；用尽后按轮换顺序切换下一个模型/Key。空回复（模型既没调工具也没给文本）也算失败。默认 3，设置为 0 表示直接轮换", 3, category="执行限制", min=0, max=5),
+            field("Agent.clear_workspace_on_reset", "/reset 命令清空工作区", "bool", "开启后 /reset 会同时清空当前会话的 Agent 工作区；关闭后仍清除聊天记忆，但保留工作区文件", category="执行限制"),
+            field("Agent.tool_result_max_chars", "工具结果最大字数", "number", "超出部分写入 data/agent_overflow，只回灌预览+路径，AI 可用 file_read 读全文", 8000, category="执行限制", min=500, max=60000),
+            field("Agent.tool_timeout", "工具超时秒数", "number", "单个工具的执行上限", 120, category="执行限制", min=10, max=600),
+            field("Agent.parallel_tools", "并发执行工具", "bool", "同一轮多个工具并发跑，更快且不增加模型请求次数", category="执行限制"),
+            field("Agent.show_time", "显示当前时间", "bool", "开启后每次对话在用户消息末尾附加当前时间，让 AI 知道现在几点", category="基本设置"),
+            field("Agent.search.provider", "搜索源", "select", "auto=有 Key 优先付费源，否则回落百度/DuckDuckGo", "auto", ["auto", "tavily", "bocha", "baidu", "duckduckgo"], category="联网搜索"),
+            field("Agent.search.tavily_api_key", "Tavily API Key", "password", "https://tavily.com 有免费额度，留空则不使用", category="联网搜索"),
+            field("Agent.search.bocha_api_key", "博查 API Key", "password", "国内搜索源，留空则不使用", category="联网搜索"),
+            field("Agent.exec_timeout", "代码执行超时秒数", "number", "execute_shell / execute_python 的执行上限", 60, category="执行限制", min=5, max=600),
+        ]},
+        {"key": "store", "title": "插件管理", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" x2="21" y1="6" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>', "desc": "管理已安装插件的配置项，或从插件商店下载新插件", "fields": []},
         {"key": "security", "title": "权限/名单", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2-1 4-2 7-2 2.5 0 4.5 1 6.5 2a1 1 0 0 1 1 1v7z"/><path d="m9 12 2 2 4-4"/></svg>', "desc": "设置管理用户和黑名单", "fields": [
             field("manage_users", "管理用户", "list", "唯一高权限入口，一行一个 "),
             field("black_list", "配置黑名单", "list", "用户号或群号，一行一个"),
@@ -1877,27 +2069,29 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("Connection.access_token", "OneBot 连接 Token", "password", "NapCat / OneBot WebSocket 认证 Token，保存后会重启连接。"),
             field("Log_level", "日志等级", "select", options=["DEBUG", "INFO", "WARNING", "ERROR"]),
         ]},
-        {"key": "webui", "title": "WebUI", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>', "desc": "Web 管理界面自身参数和外观", "fields": [
-            field("WebUI.host", "监听地址", "text"),
-            field("WebUI.port", "监听端口", "number"),
-            field("WebUI.access_token", "访问 Token", "password", "暴露到公网时请务必设置"),
-            field("Others.github_repo", "GitHub 更新仓库", "text", "格式 owner/repo，例如 Qzy327422/XcBot；留空使用默认仓库"),
-            field("Others.github_download_mirrors", "GitHub 备用更新镜像", "list", "一行一个镜像前缀。检查/下载更新时先直连 GitHub，失败后按顺序尝试这些地址"),
-            field("Others.http_proxy", "HTTP 代理", "text", "格式 http://127.0.0.1:7890，影响 GitHub 更新检查 / 插件市场与 Agent 联网（搜索、抓网页）；模型调用请在「提供商」里为每个提供商单独填代理。留空不使用代理"),
-            field("WebUI.theme_preset", "主题色", "select", "选择一套背景主题色", "aurora", ["aurora", "midnight", "sakura", "forest", "sunset", "ocean"]),
-            field("WebUI.background_image", "自定义背景图片", "background_image", "从本机选一张图，点「保存设置」时上传"),
-            field("WebUI.background_blur", "背景模糊度", "range", "0 到 40，数值越大越柔和", 10, min=0, max=40, step=1),
-            field("WebUI.liquid_glass", "液态玻璃UI", "bool", "⚠️ 低配机可能会出现卡顿，请自行决定是否开启", category="液态玻璃UI"),
-            field("WebUI.disable_background_blur", "禁用背景模糊", "bool", "仅在液态玻璃UI开启时生效，开启后将忽略「背景模糊度」选项", True, category="液态玻璃UI"),
-            field("WebUI.liquid_glass_refraction", "液态玻璃折射强度", "range", "0 到 30，数值越大折射扭曲越明显", 1, category="液态玻璃UI", min=0, max=30, step=1),
-            field("WebUI.card_background_blur", "卡片背景模糊度", "range", "0 到 10，控制液态玻璃卡片背景的模糊程度", 3, category="液态玻璃UI", min=0, max=10, step=1),
+        {"key": "webui", "title": "WebUI", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>', "desc": "配置 WebUI 访问与服务、更新与网络及界面外观", "fields": [
+            field("WebUI.host", "监听地址", "text", category="访问与服务"),
+            field("WebUI.port", "监听端口", "number", category="访问与服务"),
+            field("WebUI.access_token", "访问 Token", "password", "暴露到公网时请务必设置", category="访问与服务"),
+            field("Others.github_repo", "GitHub 更新仓库", "text", "格式 owner/repo，例如 Qzy327422/XcBot；留空使用默认仓库", category="更新与网络"),
+            field("Others.github_download_mirrors", "GitHub 备用更新镜像", "list", "一行一个镜像前缀。检查/下载更新时先直连 GitHub，失败后按顺序尝试这些地址", category="更新与网络"),
+            field("Others.http_proxy", "HTTP 代理", "text", "格式 http://127.0.0.1:7890，影响 GitHub 更新检查 / 插件市场与 Agent 联网（搜索、抓网页）；模型调用请在「提供商」里为每个提供商单独填代理。留空不使用代理", category="更新与网络"),
+            field("WebUI.theme_preset", "主题色", "select", "选择一套背景主题色", "aurora", ["aurora", "midnight", "sakura", "forest", "sunset", "ocean"], category="界面外观"),
+            field("WebUI.background_image", "自定义背景图片", "background_image", "从本机选一张图，点「保存设置」时上传", category="界面外观"),
+            field("WebUI.background_blur", "背景模糊度", "range", "0 到 40，数值越大越柔和", 10, category="界面外观", min=0, max=40, step=1),
+            field("WebUI.liquid_glass", "液态玻璃UI", "bool", "⚠️ 低配机可能会出现卡顿，请自行决定是否开启", category="界面外观"),
+            field("WebUI.disable_background_blur", "禁用背景模糊", "bool", "仅在液态玻璃UI开启时生效，开启后将忽略「背景模糊度」选项", True, category="界面外观"),
+            field("WebUI.liquid_glass_refraction", "液态玻璃折射强度", "range", "0 到 30，数值越大折射扭曲越明显", 1, category="界面外观", min=0, max=30, step=1),
+            field("WebUI.card_background_blur", "卡片背景模糊度", "range", "0 到 10，控制液态玻璃卡片背景的模糊程度", 3, category="界面外观", min=0, max=10, step=1),
         ]},
-        {"key": "trace", "title": "追踪", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></svg>', "desc": "最近 24 小时每次 AI 对话的发送链路、模型调用链路、系统提示词与 token 明细", "fields": []},
+        {"key": "trace", "title": "追踪", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></svg>', "desc": "最近 24 小时内 AI 对话明细", "fields": []},
         {"key": "logs", "title": "实时日志", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg>', "desc": "查看完整运行日志", "fields": []},
     ]
 
 
 def get_ui_value(bundle: Dict[str, Any], path: str, default=None):
+    if path == "Others.auto_compress_after_messages":
+        return compression_trigger_rounds(bundle.get("config_json", {}).get("Others", {}))
     if path == "manage_users":
         return bundle.get("manage_users", [])
     if path == "black_list":
@@ -1914,6 +2108,22 @@ def get_ui_value(bundle: Dict[str, Any], path: str, default=None):
 
 
 def set_ui_value(payload: Dict[str, Any], path: str, value):
+    if not isinstance(path, str):
+        raise ValueError("配置路径必须是字符串")
+    if path == "PluginConfigs" or path.startswith("PluginConfigs."):
+        parts = path.split(".")
+        if len(parts) != 3 or not all(_safe_plugin_config_name(x) for x in parts[1:]):
+            raise ValueError("插件配置路径必须是 PluginConfigs.<插件名>.<字段>")
+        configs = payload.setdefault("config_json", {}).setdefault("PluginConfigs", {})
+        configs.setdefault(parts[1], {})[parts[2]] = value
+        return
+    if path == "ProactiveReply" or path.startswith("ProactiveReply."):
+        allowed = {
+            f["path"] for s in build_ui_schema({}) for f in s.get("fields", [])
+            if f["path"].startswith("ProactiveReply.")
+        }
+        if path not in allowed:
+            raise ValueError("未知或无效的主动回复配置路径")
     if path == "manage_users":
         payload["manage_users"] = value
         payload["super_users"] = value
@@ -1979,6 +2189,8 @@ def _save_ui_state_locked(data: Dict[str, Any]):
     values = data.get("form_values", {}) if isinstance(data, dict) else {}
     for path, value in values.items():
         set_ui_value(payload, path, value)
+    if "Others.auto_compress_after_messages" in values:
+        cfg.get("Others", {}).pop("compression_threshold", None)
     if isinstance(values, dict) and "manage_users" in values:
         payload["manage_users"] = values.get("manage_users") or []
         payload["super_users"] = values.get("manage_users") or []
@@ -2038,20 +2250,22 @@ def _iter_runtime_log_lines(limit: int = 20000) -> list[str]:
     if not today.exists():
         return []
     try:
-        # 平均一行按 200 字节估，多留一倍余量；上限 8MB 防止极端长行把内存吃穿
-        want_bytes = min(max(limit * 400, 65536), 8 * 1024 * 1024)
+        chunks = []
+        newlines = 0
         with open(today, "rb") as fp:
             fp.seek(0, os.SEEK_END)
-            size = fp.tell()
-            start = max(0, size - want_bytes)
-            fp.seek(start)
-            chunk = fp.read()
-        text = chunk.decode("utf-8", errors="replace")
+            start = fp.tell()
+            while start > 0 and newlines <= limit:
+                size = min(start, 65536)
+                start -= size
+                fp.seek(start)
+                chunk = fp.read(size)
+                chunks.append(chunk)
+                newlines += chunk.count(b"\n")
+        raw = b"".join(reversed(chunks))
         if start > 0:
-            # 起点可能切在半行中间，丢掉第一段残行
-            nl = text.find("\n")
-            text = text[nl + 1:] if nl >= 0 else ""
-        return text.splitlines()[-limit:]
+            raw = raw[raw.find(b"\n") + 1:]
+        return raw.decode("utf-8", errors="replace").splitlines()[-limit:]
     except Exception:
         return []
 
@@ -3481,6 +3695,84 @@ def fetch_update_info(force: bool = False) -> Dict[str, Any]:
     return result
 
 
+_plugin_schemas_callback = None
+
+
+def set_plugin_schemas_callback(callback) -> None:
+    """注册 main 的 get_all_plugin_config_schemas；传入 None 时回退到读取 YAML。"""
+    if callback is not None and not callable(callback):
+        raise TypeError("callback 必须可调用或为 None")
+    global _plugin_schemas_callback
+    _plugin_schemas_callback = callback
+
+
+def _read_plugin_metadata(text: str) -> dict:
+    import yaml
+    try:
+        meta = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _visible_plugin_name(name) -> bool:
+    return _safe_plugin_config_name(name) and not name.startswith("d_") and name != "__pycache__"
+
+
+def _collect_plugin_schemas() -> Dict[str, Any]:
+    """优先使用注入的运行时 schema，仅在独立运行时读取 YAML。
+
+    获取 schema 时绝不导入 main 或执行插件。
+    """
+    if _plugin_schemas_callback is not None:
+        source = _plugin_schemas_callback()
+        source = source if isinstance(source, dict) else {}
+    else:
+        source = {}
+        if PLUGIN_DIR.exists():
+            for d in sorted(PLUGIN_DIR.iterdir()):
+                if not _visible_plugin_name(d.name):
+                    continue
+                if d.is_dir():
+                    mf = d / "metadata.yaml"
+                    try:
+                        meta = _read_plugin_metadata(mf.read_text(encoding="utf-8")) if mf.exists() else {}
+                    except (OSError, UnicodeError):
+                        meta = {}
+                    source[d.name] = {"schema": meta.get("config_schema", {})}
+            # 独立运行时不导入单文件插件。
+            for f in sorted(PLUGIN_DIR.glob("*.py")):
+                if _visible_plugin_name(f.stem) and f.stem != "__init__":
+                    source.setdefault(f.stem, {"schema": {}})
+    cfg = read_json(CONFIG_PATH, {})
+    configs = cfg.get("PluginConfigs", {})
+    configs = configs if isinstance(configs, dict) else {}
+    result = {}
+    for name, info in source.items():
+        if not _visible_plugin_name(name) or not isinstance(info, dict):
+            continue
+        raw_schema = info.get("schema", {})
+        raw_schema = raw_schema if isinstance(raw_schema, dict) else {}
+        schema = {key: copy.deepcopy(spec) for key, spec in raw_schema.items()
+                  if _safe_plugin_config_name(key) and isinstance(spec, dict)}
+        current = configs.get(name, {})
+        current = current if isinstance(current, dict) else {}
+        fallback = info.get("values", info.get("current_values", {}))
+        fallback = fallback if isinstance(fallback, dict) else {}
+        values = {key: copy.deepcopy(current.get(key, fallback.get(key, spec.get("default"))))
+                  for key, spec in schema.items()}
+        result[name] = {"schema": schema, "values": values}
+    return result
+
+
+def _store_metadata(text: str) -> dict:
+    # name/path/installed 取自压缩包结构或本地目录，
+    # 不能由 metadata 覆盖，尤其不能混入嵌套的 config_schema 字段。
+    allowed = {"version", "description", "author", "entry", "min_xcbot_version"}
+    return {key: value for key, value in _read_plugin_metadata(text).items()
+            if key in allowed and isinstance(value, str)}
+
+
 def _store_registry() -> list:
     """下载仓库 zip，从每个插件的 metadata.yaml 构建列表，合并本地已安装插件"""
     zip_url = f"https://github.com/{PLUGIN_STORE_REPO}/archive/refs/heads/main.zip"
@@ -3506,25 +3798,21 @@ def _store_registry() -> list:
                 if len(parts) != 2:
                     continue
                 plugin_name = parts[0]
+                if not _visible_plugin_name(plugin_name):
+                    continue
                 meta = {"name": plugin_name, "version": "?", "description": "", "author": "-", "path": f"plugins/{plugin_name}", "entry": "setup.py"}
-                for line in zf.read(m).decode("utf-8").splitlines():
-                    if ":" in line:
-                        k, _, v = line.partition(":")
-                        meta[k.strip()] = v.strip()
-                meta["installed"] = (PLUGIN_DIR / plugin_name).exists()
+                meta.update(_store_metadata(zf.read(m).decode("utf-8")))
+                meta["installed"] = (PLUGIN_DIR / plugin_name).is_dir()
                 data.append(meta)
     names_in_registry = {item["name"] for item in data}
     if PLUGIN_DIR.exists():
         for d in sorted(PLUGIN_DIR.iterdir()):
-            if d.is_dir() and d.name not in names_in_registry:
+            if d.is_dir() and _visible_plugin_name(d.name) and d.name not in names_in_registry:
                 meta = {"name": d.name, "version": "?", "description": "本地插件", "author": "-", "path": "", "installed": True, "local_only": True}
                 mf = d / "metadata.yaml"
                 if mf.exists():
                     try:
-                        for line in mf.read_text(encoding="utf-8").splitlines():
-                            if ":" in line:
-                                k, _, v = line.partition(":")
-                                meta[k.strip()] = v.strip()
+                        meta.update(_store_metadata(mf.read_text(encoding="utf-8")))
                     except Exception:
                         pass
                 data.append(meta)
@@ -3816,8 +4104,9 @@ def _configured_background_image_response(handler: BaseHTTPRequestHandler):
     # 手工放进去、文件名固定的图仍用 no-cache，避免换图后一直显示旧图。
     immutable = bool(re.match(r"^bg_[0-9a-f]{16}\.", resolved.name, re.I))
     cache_control = "public, max-age=31536000, immutable" if immutable else "no-cache"
-    # 拿文件名当 ETag：内容没变则 304 省流量，换图后 ETag 变化自动重取。
-    etag = '"' + resolved.name + '"'
+    # 固定名称的手工背景图也会被覆盖；ETag 必须随内容变化，不能只看文件名。
+    body = resolved.read_bytes()
+    etag = '"' + (resolved.name if immutable else hashlib.sha256(body).hexdigest()) + '"'
     if handler.headers.get("If-None-Match") == etag:
         try:
             handler.send_response(304)
@@ -3827,7 +4116,6 @@ def _configured_background_image_response(handler: BaseHTTPRequestHandler):
         except Exception:
             pass
         return
-    body = resolved.read_bytes()
     try:
         handler.send_response(200)
         handler.send_header("Content-Type", content_type)
@@ -4161,6 +4449,14 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 _text_response(self, text, "text/plain; charset=utf-8")
             elif parsed.path == "/api/plugins/store":
                 _json_response(self, {"ok": True, "data": _store_registry()})
+            elif parsed.path == "/api/plugins/schemas":
+                # 插件配置子页：返回所有声明了 config_schema 的插件的 schema 与当前值。
+                # 注意：不能 import main——它是入口脚本，import 会触发抢目录锁等副作用。
+                # 优先主程序注入的运行时 schema，standalone 才独立解析 YAML。
+                try:
+                    _json_response(self, {"ok": True, "data": _collect_plugin_schemas()})
+                except Exception as e:
+                    _json_response(self, {"ok": False, "error": str(e), "data": {}})
             elif parsed.path == "/api/knowledge/documents":
                 _json_response(self, {"ok": True, "data": _knowledge_base.list_documents()})
             elif parsed.path == "/api/knowledge/status":
@@ -4500,11 +4796,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 sse_state = {"gone": False}
                 def _sse(event: str, obj: Dict[str, Any]):
-                    # 连接断了（用户点终止 / 关页面 / 切走）不能让写失败冒出去打断生成：
-                    # 异常会一路抛到下面的 except，把这次的 user turn 也删掉，
-                    # 结果就是点一下终止，半篇已经生成好的回复全丢。
-                    # 这里改成记下"客户端没了"并静默跳过后续推送，让生成正常收尾、
-                    # 把已产出的内容存进会话，用户刷新还能看到。
+                    # 浏览器写失败只在这里消化，不能中断生成或后续落盘。
+                    # 外层收到的模型异常（即使同为断管/连接重置）仍要保存报错。
                     if sse_state["gone"]:
                         return
                     try:
@@ -4512,24 +4805,22 @@ class WebUIHandler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         sse_state["gone"] = True
-                request_id = ""
                 reply_parts = []
+                streamed_parts = []
+                progress_messages = []
                 reasoning_parts = []
                 agent_state = None
+                assistant_saved = False
                 obj = None
-                try:
-                    with _chatroom_session_lock(sid):
+                with _chatroom_session_lock(sid):
+                    try:
                         _chatroom_mark_generating(sid, True)
                         obj, full_text = _chatroom_prepare_user_message(sid, model, text, attachments)
-                        request_id = next((m.get("request_id") for m in reversed(obj.get("messages", [])) if m.get("role") == "user"), "")
                         hint = _chatroom_handle_command(full_text)
                         if hint is not None:
                             reply_parts.append(hint)
                             _sse("delta", {"text": hint})
                         elif callable(_chatroom_agent_callback):
-                            progress_messages = []
-                            streamed_parts = []
-
                             def _emit_progress(progress: str):
                                 progress = str(progress or "").strip()
                                 if progress:
@@ -4555,7 +4846,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
 
                             result = _chatroom_agent_callback({
                                 "id": sid,
-                                "model": obj.get("model") or model,
+                                "model": obj.get("model", ""),
                                 "text": full_text,
                                 "attachments": attachments,
                                 "persona": obj.get("persona") or "",
@@ -4575,9 +4866,9 @@ class WebUIHandler(BaseHTTPRequestHandler):
                             )
                             agent_state = result
                         else:
-                            llm_messages = _chatroom_build_llm_messages(obj, obj.get("model") or model)
+                            llm_messages = _chatroom_build_llm_messages(obj, obj.get("model", ""))
                             if stream_reply:
-                                for part, part_reasoning in _chatroom_stream_complete(obj.get("model") or model, llm_messages):
+                                for part, part_reasoning in _chatroom_stream_complete(obj.get("model", ""), llm_messages):
                                     if part:
                                         reply_parts.append(part)
                                         _sse("delta", {"text": part})
@@ -4585,7 +4876,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                                         reasoning_parts.append(part_reasoning)
                                         _sse("reasoning", {"text": part_reasoning})
                             else:
-                                reply, reply_reasoning = _chatroom_complete(obj.get("model") or model, llm_messages)
+                                reply, reply_reasoning = _chatroom_complete(obj.get("model", ""), llm_messages)
                                 reply_parts.append(reply)
                                 _sse("delta", {"text": reply})
                                 if reply_reasoning:
@@ -4596,42 +4887,34 @@ class WebUIHandler(BaseHTTPRequestHandler):
                             progress_messages=_chatroom_progress_messages(agent_state),
                             reasoning="".join(reasoning_parts),
                         )
+                        assistant_saved = True
                         _sse("done", {"session": _chatroom_public(fresh)})
-                except (BrokenPipeError, ConnectionResetError):
-                    # 走到这里说明是 _sse 之外的地方断的；已产出的内容此时还没落盘，
-                    # 能存就存，别把用户等了半天的半篇回复直接丢掉。
-                    saved = False
-                    try:
-                        partial = "".join(reply_parts).strip()
-                        if partial and obj is not None:
-                            _chatroom_append_assistant(
-                                obj, partial, agent_state=agent_state,
-                                progress_messages=_chatroom_progress_messages(agent_state),
-                                reasoning="".join(reasoning_parts),
-                            )
-                            saved = True
-                    except Exception:
-                        pass
-                    if not saved:
-                        _chatroom_remove_pending_user(sid, request_id)
-                except Exception as e:
-                    # 保留用户消息，把报错原因作为 error 气泡持久化（刷新后仍在），
-                    # 并把带上报错的最新会话随 error 事件推给前端。
-                    err_session = None
-                    try:
-                        if obj is not None:
-                            err_session = _chatroom_public(_chatroom_append_error(obj, str(e)))
-                    except Exception:
+                    except Exception as e:
+                        # 模型网络异常也走统一报错；浏览器断开不影响 user、半篇回复和错误落盘。
+                        # 回调抛错时最终 reply 尚未返回，安全可见片段仍在 streamed_parts 中。
+                        partial = "".join(reply_parts or streamed_parts).strip()
+                        if obj is not None and partial and not assistant_saved:
+                            try:
+                                _chatroom_append_assistant(
+                                    obj, partial, agent_state=agent_state,
+                                    progress_messages=_chatroom_progress_messages(agent_state) or progress_messages,
+                                    reasoning="".join(reasoning_parts),
+                                )
+                                assistant_saved = True
+                            except Exception as save_error:
+                                _append_log(f"[聊天室] 保存未完成回复失败：{save_error}", "webui")
                         err_session = None
-                    if err_session is None:
-                        _chatroom_remove_pending_user(sid, request_id)
-                    _append_log(f"[聊天室] 模型调用失败：{e}", "webui")
-                    try:
+                        try:
+                            if obj is not None:
+                                err_session = _chatroom_public(_chatroom_append_error(obj, str(e)))
+                        except Exception as save_error:
+                            # 落盘失败也不能删除已经保存的提问。
+                            _append_log(f"[聊天室] 保存报错失败：{save_error}", "webui")
+                        _append_log(f"[聊天室] 模型调用失败：{e}", "webui")
                         _sse("error", {"error": str(e), "detail": traceback.format_exc(limit=3), "session": err_session})
-                    except Exception:
-                        pass
-                finally:
-                    _chatroom_mark_generating(sid, False)
+                    finally:
+                        # 仍在本轮会话锁内清理，避免抹掉随后同会话请求的生成状态。
+                        _chatroom_mark_generating(sid, False)
 
             elif parsed.path == "/api/chat/send":
                 payload = data or {}
@@ -4660,6 +4943,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                             _json_response(self, {"ok": False, "error": "会话不存在"}, 404)
                         else:
                             obj["model"] = model
+                            obj["_rotation_signature"] = _chatroom_rotation_signature()
                             _chatroom_save(obj)
                             _json_response(self, {"ok": True, "data": _chatroom_public(obj)})
 
@@ -4820,9 +5104,15 @@ def _bind_webui_server(host: str, port: int, token: str) -> Optional[ThreadingHT
     这类错误顺延也没用，直接报错让用户去改配置。
     """
     global _actual_port
+    if not 1 <= port <= 65535:
+        print(f"[WebUI] 端口 {port} 无效，必须在 1～65535 之间")
+        return None
     last_error = None
     for offset in range(WEBUI_PORT_FALLBACK_LIMIT):
         candidate_port = port + offset
+        if candidate_port > 65535:
+            print("[WebUI] 已达到最大端口 65535，无法继续顺延，服务未启动")
+            return None
         try:
             server = _WebUIServer((host, candidate_port), WebUIHandler)
         except OSError as e:
@@ -4836,6 +5126,9 @@ def _bind_webui_server(host: str, port: int, token: str) -> Optional[ThreadingHT
             )
             if not in_use:
                 print(f"[WebUI] 无法监听 {host}:{candidate_port}：{e}")
+                return None
+            if candidate_port == 65535:
+                print("[WebUI] 端口 65535 已被占用，无法继续顺延，服务未启动")
                 return None
             print(f"[WebUI] 端口 {candidate_port} 已被占用，尝试 {candidate_port + 1}")
             continue
@@ -5022,7 +5315,7 @@ INDEX_HTML = r'''<!doctype html>
   </script>
   <link rel="stylesheet" href="/static/app.css">
 </head>
-<body><svg style="position:absolute;width:0;height:0;pointer-events:none" aria-hidden="true"><defs><filter id="xcbot-liquid-glass" x="0%" y="0%" width="100%" height="100%" filterUnits="objectBoundingBox" color-interpolation-filters="sRGB"><feImage id="xcbot-liquid-map" x="0" y="0" width="100%" height="100%" preserveAspectRatio="none" result="xcbot-map"/><feDisplacementMap id="xcbot-liquid-displacement-r" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-red-displaced"/><feDisplacementMap id="xcbot-liquid-displacement-g" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-green-displaced"/><feDisplacementMap id="xcbot-liquid-displacement-b" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-blue-displaced"/><feColorMatrix in="xcbot-red-displaced" type="matrix" values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="xcbot-red-channel"/><feColorMatrix in="xcbot-green-displaced" type="matrix" values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="xcbot-green-channel"/><feColorMatrix in="xcbot-blue-displaced" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="xcbot-blue-channel"/><feBlend in="xcbot-green-channel" in2="xcbot-blue-channel" mode="screen" result="xcbot-gb"/><feBlend in="xcbot-red-channel" in2="xcbot-gb" mode="screen" result="xcbot-rgb"/><feComposite in="xcbot-rgb" in2="SourceAlpha" operator="in"/></filter></defs></svg><div class="app"><aside class="sidebar"><div class="brand"><div class="logo"><img src="/assets/icon.jpg" alt="XcBot"></div><div><h1 id="brandName">XcBot</h1><p>实时 Web 管理台</p></div></div><div class="nav-title">功能列表</div><nav id="nav" class="nav"></nav><div class="nav-title">OneBot / Hyper 连接状态</div><div id="connectionStatus" class="pill">加载中...</div><div id="connectionDetail" class="desc" style="margin:10px 12px 0 12px"></div></aside><div class="nav-scrim" id="navScrim" onclick="closeMobileNav()"></div><main class="main"><div class="topbar"><button class="nav-toggle" id="navToggle" onclick="toggleMobileNav()" aria-label="展开导航" aria-expanded="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h16"/></svg></button><div class="title"><h2 id="pageTitle">加载中...</h2><p id="pageDesc">正在连接 WebUI</p></div><div class="toolbar"><span id="saveState" class="pill">未加载</span><button class="btn" onclick="gotoPage('chatroom')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>聊天室</button><button class="btn" onclick="gotoPage('debug')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>调试</button><button class="btn" id="themeBtn" onclick="toggleTheme()">深色</button><button class="btn primary" onclick="saveAll()">保存设置</button></div></div><section id="content" class="grid"></section></main></div><div id="toast" class="toast"></div><div id="submitModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center"><div style="max-width:420px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 16px;color:var(--text)">提交插件</h3><div style="display:grid;gap:10px"><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div><div class="label">插件名</div><input class="input" id="submitName" placeholder="your_plugin"></div><div><div class="label">作者</div><input class="input" id="submitAuthor" placeholder="你的名字"></div></div><div><div class="label">功能描述</div><textarea class="input" id="submitDesc" rows="3" placeholder="简单描述插件功能" style="resize:vertical"></textarea></div><p class="desc">提交后将打开 GitHub Issue 页面，把 zip 拖入评论框上传后点提交</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="el('submitModal').style.display='none'">取消</button><button class="btn primary" onclick="storeSubmit()">打开 GitHub Issue</button></div></div></div></div><div id="leaveModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center"><div style="max-width:360px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 8px;color:var(--text)">确认操作</h3><p style="margin:0 0 24px;color:var(--muted)">当前页面有未保存修改，离开后将丢失这些更改。是否离开？</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="leaveCancel()">取消</button><button class="btn primary" onclick="leaveConfirm()">确定</button></div></div></div><div id="tokenModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:10000;align-items:center;justify-content:center"><div style="max-width:460px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 style="margin:0 0 10px;color:var(--text)">设置访问 Token</h3><p style="margin:0 0 6px;color:var(--muted);font-size:13px">当前未设置访问 Token，任何能打开这个地址的人都可以查看你的 LLM API Key、以机器人身份发消息。</p><p id="tokenModalHost" style="margin:0 0 18px;color:var(--bad,#e11d48);font-size:13px;display:none"></p><div style="display:grid;gap:10px"><div><div class="label">访问 Token</div><input class="input" id="newToken" type="password" placeholder="建议用随机字符串" autocomplete="new-password"></div><div><div class="label">再输入一次</div><input class="input" id="newToken2" type="password" placeholder="确认 Token" autocomplete="new-password"></div><div id="tokenModalMsg" class="desc" style="min-height:18px;color:var(--bad,#e11d48)"></div><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn primary" id="tokenModalBtn" onclick="submitNewToken()">保存并使用</button></div></div></div></div><div id="modelInputModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;align-items:center;justify-content:center" onclick="if(event.target===this)closeModelInput()"><div style="max-width:440px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 id="modelInputTitle" style="margin:0 0 18px;color:var(--text)">添加模型</h3><div class="field"><div class="label"><span id="modelInputLabel">模型名称</span></div><input id="modelInputValue" placeholder="例如 model-name" onkeydown="if(event.key==='Enter')submitModelInput();if(event.key==='Escape')closeModelInput()"><div class="desc">保存后模型将显示为“提供商/模型名”。</div></div><div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button class="btn" onclick="closeModelInput()">取消</button><button class="btn primary" onclick="submitModelInput()">添加</button></div></div></div><div id="modelInputModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;align-items:center;justify-content:center" onclick="if(event.target===this)closeModelInput()"><div style="max-width:440px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 id="modelInputTitle" style="margin:0 0 18px;color:var(--text)">添加模型</h3><div class="field"><div class="label"><span id="modelInputLabel">模型名称</span></div><input id="modelInputValue" placeholder="例如 model-name" onkeydown="if(event.key==='Enter')submitModelInput();if(event.key==='Escape')closeModelInput()"><div class="desc">保存后模型将显示为“提供商/模型名”。</div></div><div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button class="btn" onclick="closeModelInput()">取消</button><button class="btn primary" onclick="submitModelInput()">添加</button></div></div></div><input id="pluginUploadInput" type="file" accept=".zip" style="display:none" onchange="storeUploadFile(this)"><button id="pluginUploadBtn" onclick="el('pluginUploadInput').click()" title="上传本地插件" style="display:none;position:fixed;right:24px;bottom:24px;width:48px;height:48px;border-radius:50%;background:var(--accent,#6366f1);border:none;cursor:pointer;font-size:22px;color:#fff;box-shadow:0 2px 8px #0004;z-index:999">&#8679;</button>
+<body><svg style="position:absolute;width:0;height:0;pointer-events:none" aria-hidden="true"><defs><filter id="xcbot-liquid-glass" x="0%" y="0%" width="100%" height="100%" filterUnits="objectBoundingBox" color-interpolation-filters="sRGB"><feImage id="xcbot-liquid-map" x="0" y="0" width="100%" height="100%" preserveAspectRatio="none" result="xcbot-map"/><feDisplacementMap id="xcbot-liquid-displacement-r" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-red-displaced"/><feDisplacementMap id="xcbot-liquid-displacement-g" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-green-displaced"/><feDisplacementMap id="xcbot-liquid-displacement-b" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-blue-displaced"/><feColorMatrix in="xcbot-red-displaced" type="matrix" values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="xcbot-red-channel"/><feColorMatrix in="xcbot-green-displaced" type="matrix" values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="xcbot-green-channel"/><feColorMatrix in="xcbot-blue-displaced" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="xcbot-blue-channel"/><feBlend in="xcbot-green-channel" in2="xcbot-blue-channel" mode="screen" result="xcbot-gb"/><feBlend in="xcbot-red-channel" in2="xcbot-gb" mode="screen" result="xcbot-rgb"/><feComposite in="xcbot-rgb" in2="SourceAlpha" operator="in"/></filter></defs></svg><div class="app"><aside class="sidebar"><div class="brand"><div class="logo"><img src="/assets/icon.jpg" alt="XcBot"></div><div><h1 id="brandName">XcBot</h1><p>实时 Web 管理台</p></div></div><div class="nav-title">功能列表</div><nav id="nav" class="nav"></nav><div class="nav-title">OneBot / Hyper 连接状态</div><div id="connectionStatus" class="pill">加载中...</div><div id="connectionDetail" class="desc" style="margin:10px 12px 0 12px"></div></aside><div class="nav-scrim" id="navScrim" onclick="closeMobileNav()"></div><main class="main"><div class="topbar"><button class="nav-toggle" id="navToggle" onclick="toggleMobileNav()" aria-label="展开导航" aria-expanded="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h16"/></svg></button><div class="title"><h2 id="pageTitle">加载中...</h2><p id="pageDesc">正在连接 WebUI</p></div><span id="saveState" class="pill">未加载</span><div class="topbar-actions"><div class="toolbar"><button class="btn" onclick="gotoPage('chatroom')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>聊天室</button><button class="btn" onclick="gotoPage('debug')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>调试</button><button class="btn" id="themeBtn" onclick="toggleTheme()">深色</button><button class="btn primary" onclick="saveAll()">保存设置</button></div></div></div><section id="content" class="grid"></section></main></div><div id="toast" class="toast"></div><div id="submitModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center"><div style="max-width:420px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 16px;color:var(--text)">提交插件</h3><div style="display:grid;gap:10px"><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div><div class="label">插件名</div><input class="input" id="submitName" placeholder="your_plugin"></div><div><div class="label">作者</div><input class="input" id="submitAuthor" placeholder="你的名字"></div></div><div><div class="label">功能描述</div><textarea class="input" id="submitDesc" rows="3" placeholder="简单描述插件功能" style="resize:vertical"></textarea></div><p class="desc">提交后将打开 GitHub Issue 页面，把 zip 拖入评论框上传后点提交</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="el('submitModal').style.display='none'">取消</button><button class="btn primary" onclick="storeSubmit()">打开 GitHub Issue</button></div></div></div></div><div id="leaveModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center"><div style="max-width:360px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 8px;color:var(--text)">确认操作</h3><p style="margin:0 0 24px;color:var(--muted)">当前页面有未保存修改，离开后将丢失这些更改。是否离开？</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="leaveCancel()">取消</button><button class="btn primary" onclick="leaveConfirm()">确定</button></div></div></div><div id="tokenModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:10000;align-items:center;justify-content:center"><div style="max-width:460px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 style="margin:0 0 10px;color:var(--text)">设置访问 Token</h3><p style="margin:0 0 6px;color:var(--muted);font-size:13px">当前未设置访问 Token，任何能打开这个地址的人都可以查看你的 LLM API Key、以机器人身份发消息。</p><p id="tokenModalHost" style="margin:0 0 18px;color:var(--bad,#e11d48);font-size:13px;display:none"></p><div style="display:grid;gap:10px"><div><div class="label">访问 Token</div><input class="input" id="newToken" type="password" placeholder="建议用随机字符串" autocomplete="new-password"></div><div><div class="label">再输入一次</div><input class="input" id="newToken2" type="password" placeholder="确认 Token" autocomplete="new-password"></div><div id="tokenModalMsg" class="desc" style="min-height:18px;color:var(--bad,#e11d48)"></div><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn primary" id="tokenModalBtn" onclick="submitNewToken()">保存并使用</button></div></div></div></div><div id="modelInputModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;align-items:center;justify-content:center" onclick="if(event.target===this)closeModelInput()"><div style="max-width:440px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 id="modelInputTitle" style="margin:0 0 18px;color:var(--text)">添加模型</h3><div class="field"><div class="label"><span id="modelInputLabel">模型名称</span></div><input id="modelInputValue" placeholder="例如 model-name" onkeydown="if(event.key==='Enter')submitModelInput();if(event.key==='Escape')closeModelInput()"><div class="desc">保存后模型将显示为“提供商/模型名”。</div></div><div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button class="btn" onclick="closeModelInput()">取消</button><button class="btn primary" onclick="submitModelInput()">添加</button></div></div></div><div id="modelInputModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;align-items:center;justify-content:center" onclick="if(event.target===this)closeModelInput()"><div style="max-width:440px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 id="modelInputTitle" style="margin:0 0 18px;color:var(--text)">添加模型</h3><div class="field"><div class="label"><span id="modelInputLabel">模型名称</span></div><input id="modelInputValue" placeholder="例如 model-name" onkeydown="if(event.key==='Enter')submitModelInput();if(event.key==='Escape')closeModelInput()"><div class="desc">保存后模型将显示为“提供商/模型名”。</div></div><div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button class="btn" onclick="closeModelInput()">取消</button><button class="btn primary" onclick="submitModelInput()">添加</button></div></div></div><input id="pluginUploadInput" type="file" accept=".zip" style="display:none" onchange="storeUploadFile(this)"><button id="pluginUploadBtn" onclick="el('pluginUploadInput').click()" title="上传本地插件" style="display:none;position:fixed;right:24px;bottom:24px;width:48px;height:48px;border-radius:50%;background:var(--accent,#6366f1);border:none;cursor:pointer;font-size:22px;color:#fff;box-shadow:0 2px 8px #0004;z-index:999">&#8679;</button>
 <script src="/static/app.js"></script></body></html>'''
 
 def _static_asset_version(filename: str) -> str:

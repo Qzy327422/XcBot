@@ -1,6 +1,6 @@
 let state={bundle:null,current:'welcome',section:'',dirty:false,saving:false,lastInputAt:0,expectedReloadAfterUpdate:false,apiFailCount:0,reloadTimer:null};
 let modelInputState={providerIndex:-1,kind:'chat'};
-const featureFieldMap={sensitive_filter:['Others.sensitive_words'],ai_chat:['Others.llm_split.enabled','Others.llm_split.mode','Others.llm_split.prompt_suffix','Others.llm_split.split_regex','Others.llm_split.filter_regex','Others.llm_split.max_chars_no_split'],group_chat:['Others.group_random_reply_probability','Others.group_random_reply_quote'],emoji_plus_one:['Others.emoji_plus_one_cooldown_seconds'],poke_reply:['Others.poke_cooldown_seconds'],group_join_welcome:['Others.group_join_welcome_text','Others.group_join_welcome_send_avatar'],http_send_api:[],split_reply_quote:[],weak_blacklist:['Others.weak_blacklist_trigger_probability','Others.weak_blacklist_users'],summary:['Others.summary_per_day_limit','Others.summary_max_messages'],compression_commands:['Others.compression_threshold','Others.compression_keep_recent','Others.auto_compress_after_messages'],plugins_external:[]};
+const featureFieldMap={sensitive_filter:['Others.sensitive_words'],ai_chat:['Others.llm_split.enabled','Others.llm_split.mode','Others.llm_split.prompt_suffix','Others.llm_split.split_regex','Others.llm_split.filter_regex','Others.llm_split.max_chars_no_split'],group_chat:['Others.group_random_reply_probability','Others.group_random_reply_quote'],group_chat_context:['Others.group_chat_context_max_messages'],emoji_plus_one:['Others.emoji_plus_one_cooldown_seconds'],poke_reply:['Others.poke_cooldown_seconds'],group_join_welcome:['Others.group_join_welcome_text','Others.group_join_welcome_send_avatar'],http_send_api:[],split_reply_quote:[],weak_blacklist:['Others.weak_blacklist_trigger_probability','Others.weak_blacklist_users'],summary:['Others.summary_max_messages'],compression_commands:[],plugins_external:[]};
 const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 // 首次用 ?token= 打开时把凭据转存进 localStorage，并立刻从地址栏抹掉：
 // 留在 URL 里会进浏览器历史、Referer 和反代日志。
@@ -13,11 +13,29 @@ const DRAFT_KEY='xcbotWebuiFormDraft';
 function loadDraft(){try{return JSON.parse(localStorage.getItem(DRAFT_KEY)||'null')||null}catch(e){return null}}
 function saveDraft(){try{if(state.bundle?.form_values)localStorage.setItem(DRAFT_KEY,JSON.stringify({fingerprint:state.bundle.config_fingerprint||'',values:state.bundle.form_values}))}catch(e){}}
 function clearDraft(){try{localStorage.removeItem(DRAFT_KEY)}catch(e){}}
-function sameDraftValues(a,b){try{return JSON.stringify(a||{})===JSON.stringify(b||{})}catch(e){return false}}
+function sameDraftValues(a,b){try{return JSON.stringify(a)===JSON.stringify(b)}catch(e){return false}}
 function applyDraft(bundle){const draft=loadDraft();if(!draft||!bundle?.form_values)return;if(!draft.fingerprint||!bundle.config_fingerprint||draft.fingerprint!==bundle.config_fingerprint){clearDraft();return}if(sameDraftValues(draft.values||{},bundle.form_values||{})){clearDraft();state.dirty=false;state.lastInputAt=0;return}const changed=Object.keys(draft.values||{}).some(k=>JSON.stringify(draft.values[k])!==JSON.stringify(bundle.form_values[k]));if(!changed){clearDraft();state.dirty=false;state.lastInputAt=0;return}bundle.form_values=Object.assign({},bundle.form_values,draft.values||{});state.dirty=true;state.lastInputAt=Date.now();const save=el('saveState');if(save)save.textContent='有未保存草稿'}
 async function api(path,opt={}){opt.headers=Object.assign({'Content-Type':'application/json','X-WebUI-Token':token()},opt.headers||{});const r=await fetch(path,opt),j=await r.json().catch(()=>({ok:false,error:'请求失败'}));if(r.status===401){localStorage.removeItem('webuiToken');location.href='/auth/login';throw new Error('请先登录')}if(!j.ok)throw new Error(j.error||'请求失败');return j.data??j}
 function toast(msg,ok=true){const t=el('toast'),save=el('saveState');if(t){t.textContent=msg;t.className='toast show '+(ok?'ok':'bad');clearTimeout(t._timer);t._timer=setTimeout(()=>t.classList.remove('show'),2600)}if(save)save.textContent=msg}
+const NAV_GROUPS=[
+  {key:'daily',title:'日常使用',pages:['welcome','stats']},
+  {key:'bot',title:'机器人与 AI',pages:['bot','providers','persona','ai','features','proactive','agent','knowledge','store']},
+  {key:'system',title:'系统与运行',pages:['security','connection','webui','trace','logs']},
+];
 const pages=()=>state.bundle?.ui_schema||[];
+function navigationGroups(){
+  const available=new Map(pages().map(p=>[p.key,p]));
+  const groups=NAV_GROUPS.map(g=>({...g,items:g.pages.map(key=>available.get(key)).filter(Boolean)}));
+  const known=new Set(NAV_GROUPS.flatMap(g=>g.pages));
+  groups[groups.length-1].items.push(...pages().filter(p=>!known.has(p.key)&&!['chatroom','debug'].includes(p.key)));
+  return groups.filter(g=>g.items.length);
+}
+function navGroupCollapsed(key){try{return JSON.parse(localStorage.webuiNavCollapsed||'{}')[key]===true}catch(e){return false}}
+function toggleNavGroup(key){
+  let collapsed;try{collapsed=JSON.parse(localStorage.webuiNavCollapsed||'{}')}catch(e){collapsed={}}
+  collapsed[key]=!navGroupCollapsed(key);localStorage.webuiNavCollapsed=JSON.stringify(collapsed);
+  const nav=el('nav');if(nav)nav.dataset.signature='';renderNav();requestAnimationFrame(updateNavIndicator);
+}
 const routeAlias={config:'bot',normal:'bot',dashboard:'welcome',home:'welcome',statistics:'stats',debug:'debug',webui_appearance:'webui'};
 const publicRoute={welcome:'welcome',stats:'stats',bot:'config',ai:'ai',providers:'providers',knowledge:'knowledge',persona:'persona',features:'features',agent:'agent',security:'security',connection:'connection',webui:'webui',logs:'logs',chatroom:'chatroom',debug:'debug',store:'store',trace:'trace'};
 function splitHashRoute(){let raw=decodeURIComponent((location.hash||'').replace(/^#\/?/,''));if(!raw)return {page:localStorage.webuiPage||'welcome',section:''};const parts=raw.split('#');const page=(parts.shift()||'').replace(/^\//,'')||'welcome';return {page,section:parts.join('#')}}
@@ -149,9 +167,8 @@ function createLiquidGlassGpu(image,onLost){
   const gl=canvas.getContext('webgl',{alpha:true,premultipliedAlpha:true,preserveDrawingBuffer:true,antialias:false,depth:false,stencil:false});
   if(!gl)throw new Error('no-webgl');
   let program=null,buffer=null,texture=null,disposed=false,lost=false;
-  // 已上传纹理对应的 CPU 侧模糊半径（屏幕像素）。NaN 表示还没上传过，
-  // 首次 draw 时才建纹理——避免初始化时先传一张清晰图、紧接着又为模糊重建。
-  let textureBlur=NaN;
+  // 纹理空间的模糊半径随 cover 缩放变化；首次 draw 才上传，滚动不重建。
+  let textureRevision=-1,textureKernel='';
   const shaders=[];
   const stats={textureUploads:0,frames:0,regions:0,lastJsMs:0,resolution:[0,0]};
   function cleanup(){
@@ -167,7 +184,7 @@ function createLiquidGlassGpu(image,onLost){
   }
   try{
     const vertex=shader(gl.VERTEX_SHADER,`
-      precision mediump float;
+      precision highp float;
       attribute vec2 a_pos;
       uniform vec4 u_rect;
       uniform vec2 u_view;
@@ -175,13 +192,13 @@ function createLiquidGlassGpu(image,onLost){
       void main(){v_pos=u_rect.xy+a_pos*u_rect.zw;gl_Position=vec4(v_pos.x/u_view.x*2.0-1.0,1.0-v_pos.y/u_view.y*2.0,0.0,1.0);}
     `);
     const fragment=shader(gl.FRAGMENT_SHADER,`
-      precision mediump float;
+      precision highp float;
       uniform sampler2D u_image;
       uniform vec4 u_rect,u_radii,u_cover,u_clipBox;
       uniform vec4 u_clips[8],u_clipRadii[8];
       uniform int u_clipCount;
       uniform vec3 u_base;
-      uniform float u_strength,u_pixel;
+      uniform float u_strength,u_pixel,u_sourceOpacity;
       varying vec2 v_pos;
       float radiusAt(vec2 p,vec4 radii){return p.y<0.0?(p.x<0.0?radii.x:radii.y):(p.x<0.0?radii.w:radii.z);}
       float ss(float a,float b,float t){t=clamp((t-a)/(b-a),0.0,1.0);return t*t*(3.0-2.0*t);}
@@ -201,11 +218,11 @@ function createLiquidGlassGpu(image,onLost){
       }
       vec3 sampleImage(vec2 p){
         vec2 uv=clamp((p-u_cover.xy)/u_cover.zw,0.0,1.0);uv.y=1.0-uv.y;
-        // 纹理在 CPU 侧已经做过一次真正的 Gaussian blur（见 preBlurTexture），
+        // 纹理已在 uploadTexture 中完成原生高斯或三遍 box 高斯近似，
         // 这里只做单点采样。之前在这里撒离散采样点会因为间距小于图像细节
         // 而产生「多份拷贝」的重影，看着头晕；预模糊是连续的，不会有这个问题。
         vec4 c=texture2D(u_image,uv);
-        return mix(u_base,c.rgb,c.a*.82);
+        return mix(u_base,c.rgb,c.a*u_sourceOpacity);
       }
       void main(){
         if(v_pos.x<u_clipBox.x||v_pos.y<u_clipBox.y||v_pos.x>u_clipBox.z||v_pos.y>u_clipBox.w)discard;
@@ -235,92 +252,75 @@ function createLiquidGlassGpu(image,onLost){
     texture=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,texture);
     gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
-    const max=Math.min(4096,gl.getParameter(gl.MAX_TEXTURE_SIZE));
+    const probeContext=document.createElement('canvas').getContext('2d');
+    const nativeBlur=!!probeContext&&typeof probeContext.filter==='string';
+    const max=Math.min(nativeBlur?4096:2048,gl.getParameter(gl.MAX_TEXTURE_SIZE));
     // 把壁纸按目标模糊半径预先高斯模糊一次，再上传给 GPU。
     // 为什么要预模糊而不是在 shader 里多点采样：采样点之间的距离一旦超过
     // 图像细节的尺度，拿到的就是同一批细节的「多份拷贝」，看起来就是重影，
     // 越大越晕。CPU 侧的 Gaussian blur 是连续卷积，不存在离散空洞。
     // 模糊半径按纹理像素算：屏幕 px / cover 缩放比。
-    function uploadTexture(blurScreenPx,coverWidth){
+    function uploadTexture(texBlur){
       let source=image;
       if(Math.max(image.naturalWidth,image.naturalHeight)>max){
         const scaled=document.createElement('canvas'),ratio=max/Math.max(image.naturalWidth,image.naturalHeight);
         scaled.width=Math.max(1,Math.round(image.naturalWidth*ratio));scaled.height=Math.max(1,Math.round(image.naturalHeight*ratio));
         scaled.getContext('2d').drawImage(image,0,0,scaled.width,scaled.height);source=scaled;
       }
-      // 模糊半径必须按**实际要上传的那张图**的像素尺度换算：
-      // 图片被 MAX_TEXTURE_SIZE 缩过之后，再拿原图宽度去乘会把模糊放大好几倍。
-      const sourceW=source.naturalWidth||source.width;
-      const texBlur=coverWidth>0?blurScreenPx*sourceW/coverWidth:blurScreenPx;
       if(texBlur>0.1){
         const cv=document.createElement('canvas');
         cv.width=source.naturalWidth||source.width;cv.height=source.naturalHeight||source.height;
         const ctx=cv.getContext('2d',{willReadFrequently:false});
-        if(ctx&&typeof ctx.filter==='string'){
-          // Chromium / Android：ctx.filter 是 GPU 加速的高斯，直接用。
-          ctx.filter=`blur(${texBlur.toFixed(2)}px)`;
-          // 先铺满四周再画，避免模糊后边缘变透明（CLAMP_TO_EDGE 也会露出暗边）。
-          ctx.drawImage(source,-texBlur*2,-texBlur*2,cv.width+texBlur*4,cv.height+texBlur*4);
-          ctx.filter='none';
+        if(ctx&&nativeBlur){
+          // 延展边缘后模糊，再裁回原坐标；不能拉伸整张图片来填充模糊边界。
+          const pad=Math.ceil(texBlur*3),w=cv.width,h=cv.height;
+          const padded=document.createElement('canvas');padded.width=w+pad*2;padded.height=h+pad*2;
+          const pc=padded.getContext('2d');if(!pc)throw new Error('blur-canvas');
+          pc.drawImage(source,pad,pad);
+          pc.imageSmoothingEnabled=false;
+          pc.drawImage(source,0,0,w,1,pad,0,w,pad);pc.drawImage(source,0,h-1,w,1,pad,pad+h,w,pad);
+          pc.drawImage(source,0,0,1,h,0,pad,pad,h);pc.drawImage(source,w-1,0,1,h,pad+w,pad,pad,h);
+          for(const [sx,sy,dx,dy] of [[0,0,0,0],[w-1,0,pad+w,0],[0,h-1,0,pad+h],[w-1,h-1,pad+w,pad+h]])pc.drawImage(source,sx,sy,1,1,dx,dy,pad,pad);
+          ctx.filter=`blur(${texBlur.toFixed(3)}px)`;ctx.drawImage(padded,-pad,-pad);ctx.filter='none';
           source=cv;
         }else if(ctx&&texBlur>0.05){
-          // iOS Safari 的 canvas 2D 没有 ctx.filter（实测 'filter' in ctx === false），
-          // 上面那段会整段跳过。这里用「等比降采样 + 逐级放大」近似高斯：
-          //   · 模糊半径与滑块数值**线性**对应，强度和其他平台的
-          //     ctx.filter(`blur(${texBlur}px)`) 一致（见下方系数标定）。
-          //   · 以前写的是 k = 2*sqrt(texBlur)：平方根把滑块后几档压缩掉了
-          //     （iOS 拖到 10 看着只等于别端 3），而最后一次大比例双线性放大
-          //     在 Safari 上还会留下明显的块状/锯齿。
-          //   · 降采样只按 2 的整数倍逐次减半（每次都是精确的 2x2 盒式平均），
-          //     再用同样的 2x 步长**逐级放大回原尺寸**。一次性大比例放大在
-          //     Safari 上只做双线性、会留下方块和锯齿；逐级放大每步只放大 2 倍，
-          //     多级叠起来等价于一个平滑的 tent 核，边缘不会有台阶。
-          const sw=source.naturalWidth||source.width,sh=source.naturalHeight||source.height;
-          // CSS 的 blur(r) 里 r 就是高斯标准差（Filter Effects 规范），
-          // 所以目标等效 sigma = texBlur。
-          // 「逐次减半 + 逐级 2x 放大」实测 sigma ≈ 0.7k，故取 k = 1.4*texBlur，
-          // 让 iOS 的模糊强度与其它平台的 ctx.filter('blur(r)') 对齐。
-          // 上一版取 0.7 只有目标的一半，看起来仍然"偏弱"。
-          const k=Math.min(Math.max(1,texBlur*1.4),Math.max(1,Math.min(sw,sh)/2));
-          const targetW=Math.max(2,Math.round(sw/k)),targetH=Math.max(2,Math.round(sh/k));
-          // 先工整地逐次减半（每步都是精确的 2x2 盒式平均），只保留当前层。
-          let cur=source,curW=sw,curH=sh;
-          function resample(from,fromW,fromH,toW,toH){
-            const cv2=document.createElement('canvas');cv2.width=toW;cv2.height=toH;
-            const c2=cv2.getContext('2d');
-            if(!c2)return null;
-            c2.imageSmoothingEnabled=true;c2.imageSmoothingQuality='high';
-            c2.drawImage(from,0,0,fromW,fromH,0,0,toW,toH);
-            return cv2;
+          // 无 Canvas filter 的 Safari：在原纹理上做三遍分离 box 高斯近似，
+          // 不缩成小图再放大，避免斜线台阶；预乘 alpha 后滤波，透明边不会发黑。
+          const w=cv.width,h=cv.height;
+          ctx.drawImage(source,0,0);
+          const pixels=ctx.getImageData(0,0,w,h),a=new Float32Array(pixels.data.length),b=new Float32Array(a.length);
+          for(let i=0;i<a.length;i+=4){const alpha=pixels.data[i+3]/255;a[i]=pixels.data[i]*alpha;a[i+1]=pixels.data[i+1]*alpha;a[i+2]=pixels.data[i+2]*alpha;a[i+3]=pixels.data[i+3]}
+          // 相邻半径连续混合，避免整数 box 核让小数模糊档位完全相同。
+          const radius=Math.floor((Math.sqrt(1+4*texBlur*texBlur)-1)/2);
+          const blend=(texBlur*texBlur-radius*(radius+1))/(2*radius+2);
+          function boxPass(input,output,vertical){
+            const length=vertical?h:w,lines=vertical?w:h,stride=vertical?w*4:4,diameter=radius*2+1;
+            for(let line=0;line<lines;line++){
+              const start=vertical?line*4:line*w*4;
+              for(let channel=0;channel<4;channel++){
+                let sum=0;
+                for(let k=-radius;k<=radius;k++)sum+=input[start+Math.max(0,Math.min(length-1,k))*stride+channel];
+                for(let p=0;p<length;p++){
+                  const outer=sum+input[start+Math.max(0,p-radius-1)*stride+channel]+input[start+Math.min(length-1,p+radius+1)*stride+channel];
+                  output[start+p*stride+channel]=(1-blend)*sum/diameter+blend*outer/(diameter+2);
+                  sum+=input[start+Math.min(length-1,p+radius+1)*stride+channel]-input[start+Math.max(0,p-radius)*stride+channel];
+                }
+              }
+            }
           }
-          while(curW>=targetW*2&&curH>=targetH*2&&curW>2&&curH>2){
-            const nw=Math.max(2,Math.round(curW/2)),nh=Math.max(2,Math.round(curH/2));
-            const tmp=resample(cur,curW,curH,nw,nh);
-            if(!tmp)break;
-            cur=tmp;curW=nw;curH=nh;
-          }
-          // 收尾：缩到目标尺寸（可以不是 2 的幂），保证每一档 texBlur 都有差异。
-          if(targetW<curW||targetH<curH){
-            const tmp=resample(cur,curW,curH,targetW,targetH);
-            if(tmp){cur=tmp;curW=targetW;curH=targetH}
-          }
-          // 逐级放大回原尺寸：每步只放大 2 倍，避免一次性大比例双线性的台阶，
-          // 同时不保留中间层，内存只多一张当前画布。
-          while(curW<sw||curH<sh){
-            const nw=Math.min(sw,Math.max(curW+1,curW*2)),nh=Math.min(sh,Math.max(curH+1,curH*2));
-            const tmp=resample(cur,curW,curH,nw,nh);
-            if(!tmp)break;
-            cur=tmp;curW=nw;curH=nh;
-          }
-          source=cur;
+          for(let pass=0;pass<3;pass++){boxPass(a,b,false);boxPass(b,a,true)}
+          for(let i=0;i<a.length;i+=4){const alpha=a[i+3];pixels.data[i+3]=alpha;for(let c=0;c<3;c++)pixels.data[i+c]=alpha>0?a[i+c]*255/alpha:0}
+          ctx.putImageData(pixels,0,0);source=cv;
         }
       }
+      if(texBlur>0.1&&source===image)throw new Error('blur-canvas');
       gl.bindTexture(gl.TEXTURE_2D,texture);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
       gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,source);
       if(gl.getError()!==gl.NO_ERROR)throw new Error('texture-upload');stats.textureUploads++;
+      stats.textureSize=[source.naturalWidth||source.width,source.naturalHeight||source.height];
     }
-    const locations={};['rect','view','radii','cover','clipBox','clips[0]','clipRadii[0]','clipCount','base','strength','pixel','image'].forEach(k=>locations[k]=gl.getUniformLocation(program,'u_'+k));
+    const locations={};['rect','view','radii','cover','clipBox','clips[0]','clipRadii[0]','clipCount','base','strength','pixel','image','sourceOpacity'].forEach(k=>locations[k]=gl.getUniformLocation(program,'u_'+k));
     gl.uniform1i(locations.image,0);gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
     gl.clearColor(0,0,0,0);gl.disable(gl.DEPTH_TEST);
     canvas.addEventListener('webglcontextlost',contextLost);document.body.insertBefore(canvas,document.body.firstChild);
@@ -328,13 +328,15 @@ function createLiquidGlassGpu(image,onLost){
     const maxBuffer=gl.getParameter(gl.MAX_RENDERBUFFER_SIZE);
     return {canvas,dispose:cleanup,diagnostics:()=>({...stats,resolution:stats.resolution.slice(),refractionModel:'xcbot-sdf-v1',strengthProfile:'pc-base-scale-40-soft-35%'}),draw(regions,geometry){
       if(disposed||lost)return;
-      const start=performance.now(),{width,height,cover,blur,base,animating}=geometry;
-      // 首次绘制，或模糊半径变化超过 0.5px 才重建纹理：
-      // 静态画面下只上传一次，拖滑块时才逐档重建。
-      if(!(Math.abs(blur-textureBlur)<0.5)){
-        // cover[2] 是壁纸在屏幕上的显示宽度；纹理是图片像素宽。
-        // 屏幕上的 blur 半径换算到纹理空间要乘这个比值。
-        try{uploadTexture(blur,cover[2]);textureBlur=blur}catch(e){}
+      const start=performance.now(),{width,height,cover,blur,base,animating,sourceRevision=0,sourceOpacity=.82}=geometry;
+      const sourceW=image.naturalWidth||image.width,sourceH=image.naturalHeight||image.height;
+      const textureWidth=Math.max(sourceW,sourceH)>max?Math.max(1,Math.round(sourceW*max/Math.max(sourceW,sourceH))):sourceW;
+      const sigma=cover[2]>0?blur*textureWidth/cover[2]:blur;
+      const kernel=sigma<=0.1?'none':nativeBlur?sigma.toFixed(3):String(sigma);
+      if(sourceRevision!==textureRevision||kernel!==textureKernel){
+        uploadTexture(sigma);textureRevision=sourceRevision;textureKernel=kernel;
+        stats.blurMethod=sigma>0.1?(nativeBlur?'canvas-gaussian':'three-box-gaussian'):'none';
+        stats.textureSigma=sigma;
         gl.bindTexture(gl.TEXTURE_2D,texture);gl.uniform1i(locations.image,0);
       }
       // 像素预算：移动端 GPU 带宽有限，dpr 2.75 直接按 2 仍偏大；
@@ -357,7 +359,7 @@ function createLiquidGlassGpu(image,onLost){
       gl.viewport(0,0,w,h);gl.disable(gl.SCISSOR_TEST);gl.clear(gl.COLOR_BUFFER_BIT);
       gl.enable(gl.SCISSOR_TEST);
       gl.uniform2f(locations.view,width,height);gl.uniform4fv(locations.cover,cover);gl.uniform3fv(locations.base,base);
-      gl.uniform1f(locations.pixel,Math.max(1/dpr,.75));
+      gl.uniform1f(locations.pixel,Math.max(1/dpr,.75));gl.uniform1f(locations.sourceOpacity,sourceOpacity);
       // 折射强度每次 draw 只读一次样式，不再在每个 region 里 getComputedStyle。
       // 同样内联：本函数会被测试单独抽取注入。
       const rawStrength=getComputedStyle(document.documentElement).getPropertyValue('--liquid-glass-refraction').trim();
@@ -410,8 +412,9 @@ const liquidGlassWebGLProbe=(()=>{
 function liquidGlassRenderPlan(value,url,svgReady){
   const webkit=liquidGlassWebKitTarget();
   if(!value)return {engine:'off',reason:'disabled'};
-  // WebKit 的历史行为优先保留：无壁纸时仍然进入控制器的 no-wallpaper 流程。
-  if(!url)return {engine:webkit?'svg':'off',reason:'no-wallpaper'};
+  // 无壁纸使用内部主题纹理；能力不足时明确轻量后备，不逐卡运行 SVG warp。
+  if(!url)return navigator.connection?.saveData===true?{engine:'lightweight',reason:'save-data'}:
+    liquidGlassWebGLProbe()?{engine:'gpu',reason:'theme-gradient'}:{engine:'lightweight',reason:'no-webgl'};
   let sameOrigin=false;
   try{sameOrigin=new URL(url,location.href).origin===location.origin}catch(e){}
   // 跨域壁纸读不到像素，GPU 无法上传纹理。放在 WebGL 探测之前，避免白建上下文。
@@ -430,8 +433,38 @@ const liquidGlassLensController=(()=>{
   // Chromium 上只负责 GPU 画布，失败要无声退回它原本的 CSS 折射路径，
   // 不能写 liquid-glass-fallback，否则会把可用的 filter:url() 折射降级成纯模糊。
   const webkitTarget=liquidGlassWebKitTarget();
-  let targets=[],gpu=null,gpuReason='',movingUntil=0,lastJsMs=0,animationTracking=false,coverViewport=null,drawerTransition=false,drawerRect=null;
+  let targets=[],gpu=null,gpuReason='',movingUntil=0,lastJsMs=0,animationTracking=false,coverViewport=null,drawerTransition=false,firstFrameReady=false;
   const surfaces=new Map();
+  let themeCanvas=null,themeKey='',themeRevision=0,themeBuilds=0,themeFailure='',themeDirty=true,themeSize='';
+  // 与 body 的六个 ellipse farthest-corner 径向层及线性底色一致，倒序合成。
+  // 只保留一张有上限的内部纹理；不创建假壁纸、不写用户缓存、不发图片请求。
+  function syncThemeTexture(width,height){
+    const size=width+'x'+height;if(!themeDirty&&themeSize===size)return;
+    const style=getComputedStyle(root),light=root.dataset.theme==='light';
+    const colors=['--bg0','--bg1','--accent-rgb','--accent2-rgb'].map(k=>style.getPropertyValue(k).trim());
+    const key=JSON.stringify([width,height,light,root.dataset.webuiPreset,...colors]);
+    themeDirty=false;themeSize=size;if(themeKey===key)return;
+    if(!themeCanvas)themeCanvas=document.createElement('canvas');
+    const ratio=Math.min(1,1536/Math.max(width,height));
+    const w=Math.max(1,Math.round(width*ratio)),h=Math.max(1,Math.round(height*ratio));
+    themeCanvas.width=w;themeCanvas.height=h;
+    const ctx=themeCanvas.getContext('2d');if(!ctx)throw new Error('no-theme-canvas');
+    const base=ctx.createLinearGradient(0,0,0,h);base.addColorStop(0,colors[0]);base.addColorStop(1,colors[1]);ctx.fillStyle=base;ctx.fillRect(0,0,w,h);
+    const layers=[[.5,.5,0,light?.35:.28,.55],[.8,.2,1,light?.30:.24,.50],[.2,.8,0,light?.25:.20,.60],[.4,.6,1,light?.25:.20,.55],[.7,.7,0,light?.20:.16,.50],[.3,.3,1,light?.20:.16,.60]];
+    for(const [x,y,color,alpha,stop] of layers.reverse()){
+      const cx=x*w,cy=y*h,rx=Math.max(cx,w-cx)*Math.SQRT2,ry=Math.max(cy,h-cy)*Math.SQRT2;
+      ctx.save();ctx.translate(cx,cy);ctx.scale(rx,ry);
+      const gradient=ctx.createRadialGradient(0,0,0,0,0,stop),rgb=colors[2+color];
+      gradient.addColorStop(0,`rgba(${rgb},${alpha})`);gradient.addColorStop(1,`rgba(${rgb},0)`);
+      ctx.fillStyle=gradient;ctx.fillRect(-cx/rx,-cy/ry,w/rx,h/ry);ctx.restore();
+    }
+    // CanvasImageSource 与 Image 共用尺寸读取，natural* 只作内部兼容属性。
+    themeCanvas.naturalWidth=w;themeCanvas.naturalHeight=h;
+    image=themeCanvas;themeKey=key;themeRevision++;themeBuilds++;
+  }
+  const themeObserver=new MutationObserver(records=>{
+    if(records.some(r=>r.oldValue!==root.getAttribute(r.attributeName))){themeDirty=true;schedule()}
+  });
   // 记录上一次观察到的抽屉开合状态，用于判断 drawer class 变化是否真的翻转。
   let wasDrawerOpen=document.body.classList.contains('nav-open')||document.body.classList.contains('drawer-intent-open');
   const resizeObserver=window.ResizeObserver?new ResizeObserver(()=>schedule()):null;
@@ -444,15 +477,6 @@ const liquidGlassLensController=(()=>{
         drawerTransition=true;
         movingUntil=performance.now()+360;
         animationTracking=true;
-        // 必须用**实时**矩形，不能预置成「已完全打开」的矩形。
-        // 以前这里写的是 {x:0,w:r.width}：抽屉还停在屏幕外时，主内容玻璃就被
-        // 按最终宽度裁掉了一条，而抽屉本体还没滑到那儿 —— 那一帧看起来
-        // 就是凭空出现的一块玻璃框（iOS 上尤其明显）。
-        // 实时矩形在动画第一帧就等于关闭位置，随滑动逐帧收回，不会留下空隙。
-        if(drawerOpen){
-          const sidebar=document.querySelector('.sidebar'),r=sidebar?.getBoundingClientRect();
-          if(r)drawerRect={x:r.x,y:r.y,w:r.width,h:r.height};
-        }
         // 抽屉开合会改变 targets 的过滤条件（侧栏进出），必须重新扫描，
         // 否则关闭后侧栏永远不会被加回玻璃目标。
         // 注意：这个 observer 挂的是 document.body 的 subtree + class 过滤，
@@ -470,31 +494,43 @@ const liquidGlassLensController=(()=>{
     if(changed)schedule();
   });
   function syncState(){
-    const ready=enabled&&status==='ready';
+    const ready=enabled&&status==='ready'&&firstFrameReady;
+    root.classList.toggle('glass-render-pending',enabled&&!ready&&(engine==='gpu'||engine==='svg'));
+    if(engine==='off')root.classList.remove('liquid-glass-fallback');
     // webkit-liquid-glass 只服务 WebKit 的回退样式（把模糊挪到元素本体），
     // 对 Chromium 是错误分支，会丢折射，所以只在 WebKit 上置位。
     root.classList.toggle('webkit-liquid-glass',enabled&&webkitTarget);
     // ios-liquid-glass 收窄为「WebKit 的 SVG 克隆层就绪」，Chromium 永不置位。
     root.classList.toggle('ios-liquid-glass',ready&&webkitTarget&&engine==='svg');
     root.classList.toggle('gpu-liquid-glass',ready&&!!gpu);
+    root.classList.toggle('theme-glass-fallback',engine==='lightweight');
     root.dataset.liquidGlassEngine=engine;
     root.classList.toggle('drawer-transition',drawerTransition);
     root.style.setProperty('--drawer-open',document.body.classList.contains('nav-open')?'1':'0');
-    // 状态归属：只有 WebKit 由本控制器写 fallback 与状态字符串；
-    // Chromium 的 CSS 折射与 GPU 成败无关，写了只会造成误降级。
-    if(enabled&&webkitTarget){
+    // 壁纸 CSS 路径保留原控制器状态；GPU 与无壁纸轻量后备显式报告来源。
+    // 不把 Chromium 壁纸加载失败误降级为逐卡纯模糊。
+    if(engine==='lightweight'){
+      root.classList.add('liquid-glass-fallback');root.dataset.liquidGlassState='fallback-'+status;
+    }else if(ready&&gpu){
+      root.classList.remove('liquid-glass-fallback');root.dataset.liquidGlassState=source==='theme-gradient'?'gpu-theme-refraction':'gpu-wallpaper-refraction';
+    }else if(enabled&&webkitTarget){
       root.classList.toggle('liquid-glass-fallback',!ready);
-      root.dataset.liquidGlassState=ready?(gpu?'gpu-wallpaper-refraction':'svg-wallpaper-refraction'):'fallback-'+status;
+      root.dataset.liquidGlassState=ready?(gpu?(source==='theme-gradient'?'gpu-theme-refraction':'gpu-wallpaper-refraction'):'svg-wallpaper-refraction'):'fallback-'+status;
     }
   }
   function schedule(){
     if(!enabled||status!=='ready'||frame)return;
     frame=requestAnimationFrame(()=>{frame=0;update()});
   }
+  let lastNarrow=narrowViewport();
+  function onResize(){
+    const narrow=narrowViewport();if(narrow!==lastNarrow){lastNarrow=narrow;targetsDirty=true}
+    schedule();
+  }
   function onScroll(){movingUntil=performance.now()+220;schedule()}
   function onVisible(){if(document.visibilityState==='visible'){targetsDirty=true;schedule()}}
   function onMotion(event){
-    if(event.target instanceof Element&&event.target.matches(selector+',.page-anim,.chatroom')){
+    if(event.target instanceof Element&&event.target.matches(selector+',.page-anim,.chatroom,.subtab-panel,.subtab-enter,.plugin-root,.plugin-panel,.plugin-config-cards')){
       // 翻页动画持续 0.82s，延迟最长 0.61s，总共约 1.43s。
       // 动画期间必须持续更新玻璃位置，否则模糊区域会停留在初始位置。
       movingUntil=performance.now()+(event.type==='animationstart'?1500:220);
@@ -506,38 +542,41 @@ const liquidGlassLensController=(()=>{
     if(on===listening)return;
     listening=on;
     if(on){
+      lastNarrow=narrowViewport();
       document.addEventListener('scroll',onScroll,{passive:true,capture:true});
       document.addEventListener('touchmove',onScroll,{passive:true,capture:true});
       document.addEventListener('touchend',onScroll,{passive:true,capture:true});
-      window.addEventListener('resize',schedule,{passive:true});
-      window.visualViewport?.addEventListener('resize',schedule,{passive:true});
+      window.addEventListener('resize',onResize,{passive:true});
+      window.visualViewport?.addEventListener('resize',onResize,{passive:true});
       window.visualViewport?.addEventListener('scroll',schedule,{passive:true});
       // 切回前台时 rAF 曾被节流，画布可能停在旧状态，补一次重绘。
       document.addEventListener('visibilitychange',onVisible,false);
       motionEvents.forEach(type=>document.addEventListener(type,onMotion,true));
       mutationObserver.observe(document.body,{attributes:true,attributeFilter:['class'],childList:true,subtree:true});
+      themeObserver.observe(root,{attributes:true,attributeOldValue:true,attributeFilter:['data-theme','data-webui-preset','style']});
       targetsDirty=true;
     }else{
       document.removeEventListener('scroll',onScroll,true);
       document.removeEventListener('touchmove',onScroll,true);
       document.removeEventListener('touchend',onScroll,true);
-      window.removeEventListener('resize',schedule);
-      window.visualViewport?.removeEventListener('resize',schedule);
+      window.removeEventListener('resize',onResize);
+      window.visualViewport?.removeEventListener('resize',onResize);
       window.visualViewport?.removeEventListener('scroll',schedule);
       document.removeEventListener('visibilitychange',onVisible,false);
       motionEvents.forEach(type=>document.removeEventListener(type,onMotion,true));
-      mutationObserver.disconnect();resizeObserver?.disconnect();
+      mutationObserver.disconnect();themeObserver.disconnect();resizeObserver?.disconnect();
     }
   }
   function removeSurface(node,surface){node.classList.remove('glass-lens-surface');surface.svg.remove();surfaces.delete(node)}
   function clear(){
     if(frame)cancelAnimationFrame(frame);
-    frame=0;movingUntil=0;listen(false);
+    frame=0;movingUntil=0;firstFrameReady=false;listen(false);
     surfaces.forEach((surface,node)=>removeSurface(node,surface));targets=[];
     if(gpu)gpu.dispose();gpu=null;gpuReason='';
     root.classList.remove('gpu-liquid-glass');
     if(request)request.abort();request=null;
     if(blobUrl)URL.revokeObjectURL(blobUrl);blobUrl='';imageSrc='';coverViewport=null;animationTracking=false;
+    themeCanvas=null;themeKey='';themeSize='';themeDirty=true;
   }
   // 元素级滤镜是模板的克隆体，强度改了要逐个同步，否则只有模板变了、
   // 页面上实际使用的克隆还是旧 scale（iPhone 上就会看到和卡片不一致）。
@@ -576,17 +615,9 @@ const liquidGlassLensController=(()=>{
   }
   function attr(node,key,value){const next=String(value);if(node.getAttribute(key)!==next)node.setAttribute(key,next)}
   function gpuRegions(width,height){
-    // 注意类名是 drawer-intent-open，不是 drawer-target-open（历史上写过错字，
-    // 导致抽屉打开的动画阶段 inDrawer 为 false，主内容区域没被剔除）。
-    const cache=new Map(),inDrawer=document.body.classList.contains('nav-open')||document.body.classList.contains('drawer-intent-open'),sidebar=document.querySelector('.sidebar'),sidebarBox=sidebar?.getBoundingClientRect();
-    // 每帧为每个 target 新建 MediaQueryList 是纯浪费，提到函数外只求值一次。
+    const cache=new Map(),inDrawer=document.body.classList.contains('nav-open')||document.body.classList.contains('drawer-intent-open');
+    // 每帧只求值一次；宽屏侧栏常驻，窄屏侧栏才是浮动抽屉。
     const narrow=narrowViewport();
-    // 不在滑动中更新 drawerRect：它会逐帧跟着侧栏移动，导致主内容的
-    // 玻璃裁切边界跟着侧栏跑，形成「透明层先开、侧栏跟着开」的观感。
-    // 抽屉完全打开后（drawerTransition=false）由 update() 置位即可。
-    if(!drawerTransition){
-      drawerRect=sidebarBox&&sidebarBox.width>0&&sidebarBox.right>0?{x:sidebarBox.x,y:sidebarBox.y,w:sidebarBox.width,h:sidebarBox.height}:null;
-    }
     function box(node){
       if(cache.has(node))return cache.get(node);
       const r=node.getBoundingClientRect(),s=getComputedStyle(node);
@@ -611,7 +642,7 @@ const liquidGlassLensController=(()=>{
       //     抽屉本来就有一层不透明底色，不需要折射，直接跳过最干净。
       // 宽屏下侧栏是常驻栏，照旧当成普通玻璃目标。
       if(node.closest('.sidebar')&&(inDrawer||narrow))return;
-      if(node.matches('.card')&&r[3]>height&&node.querySelector('.field,.feature,.stat'))return;
+      // 长卡片也保留玻璃，只裁剪可见区；整块跳过会让父卡片只剩边框。
       const clipBox=[0,0,width,height],clips=[];
       let fixed=s.position==='fixed';
       for(let parent=node.parentElement;parent&&parent!==document.body;parent=parent.parentElement){
@@ -626,15 +657,7 @@ const liquidGlassLensController=(()=>{
         }
         if(ps.position==='fixed')fixed=true;
       }
-      // 抽屉完全打开后，把被抽屉盖住的那一条裁掉，避免玻璃画到抽屉底下。
-      // 但**滑动过程中不要裁**：drawerRect 每帧跟着实时位置动，
-      // 主内容的玻璃区域会跟着抽屉一起平移，形成一条"清晰/模糊"的竖直边界
-      // 跟着侧栏跑 —— 用户看到的就是「一层透明的东西先开，侧栏跟着开」。
-      // 滑动途中裁切完全不需要：抽屉本身不透明，画在它底下看不见。
-      // 用稳定的抽屉完全打开状态（不依赖会变的 drawerTransition）。
-      if(inDrawer&&!drawerTransition&&drawerRect&&node.closest('.main')){
-        clipBox[0]=Math.max(clipBox[0],drawerRect.x+drawerRect.w);
-      }
+      // 抽屉和遮罩均半透明，后方卡片必须继续绘制；不能按抽屉宽度裁成原图。
       if(Math.min(r[0]+r[2],clipBox[2])<=Math.max(r[0],clipBox[0])||Math.min(r[1]+r[3],clipBox[3])<=Math.max(r[1],clipBox[1]))return;
       const order=node.closest('.sidebar')&&inDrawer?200:node.closest('.topbar')?100:0;
       regions.push({rect:r,radii:own.radii,clipBox,clips,soft:node.matches('.field,.feature,.stat,.btn,.pill'),order,index,area:r[2]*r[3]});
@@ -653,17 +676,21 @@ const liquidGlassLensController=(()=>{
   // 在 Chromium 上 GPU 建不起来就直接放弃控制器，交还给 CSS 折射路径；
   // WebKit 则退到每元素的 SVG 克隆层。两者都不能写 liquid-glass-fallback。
   function abandonGpu(reason){
+    firstFrameReady=false;
+    if(source==='theme-gradient'){
+      themeFailure=reason;enabled=false;generation++;image=null;source=null;clear();engine='lightweight';status=reason;gpuReason=reason;syncState();return true;
+    }
     gpuReason=reason;
     if(webkitTarget){engine='svg';return false}
     engine='css';enabled=false;status='off';
-    generation++;image=null;source=null;blobUrl='';imageSrc='';coverViewport=null;
-    clear();
+    generation++;image=null;source=null;
+    clear();gpuReason=reason;
     syncState();
     return true;
   }
   function startGpu(serial){
     // 外链不经 CORS 读像素，保留无需 canvas 读取权限的原生 SVG 后备。
-    if(!blobUrl){
+    if(!blobUrl&&source!=='theme-gradient'){
       abandonGpu('external-image');
       return;
     }
@@ -681,6 +708,9 @@ const liquidGlassLensController=(()=>{
   function update(){
     if(!enabled||status!=='ready'||!image)return;
     const started=performance.now();
+    const wasTracking=animationTracking;
+    const running=!!document.getAnimations?.().some(a=>(a.playState==='running'||a.pending)&&a.effect?.target?.matches?.(selector+',.page-anim,.chatroom,.sidebar,.main,.app,.subtab-panel,.subtab-enter,.plugin-root,.plugin-panel,.plugin-config-cards'));
+    animationTracking=running||started<movingUntil;
     if(targetsDirty){
       // 抽屉态的侧栏不进 targets：三条渲染路径（GPU / SVG 克隆 / CSS）
       // 因此都不必再各自判断，也不会画出那块浮空的玻璃框。
@@ -694,7 +724,8 @@ const liquidGlassLensController=(()=>{
       targets=next;targetsDirty=false;
       resizeObserver?.disconnect();targets.forEach(node=>resizeObserver?.observe(node));
     }
-    const blur=Math.max(0,parseFloat(getComputedStyle(root).getPropertyValue('--user-bg-blur'))||0);
+    const themeSource=source==='theme-gradient';
+    const blur=themeSource?0:Math.max(0,parseFloat(getComputedStyle(root).getPropertyValue('--user-bg-blur'))||0);
     // 卡片背景模糊度只影响玻璃内的采样模糊，不参与几何换算。
     // 几何（cover / 缩放）必须和壁纸本身的模糊度一致，否则折射采到的区域
     // 和元素底下真实的壁纸对不上，iOS 上就会看到明显错位。
@@ -708,6 +739,7 @@ const liquidGlassLensController=(()=>{
     const sampleBlur=blur+cardBlur;
     const viewport=window.visualViewport;
     const width=Math.max(1,Math.round(viewport?.width||innerWidth)),height=Math.max(1,Math.round(viewport?.height||innerHeight));
+    if(themeSource){try{syncThemeTexture(width,height)}catch(e){abandonGpu('theme-source');return}}
     const nextCover=Math.max((width+blur*4)/image.naturalWidth,(height+blur*4)/image.naturalHeight);
     if(!coverViewport||Math.abs(coverViewport.width-width)>=1||Math.abs(coverViewport.height-height)>=1||Math.abs(coverViewport.blur-blur)>=.01){
       coverViewport={width,height,blur,scale:nextCover};
@@ -716,13 +748,20 @@ const liquidGlassLensController=(()=>{
     const imageW=image.naturalWidth*scale,imageH=image.naturalHeight*scale;
     const baseX=(width-imageW)/2,baseY=(height-imageH)/2;
     if(gpu){
-      const color=getComputedStyle(document.body).backgroundColor;
-      const theme=getComputedStyle(root).getPropertyValue('--bg0').trim();
-      let base=[1,1,1];
-      if(/^#[0-9a-f]{6}$/i.test(theme))base=[1,3,5].map(i=>parseInt(theme.slice(i,i+2),16)/255);
-      else if(/^#[0-9a-f]{3}$/i.test(theme))base=[1,2,3].map(i=>parseInt(theme[i]+theme[i],16)/255);
-      else{const components=(color.match(/[\d.]+/g)||[]).slice(0,3).map(Number);if(components.length===3)base=components.map(x=>x/255)}
-      gpu.draw(gpuRegions(width,height),{width,height,cover:[baseX,baseY,imageW,imageH],blur:sampleBlur,base,animating:animationTracking});
+      let base=[0,0,0];
+      if(!themeSource){
+        const color=getComputedStyle(document.body).backgroundColor;
+        const theme=getComputedStyle(root).getPropertyValue('--bg0').trim();
+        base=[1,1,1];
+        if(/^#[0-9a-f]{6}$/i.test(theme))base=[1,3,5].map(i=>parseInt(theme.slice(i,i+2),16)/255);
+        else if(/^#[0-9a-f]{3}$/i.test(theme))base=[1,2,3].map(i=>parseInt(theme[i]+theme[i],16)/255);
+        else{const components=(color.match(/[\d.]+/g)||[]).slice(0,3).map(Number);if(components.length===3)base=components.map(x=>x/255)}
+      }
+      try{
+        gpu.draw(gpuRegions(width,height),{width,height,cover:themeSource?[0,0,width,height]:[baseX,baseY,imageW,imageH],blur:sampleBlur,base,animating:animationTracking,sourceRevision:themeSource?themeRevision:0,sourceOpacity:themeSource?1:.82});
+        if(!firstFrameReady){firstFrameReady=true;syncState()}
+      }
+      catch(e){if(gpu)gpu.dispose();gpu=null;if(abandonGpu('texture-upload'))return;syncState();schedule()}
     }else{
     // SVG 后备路径，滤镜以面板 padding box 定域而不是整张壁纸的包围盒。
     const drawerOpen=document.body.classList.contains('nav-open')||document.body.classList.contains('drawer-intent-open');
@@ -753,21 +792,10 @@ const liquidGlassLensController=(()=>{
       if(s.svg.style.left!==scrollX+'px')s.svg.style.left=scrollX+'px';
       if(s.svg.style.top!==scrollY+'px')s.svg.style.top=scrollY+'px';
     });
+    if(!firstFrameReady&&surfaces.size){firstFrameReady=true;syncState()}
     }
     lastJsMs=Number((performance.now()-started).toFixed(2));
-    const running=!!document.getAnimations?.().some(a=>a.playState==='running'&&a.effect?.target?.matches?.(selector+',.page-anim,.chatroom,.sidebar'));
-    const wasTracking=animationTracking;
-    animationTracking=running||performance.now()<movingUntil;
-    if(!animationTracking){
-      drawerTransition=false;
-      // 动画结束时把 drawerRect 刷到最终位置，避免下一帧裁切用滑动途中的旧矩形。
-      if(document.body.classList.contains('nav-open')){
-        const sb=document.querySelector('.sidebar'),r=sb?.getBoundingClientRect();
-        drawerRect=r&&r.width>0?{x:r.x,y:r.y,w:r.width,h:r.height}:null;
-      }else{
-        drawerRect=null;
-      }
-    }
+    if(!animationTracking)drawerTransition=false;
     // 动画刚结束的那一帧必须再画一次：上面的 region 是**这次**调用用的，
     // 而动画最后一帧的 transform 已经到位。少了这一次重绘，画布会停在
     // 倒数第二帧的位置，卡片却已经落位 —— 视觉上就是刷新后卡片"跳一下"。
@@ -800,7 +828,7 @@ const liquidGlassLensController=(()=>{
       next.onload=()=>{
         if(serial!==generation||!enabled)return;
         if(!next.naturalWidth||!next.naturalHeight){imageFailed();return}
-        image=next;imageSrc=src;status='ready';startGpu(serial);syncState();listen(true);schedule();
+        image=next;imageSrc=src;status='ready';startGpu(serial);syncState();if(enabled){listen(true);schedule()}
       };
       next.onerror=()=>{if(serial===generation&&enabled)imageFailed()};
       next.src=src;
@@ -811,27 +839,35 @@ const liquidGlassLensController=(()=>{
   }
   return {setEnabled(value,url,svgReady){
     const plan=liquidGlassRenderPlan(!!value,url,svgReady);
-    engine=plan.engine;
+    if(!value||url)themeFailure='';
+    if(value&&!url&&themeFailure){plan.engine='lightweight';plan.reason=themeFailure}
+    const previousEngine=engine;engine=plan.engine;
     // off / css：控制器完全惰性，不加载图片、不建 surface。
     // css 是 Chromium 的原生回退路径，由 CSS 自己完成，这里绝不能插手。
-    if(engine==='off'||engine==='css'){
+    if(engine==='off'||engine==='css'||engine==='lightweight'){
       const wasActive=enabled;
-      enabled=false;status='off';drawerTransition=false;drawerRect=null;
+      enabled=false;status=engine==='lightweight'?plan.reason:'off';drawerTransition=false;
       if(wasActive||gpu||surfaces.size||image){generation++;image=null;source=null;clear()}
       syncState();
       return;
     }
     enabled=true;
     // GPU 不需要 SVG 位移贴图；svg 引擎才需要 svgReady。
-    const nextSource=engine==='gpu'?(url||''):(svgReady&&url?url:'');
-    if(source===nextSource){syncState();schedule();return}
+    const nextSource=engine==='gpu'?(url||'theme-gradient'):(svgReady&&url?url:'');
+    if(previousEngine===engine&&source===nextSource){syncState();schedule();return}
     source=nextSource;image=null;const serial=++generation;clear();
     // svg 引擎沿用原有判定顺序：先看 SVG 位移贴图是否就绪，再看有没有壁纸。
     // GPU 不需要贴图，只看壁纸。
     status=engine==='svg'?(!svgReady?'no-map':!nextSource?'no-wallpaper':'loading'):(!nextSource?'no-wallpaper':'loading');
     syncState();
-    if(nextSource)load(nextSource,serial);
-  },refresh(){schedule()},diagnostics(){return {engine,renderer:gpu?'fixed-webgl-v2':(engine==='css'?'css-backdrop':'native-svg-fallback-v2'),status,imageSize:image?[image.naturalWidth,image.naturalHeight]:null,layers:gpu?1:surfaces.size,sourceType:blobUrl?'same-origin-blob':imageSrc?'external-image':'none',drawerOpen:document.body.classList.contains('nav-open'),animationTracking,cover:coverViewport?{width:coverViewport.width,height:coverViewport.height,blur:coverViewport.blur}:null,gpu:gpu?gpu.diagnostics():null,gpuFallbackReason:gpuReason||null,lastUpdateJsMs:lastJsMs}}};
+    if(nextSource==='theme-gradient'){
+      try{
+        const viewport=window.visualViewport;
+        syncThemeTexture(Math.max(1,Math.round(viewport?.width||innerWidth)),Math.max(1,Math.round(viewport?.height||innerHeight)));
+        status='ready';startGpu(serial);syncState();if(enabled){listen(true);schedule()}
+      }catch(e){abandonGpu('theme-source')}
+    }else if(nextSource)load(nextSource,serial);
+  },refresh(){schedule()},diagnostics(){return {engine,renderer:gpu?'fixed-webgl-v2':(engine==='lightweight'?'theme-lightweight':engine==='css'?'css-backdrop':'native-svg-fallback-v2'),status,firstFrameReady,imageSize:image?[image.naturalWidth,image.naturalHeight]:null,layers:gpu?1:surfaces.size,sourceType:source==='theme-gradient'?'theme-gradient':blobUrl?'same-origin-blob':imageSrc?'external-image':'none',themeTextureBuilds:themeBuilds,themeTextureRevision:themeRevision,drawerOpen:document.body.classList.contains('nav-open'),animationTracking,cover:coverViewport?{width:coverViewport.width,height:coverViewport.height,blur:coverViewport.blur}:null,gpu:gpu?gpu.diagnostics():null,gpuFallbackReason:gpuReason||null,lastUpdateJsMs:lastJsMs}}};
 })();
 function applyWebuiAppearance(){const v=state.bundle?.form_values||{},root=document.documentElement;const preset=String(v['WebUI.theme_preset']||'aurora');root.dataset.webuiPreset=preset;const liquid=!!v['WebUI.liquid_glass'];const disableBgBlur=liquid&&!!v['WebUI.disable_background_blur'];const blur=disableBgBlur?0:Math.max(0,Math.min(40,Number(v['WebUI.background_blur']||0)));root.style.setProperty('--user-bg-blur',blur+'px');
     // 区分「键不存在」（bundle 还没加载完/部分刷新）与「键存在但为空」（用户主动清除）。
@@ -1002,13 +1038,25 @@ function setMobileNav(open){
 }
 function toggleMobileNav(){setMobileNav(!document.body.classList.contains('nav-open'))}
 function closeMobileNav(){setMobileNav(false)}
-function gotoPage(k,section='',opts={}){closeMobileNav();if(state.dirty){const m=el('leaveModal');if(m){m.style.display='flex';m._pending={k,section};return}}if(state.bundle&&!isValidPage(k))k='welcome';if(!opts.discard)syncCurrentPageFieldsFromDom();if(k==='chatroom'){chatState._enterBottom=true}window.__pageSwitched=true;state._navigating=true;state.dirty=false;state.lastInputAt=0;clearDraft();updateRoute(k,section);render();const live=['welcome','logs','stats','debug','chatroom','store'].includes(k);/* 确认放弃改动时也要强制回读服务端，否则非 live 页面会继续显示未保存的编辑值 */Promise.resolve((live||opts.discard)?refreshAll(true):null).finally(()=>{state._navigating=false});if(k==='store')loadStore();if(k==='knowledge')loadKnowledge();if(k==='trace'&&!traceState.openId)traceLoad()}
+function gotoPage(k,section='',opts={}){closeMobileNav();if(state.dirty){const m=el('leaveModal');if(m){m.style.display='flex';m._pending={k,section};return}}if(state.bundle&&!isValidPage(k))k='welcome';if(!opts.discard)syncCurrentPageFieldsFromDom();if(k==='chatroom'){chatState._enterBottom=true}window.__pageSwitched=true;state._navigating=true;state.dirty=false;state.lastInputAt=0;clearDraft();updateRoute(k,section);render();const live=['welcome','logs','stats','debug','chatroom','store'].includes(k);/* 确认放弃改动时也要强制回读服务端，否则非 live 页面会继续显示未保存的编辑值 */Promise.resolve((live||opts.discard)?refreshAll(true):null).finally(()=>{state._navigating=false});if(k==='knowledge')loadKnowledge();if(k==='trace'&&!traceState.openId)traceLoad()}
 function leaveCancel(){const m=el('leaveModal');if(m){m.style.display='none';m._pending=null}}
 function leaveConfirm(){const m=el('leaveModal');if(!m)return;const p=m._pending;m.style.display='none';m._pending=null;state.dirty=false;traceDiscardPending();/* 确认离开=丢弃未保存改动：不同步 DOM，并强制从服务端重载 */if(p)gotoPage(p.k||p.page,p.section||'',{discard:true})}
-function renderNav(){const nav=el('nav');if(!nav)return;if(!el('navIndicator')){nav.innerHTML=`<div class="custom-nav">`+pages().map(p=>{let iconHtml='';if(p.icon&&p.icon.includes('<svg'))iconHtml=p.icon;else if(p.icon)iconHtml=p.icon;else iconHtml='•';return `<div class="custom-nav-item" data-key="${p.key}" onclick="gotoPage('${p.key}')"><div class="custom-nav-icon">${iconHtml}</div><div class="custom-nav-label">${esc(p.title)}</div></div>`}).join('')+`<div class="active-indicator-floater" id="navIndicator"></div><div class="nav-bg-floater" id="navBg"></div></div>`;}nav.querySelectorAll('.custom-nav-item').forEach(item=>{item.classList.toggle('active',item.dataset.key===state.current);});}
+function renderNav(){
+  const nav=el('nav');if(!nav)return;
+  const groups=navigationGroups(),signature=JSON.stringify(groups.map(g=>[g.key,navGroupCollapsed(g.key),g.items.map(p=>[p.key,p.title,p.icon])]));
+  if(nav.dataset.signature!==signature||!el('navIndicator')){
+    nav.dataset.signature=signature;
+    nav.innerHTML='<div class="custom-nav">'+groups.map(g=>`<section class="nav-group ${navGroupCollapsed(g.key)?'is-collapsed':''}" data-group="${esc(g.key)}"><button type="button" class="nav-group-title" data-group="${esc(g.key)}" aria-expanded="${!navGroupCollapsed(g.key)}" onclick="toggleNavGroup(this.dataset.group)"><span>${esc(g.title)}</span><span class="nav-group-caret" aria-hidden="true">⌄</span></button><div class="nav-group-items">${g.items.map(p=>`<div class="custom-nav-item" role="button" tabindex="0" data-key="${esc(p.key)}" onclick="gotoPage(this.dataset.key)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();gotoPage(this.dataset.key)}"><div class="custom-nav-icon">${p.icon||'•'}</div><div class="custom-nav-label">${esc(p.title)}</div></div>`).join('')}</div></section>`).join('')+'<div class="active-indicator-floater" id="navIndicator"></div><div class="nav-bg-floater" id="navBg"></div></div>';
+  }
+  nav.querySelectorAll('.custom-nav-item').forEach(item=>{
+    const active=item.dataset.key===state.current;item.classList.toggle('active',active);
+    if(active)item.setAttribute('aria-current','page');else item.removeAttribute('aria-current');
+    if(active){const group=item.closest('.nav-group');group?.classList.remove('is-collapsed');group?.querySelector('.nav-group-title')?.setAttribute('aria-expanded','true')}
+  });
+}
 const updateNavIndicator=()=>{const nav=el('nav'),items=nav?nav.querySelectorAll('.custom-nav-item'):[],floater=el('navIndicator'),floaterBg=el('navBg');if(!floater||!nav)return;const host=nav.querySelector('.custom-nav')||nav;let activeEl=null;for(let i=0;i<items.length;i++){if(items[i].classList.contains('active')){activeEl=items[i];break}}if(activeEl){const hostTop=host.getBoundingClientRect().top;const itemTop=activeEl.getBoundingClientRect().top;const top=itemTop-hostTop+host.scrollTop;floater.style.opacity='1';floater.style.top=(top+10)+'px';floater.style.height=Math.max(0,activeEl.offsetHeight-20)+'px';if(floaterBg){floaterBg.style.opacity='1';floaterBg.style.top=top+'px';floaterBg.style.height=activeEl.offsetHeight+'px'}}else{floater.style.opacity='0';if(floaterBg)floaterBg.style.opacity='0'}};
 function renderConnectionStatus(){const s=state.bundle?.status||{},cs=s.connection_status||{},cfg=s.connection||{};const statusEl=el('connectionStatus'),detailEl=el('connectionDetail');if(statusEl){const text=cs.text||'未知状态';statusEl.textContent=text;statusEl.className='pill '+((cs.state==='connected')?'ok':(cs.state==='failed'||cs.state==='disconnected'||cs.state==='stopped')?'bad':'')}if(detailEl){const lines=[];if(cs.detail)lines.push(cs.detail);const endpoint=[cfg.host&&cfg.port?`${cfg.host}:${cfg.port}`:''].filter(Boolean).join(' · ');if(endpoint)lines.push(endpoint);detailEl.textContent=lines.join(' | ')||'暂无连接详情'}}
-function render(){if(!state.bundle)return;applyWebuiAppearance();applyRoute();const isSwitch=state._lastPage!==state.current;state._lastPage=state.current;const logScroll=captureLogScrollState();renderNav();requestAnimationFrame(updateNavIndicator);renderConnectionStatus();const ub=el('pluginUploadBtn');if(ub)ub.style.display=state.current==='store'?'':'none';const m=meta(),titleEl=el('pageTitle'),descEl=el('pageDesc'),brandEl=el('brandName'),contentEl=el('content');const isChat=state.current==='chatroom',isDebug=state.current==='debug';if(isChat&&contentEl){contentEl.classList.remove('page-anim');clearTimeout(contentEl._animTimer)}if(titleEl)titleEl.textContent=isChat?'聊天室':isDebug?'调试':m.title;if(descEl){const desc=isChat?'':isDebug?'运行资源、缓存和会话状态等可统计的全部调试信息':(Object.prototype.hasOwnProperty.call(m,'desc')?m.desc:'所有数值均可在此直接修改并保存');descEl.textContent=desc;descEl.style.display=desc?'':'none'}if(brandEl)brandEl.textContent=state.bundle.status?.project||'XcBot';if(contentEl){
+function render(){if(!state.bundle)return;snapshotPluginConfigOpen();applyWebuiAppearance();applyRoute();const isSwitch=state._lastPage!==state.current;state._lastPage=state.current;const logScroll=captureLogScrollState();renderNav();requestAnimationFrame(updateNavIndicator);renderConnectionStatus();const ub=el('pluginUploadBtn');if(ub)ub.style.display=state.current==='store'?'':'none';const m=meta(),titleEl=el('pageTitle'),descEl=el('pageDesc'),brandEl=el('brandName'),contentEl=el('content');const isChat=state.current==='chatroom',isDebug=state.current==='debug';if(isChat&&contentEl){contentEl.classList.remove('page-anim');clearTimeout(contentEl._animTimer)}if(titleEl)titleEl.textContent=isChat?'聊天室':isDebug?'调试':m.title;if(descEl){const desc=isChat?'':isDebug?'运行资源、缓存和会话状态等可统计的全部调试信息':(Object.prototype.hasOwnProperty.call(m,'desc')?m.desc:'所有数值均可在此直接修改并保存');descEl.textContent=desc;descEl.style.display=desc?'':'none'}if(brandEl)brandEl.textContent=state.bundle.status?.project||'XcBot';if(contentEl){
   if(isSwitch&&contentEl._chatAnimRenderTimer){clearTimeout(contentEl._chatAnimRenderTimer);contentEl._chatAnimRenderTimer=null}
   // 只允许真实页面切换触发一次动画。refreshAll/chatBootstrap/hashchange 可能在同一帧内再次 render，
   // 不能再用全局 pageSwitched 标记，否则会把同一页重新播放一遍。
@@ -1025,7 +1073,7 @@ function render(){if(!state.bundle)return;applyWebuiAppearance();applyRoute();co
     // 等 staggered delay(0.61s)+duration(0.82s) 播完再摘掉 class，避免中途被刷新掐断
     contentEl._animTimer=setTimeout(()=>contentEl.classList.remove('page-anim'),1500);
      window.__pageSwitched=false;
-    if(state.current==='store'&&_storeList===null)loadStore();
+    if(state.current==='store')ensurePluginTabLoaded();
     if(state.current==='trace'&&traceState.list===null&&!traceState.loading)traceLoad();
   }else if(animating&&!isChat){
      // 非聊天室页面继续等待动画结束后刷新。
@@ -1386,16 +1434,78 @@ async function debugSendSelfMessage(btn){
     forceRender()
   }
 }
-function providers(){const v=state.bundle.form_values||{};let ps=Array.isArray(v['Others.llm_providers'])?v['Others.llm_providers']:[];return ps}
+function providers(){const v=state.bundle?.form_values||{};let ps=Array.isArray(v['Others.llm_providers'])?v['Others.llm_providers']:[];ps.forEach(providerIdentity);return ps}
 function rotation(){const v=state.bundle.form_values||{};return Array.isArray(v['Others.llm_rotation'])?v['Others.llm_rotation']:[]}
 function providerModelLabel(pid,m){return (pid?pid+'/':'')+m}
 function enabledProviderModels(){const out=[];providers().forEach(p=>(p.models||[]).forEach(m=>{if(m.enabled&&p.id&&m.name)out.push({provider_id:p.id,model:m.name,label:providerModelLabel(p.id,m.name),supports_multimodal:!!m.supports_multimodal})}));return out}
 function ensureProviderSelection(){const ps=providers();if(!state.providerIndex||state.providerIndex>=ps.length)state.providerIndex=0;return state.providerIndex||0}
-function setProviders(ps){setValue('Others.llm_providers',ps);syncRotationWithEnabled()}
+const PROVIDER_IDENTITY=Symbol('providerIdentity');
+const providerDetections=new Map();
+const detectedViews=new Map();
+function providerIdentity(p){return p[PROVIDER_IDENTITY]||(p[PROVIDER_IDENTITY]=Symbol('provider'))}
+function providerDetectParams(p){return JSON.stringify({provider_id:p.id,base_url:p.base_url,keys:p.keys||[],http_proxy:p.http_proxy||''})}
+function providerRotationSignature(ps){return JSON.stringify(ps.flatMap(p=>(p.models||[]).filter(m=>m.enabled&&p.id&&m.name).map(m=>providerModelLabel(p.id,m.name))))}
+function adoptProviderIdentities(previous,next){
+  // 保存响应会规范化并重建对象；仅唯一且连接参数未变的提供商继承请求身份。
+  for(const p of next){const matches=previous.filter(x=>x.id===p.id&&providerDetectParams(x)===providerDetectParams(p));if(matches.length===1&&next.filter(x=>x.id===p.id).length===1)p[PROVIDER_IDENTITY]=providerIdentity(matches[0])}
+}
+function setProviders(ps){
+  const previous=providers(),rotationChanged=providerRotationSignature(previous)!==providerRotationSignature(ps);
+  for(const p of ps)providerIdentity(p);
+  for(const [id,request] of providerDetections){const p=ps.find(x=>providerIdentity(x)===id);if(!p||providerDetectParams(p)!==request.params)providerDetections.delete(id)}
+  if(sameDraftValues(previous,ps))return;
+  setValue('Others.llm_providers',ps);if(rotationChanged)syncRotationWithEnabled();
+}
 function setRotation(r){setValue('Others.llm_rotation',r)}
-function syncRotationWithEnabled(){const enabled=enabledProviderModels(),valid=new Set(enabled.map(x=>x.label)),cur=rotation().filter(x=>valid.has(providerModelLabel(x.provider_id,x.model))),seen=new Set(cur.map(x=>providerModelLabel(x.provider_id,x.model)));enabled.forEach(x=>{if(!seen.has(x.label))cur.push({provider_id:x.provider_id,model:x.model})});setValue('Others.llm_rotation',cur)}
+function syncRotationWithEnabled(){const enabled=enabledProviderModels(),valid=new Set(enabled.map(x=>x.label)),cur=rotation().filter(x=>valid.has(providerModelLabel(x.provider_id,x.model))),seen=new Set(cur.map(x=>providerModelLabel(x.provider_id,x.model)));enabled.forEach(x=>{if(!seen.has(x.label))cur.push({provider_id:x.provider_id,model:x.model})});if(!sameDraftValues(rotation(),cur))setValue('Others.llm_rotation',cur)}
 function renderProviders(){const ps=providers(),idx=ensureProviderSelection(),p=ps[idx]||null;return `<div class="card"><div class="section-head"><div><h3>提供商</h3><p>检测模型、勾选模型并设置轮换顺序</p></div><button class="btn primary" onclick="addProvider()">新增提供商</button></div><div class="split-pane"><div class="split-pane-list">${ps.length?ps.map((x,i)=>`<button class="btn ${i===idx?'primary':''}" style="text-align:left" onclick="syncProviderFieldsFromDom();state.providerIndex=${i};forceRender()">${esc(x.id||('provider'+(i+1)))}</button>`).join(''):'<div class="desc">暂无提供商</div>'}</div><div>${p?renderProviderDetail(p,idx):'<div class="desc">点击新增提供商开始配置。</div>'}</div></div></div>${renderRotationList()}`}
-function renderProviderDetail(p,idx){return `<div class="form-grid"><div class="field"><div class="label"><span>提供商 ID</span><button class="btn" onclick="removeProvider(${idx})">删除</button></div><input id="provider_id_${idx}" value="${esc(p.id||'')}" oninput="updateProvider(${idx},'id',this.value.trim())"><div class="desc">Bot 显示名为 提供商ID/模型名</div></div><div class="field"><div class="label"><span>Base URL</span></div><input id="provider_base_${idx}" value="${esc(p.base_url||'')}" placeholder="https://.../v1" oninput="updateProvider(${idx},'base_url',this.value.trim())"></div><div class="field"><div class="label"><span>HTTP 代理（可选）</span></div><input id="provider_proxy_${idx}" value="${esc(p.http_proxy||'')}" placeholder="http://127.0.0.1:7890" oninput="updateProvider(${idx},'http_proxy',this.value.trim())"><div class="desc">该提供商的全部请求走此代理；留空为直连，不使用全局代理。仅支持 http / https。</div></div><div class="field" style="grid-column:1/-1"><div class="label"><span>API Keys（每行一个）</span><button class="btn" onclick="detectProviderModels(${idx})">检测模型</button></div><textarea id="provider_keys_${idx}" style="min-height:92px" placeholder="同一提供商的多个 API Key，每行一个" oninput="updateProvider(${idx},'keys',this.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean))">${esc(Array.isArray(p.keys)?p.keys.join('\n'):'')}</textarea><div class="desc">同一提供商可填写多个 Key；系统会按 Key 轮换，某个 Key 失败时暂时冷却，避免反复使用。</div><div class="desc" id="providerDetect_${idx}">${esc(p.detect_error||'')}</div>${renderDetectedModels(p,idx)}</div><div class="field" style="grid-column:1/-1"><div class="label"><span>对话模型</span><button class="btn" onclick="openModelInput(${idx},'chat')">手动添加模型</button></div><div style="display:grid;gap:8px">${renderProviderModels(p,idx)}</div></div><div class="field" style="grid-column:1/-1"><div class="label"><span>嵌入模型</span><button class="btn" onclick="openModelInput(${idx},'embedding')">添加嵌入模型</button></div><div style="display:grid;gap:8px">${renderEmbeddingModels(p,idx)}</div><div class="desc">嵌入模型复用本提供商的 Base URL 和 Key，知识库可在这里选择。</div></div></div>`}
+function renderProviderDetail(p,idx){
+  // 提供商内三个子标签页：对话模型 / 回复判断模型 / 嵌入模型
+  const tab = state.providerSubTab?.[idx] || 'chat';
+
+  const detecting=providerDetections.has(providerIdentity(p));
+  return `<div class="form-grid">
+    <div class="field"><div class="label"><span>提供商 ID</span><button class="btn" onclick="removeProvider(${idx})">删除</button></div><input id="provider_id_${idx}" value="${esc(p.id||'')}" oninput="updateProvider(${idx},'id',this.value.trim())"><div class="desc">Bot 显示名为 提供商ID/模型名</div></div>
+    <div class="field"><div class="label"><span>Base URL</span></div><input id="provider_base_${idx}" value="${esc(p.base_url||'')}" placeholder="https://.../v1" oninput="updateProvider(${idx},'base_url',this.value.trim())"></div>
+    <div class="field"><div class="label"><span>HTTP 代理（可选）</span></div><input id="provider_proxy_${idx}" value="${esc(p.http_proxy||'')}" placeholder="http://127.0.0.1:7890" oninput="updateProvider(${idx},'http_proxy',this.value.trim())"><div class="desc">该提供商的全部请求走此代理；留空为直连，不使用全局代理。仅支持 http / https。</div></div>
+    <div class="field" style="grid-column:1/-1"><div class="label"><span>API Keys（每行一个）</span><button class="btn" id="providerDetectBtn_${idx}" ${detecting?'disabled':''} onclick="detectProviderModels(${idx})">${detecting?'检测中…':'检测模型'}</button></div><textarea id="provider_keys_${idx}" style="min-height:92px" placeholder="同一提供商的多个 API Key，每行一个" oninput="updateProvider(${idx},'keys',this.value.split(/\\r?\\n/).map(x=>x.trim()).filter(Boolean))">${esc(Array.isArray(p.keys)?p.keys.join('\n'):'')}</textarea><div class="desc">同一提供商可填写多个 Key；系统会按 Key 轮换，某个 Key 失败时暂时冷却，避免反复使用。</div><div class="desc" id="providerDetect_${idx}">${esc(detecting?'检测中…':p.detect_error||'')}</div><div id="providerDetected_${idx}">${renderDetectedModels(p,idx)}</div></div>
+    <div style="grid-column:1/-1;margin-top:12px"><div class="subtab-nav" id="providerTabs_${idx}">${['chat','planner','embedding'].map((kind,i)=>`<button class="btn ${tab===kind?'primary':''}" data-tab="${kind}" onclick="switchProviderTab(${idx},this.dataset.tab)">${['对话模型','回复判断模型','嵌入模型'][i]}</button>`).join('')}</div><div class="subtab-panel" id="providerPanel_${idx}">${renderProviderTab(p,idx,tab)}</div></div>
+  </div>`;
+}
+function animateSubtab(panel){
+  if(!panel)return;
+  panel.classList.remove('subtab-enter');
+  panel.onanimationend=panel.onanimationcancel=null;
+  if(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches)return;
+  void panel.offsetWidth;
+  panel.classList.add('subtab-enter');
+  panel.onanimationend=panel.onanimationcancel=event=>{
+    if(event.target!==panel||!['subtab-content-in','glass-subtab-content-in'].includes(event.animationName))return;
+    panel.classList.remove('subtab-enter');
+    panel.onanimationend=panel.onanimationcancel=null;
+  };
+}
+function switchProviderTab(idx,tab){
+  if(!['chat','planner','embedding'].includes(tab)||(state.providerSubTab?.[idx]||'chat')===tab)return;
+  syncProviderFieldsFromDom();rememberDetectedSelection(idx);
+  (state.providerSubTab||(state.providerSubTab={}))[idx]=tab;
+  const p=providers()[idx],panel=el('providerPanel_'+idx);if(!p||!panel)return;
+  panel.innerHTML=renderProviderTab(p,idx,tab);
+  const detected=el('providerDetected_'+idx);if(detected)detected.innerHTML=renderDetectedModels(p,idx);
+  el('providerTabs_'+idx)?.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('primary',b.dataset.tab===tab));animateSubtab(panel);
+}
+function renderProviderTab(p,idx,tab){
+  let tabContent = '';
+  if (tab === 'chat') {
+    tabContent = `<div class="section-header"><h4>对话模型</h4><button class="btn" onclick="openModelInput(${idx},'chat')">手动添加模型</button></div><div style="display:grid;gap:8px;margin-top:12px">${renderProviderModels(p,idx)}</div>`;
+  } else if (tab === 'planner') {
+    tabContent = `<div class="section-header"><h4>回复判断模型</h4><button class="btn" onclick="openModelInput(${idx},'planner')">手动添加模型</button></div><div class="desc" style="margin:12px 0 8px">主动回复功能的 AI 判断器专用。建议选轻量快速的模型（如 step-3.7-flash / mimo-v2.6-flash）以降低成本。</div><div style="display:grid;gap:8px">${renderPlannerModels(p,idx)}</div>`;
+  } else {
+    tabContent = `<div class="section-header"><h4>嵌入模型</h4><button class="btn" onclick="openModelInput(${idx},'embedding')">添加嵌入模型</button></div><div style="display:grid;gap:8px;margin-top:12px">${renderEmbeddingModels(p,idx)}</div><div class="desc" style="margin-top:12px">嵌入模型复用本提供商的 Base URL 和 Key，知识库可在这里选择。</div>`;
+  }
+
+  return tabContent;
+}
 const REASONING_LABELS=[['','默认'],['none','关闭'],['minimal','最小'],['low','低'],['medium','中'],['high','高']];
 function modelRowOpen(idx,mi){return !!(state.modelRowOpen&&state.modelRowOpen[idx+':'+mi])}
 function toggleModelRow(idx,mi){if(!state.modelRowOpen)state.modelRowOpen={};const k=idx+':'+mi;state.modelRowOpen[k]=!state.modelRowOpen[k];forceRender()}
@@ -1407,28 +1517,135 @@ return `<div class="field" style="padding:10px;display:grid;gap:8px"><div class=
 function renderEmbeddingModels(p,idx){const models=Array.isArray(p.embedding_models)?p.embedding_models:[];if(!models.length)return '<div class="desc">暂无嵌入模型。</div>';return models.map((m,mi)=>`<div class="embed-row field"><input type="checkbox" ${m.enabled!==false?'checked':''} onchange="updateEmbeddingModel(${idx},${mi},'enabled',this.checked)"><input value="${esc(m.name||'')}" oninput="updateEmbeddingModel(${idx},${mi},'name',this.value.trim())"><input type="number" placeholder="维度（可选）" value="${esc(m.dimensions||'')}" oninput="updateEmbeddingModel(${idx},${mi},'dimensions',num(this.value))"><button class="btn" onclick="removeEmbeddingModel(${idx},${mi})">删除</button></div>`).join('')}
 function updateEmbeddingModel(i,mi,k,v){const ps=[...providers()];ps[i]=Object.assign({},ps[i]||{});ps[i].embedding_models=[...(ps[i].embedding_models||[])];ps[i].embedding_models[mi]=Object.assign({},ps[i].embedding_models[mi]||{});ps[i].embedding_models[mi][k]=v;setProviders(ps)}
 function removeEmbeddingModel(i,mi){const ps=[...providers()];ps[i]=Object.assign({},ps[i]||{});ps[i].embedding_models=[...(ps[i].embedding_models||[])];ps[i].embedding_models.splice(mi,1);setProviders(ps);forceRender()}
-function renderDetectedModels(p,idx){const detected=Array.isArray(p.detected_models)?p.detected_models:[];if(!detected.length)return '';const existing=new Set((p.models||[]).map(x=>x.name));const options=detected.filter(x=>!existing.has(x));return `<div class="field" style="margin-top:12px;padding:12px"><div class="label"><span>检测结果</span><span class="pill">${options.length} 个可添加 / ${detected.length} 个已检测</span></div><input id="detected_search_${idx}" placeholder="搜索模型名称" oninput="filterDetectedModels(${idx},this.value)"><select id="detected_select_${idx}" size="${Math.min(10,Math.max(3,options.length))}" style="margin-top:10px">${options.map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join('')}</select><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="btn primary" onclick="addDetectedModel(${idx})" ${options.length?'':'disabled'}>添加选中模型</button><button class="btn" onclick="clearDetectedModels(${idx})">清空检测结果</button></div><div class="desc">支持按名称搜索；只添加当前选中的模型。</div></div>`}
-function filterDetectedModels(i,value){const p=providers()[i]||{},existing=new Set((p.models||[]).map(x=>x.name)),query=String(value||'').trim().toLowerCase(),select=el('detected_select_'+i);if(!select)return;const options=(p.detected_models||[]).filter(x=>!existing.has(x)&&(!query||String(x).toLowerCase().includes(query)));select.innerHTML=options.map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join('');select.size=Math.min(10,Math.max(3,options.length))}
-function openModelInput(i,kind){modelInputState={providerIndex:i,kind:kind==='embedding'?'embedding':'chat'};const modal=el('modelInputModal'),title=el('modelInputTitle'),label=el('modelInputLabel'),input=el('modelInputValue');if(!modal||!input)return;if(title)title.textContent=modelInputState.kind==='embedding'?'添加嵌入模型':'添加对话模型';if(label)label.textContent=modelInputState.kind==='embedding'?'嵌入模型名称':'对话模型名称';input.value='';modal.style.display='flex';requestAnimationFrame(()=>input.focus())}
+function renderPlannerModels(p,idx){const models=Array.isArray(p.planner_models)?p.planner_models:[];if(!models.length)return '<div class="desc">暂无回复判断模型。</div>';return models.map((m,mi)=>`<div class="field" style="padding:10px;display:grid;gap:8px"><div class="model-row planner-row"><input type="checkbox" ${m.enabled?'checked':''} onchange="updatePlannerModel(${idx},${mi},'enabled',this.checked)"><input value="${esc(m.name||'')}" oninput="updatePlannerModel(${idx},${mi},'name',this.value.trim())"><span>超时</span><input type="number" step="1" value="${esc(m.timeout_seconds||60)}" oninput="updatePlannerModel(${idx},${mi},'timeout_seconds',num(this.value))"><button class="btn" onclick="removePlannerModel(${idx},${mi})">删除</button></div></div>`).join('')}
+function updatePlannerModel(i,mi,k,v){const ps=[...providers()];ps[i]=Object.assign({},ps[i]||{});ps[i].planner_models=[...(ps[i].planner_models||[])];ps[i].planner_models[mi]=Object.assign({},ps[i].planner_models[mi]||{});ps[i].planner_models[mi][k]=v;setProviders(ps)}
+function removePlannerModel(i,mi){const ps=[...providers()];ps[i]=Object.assign({},ps[i]||{});ps[i].planner_models=[...(ps[i].planner_models||[])];ps[i].planner_models.splice(mi,1);setProviders(ps);forceRender()}
+function providerModelListKey(tab){return tab==='planner'?'planner_models':tab==='embedding'?'embedding_models':'models'}
+function detectedView(p,tab){const id=providerIdentity(p);if(!detectedViews.has(id))detectedViews.set(id,{});const views=detectedViews.get(id);return views[tab]||(views[tab]={query:'',selected:''})}
+function detectedOptions(p,tab,query=''){
+  const existing=new Set((p[providerModelListKey(tab)]||[]).map(m=>m.name)),q=query.trim().toLowerCase();
+  return [...new Set(p.detected_models||[])].filter(x=>!existing.has(x)&&(!q||String(x).toLowerCase().includes(q)));
+}
+function rememberDetectedSelection(i){const p=providers()[i],select=el('detected_select_'+i);if(p&&select)detectedView(p,state.providerSubTab?.[i]||'chat').selected=select.value}
+function renderDetectedModels(p,idx){
+  const tab=state.providerSubTab?.[idx]||'chat',detected=p.detected_models||[];
+  if(!detected.length)return '';
+  const view=detectedView(p,tab),options=detectedOptions(p,tab,view.query);
+  if(!options.includes(view.selected))view.selected=options[0]||'';
+  const btnText=tab==='embedding'?'添加为嵌入模型':tab==='planner'?'添加为回复判断模型':'添加为对话模型';
+  return `<div class="field" style="margin-top:12px;padding:12px"><div class="label"><span>检测结果</span><span class="pill" id="detected_count_${idx}">${options.length} 个可添加 / ${detected.length} 个已检测</span></div><input id="detected_search_${idx}" value="${esc(view.query)}" placeholder="搜索模型名称" oninput="filterDetectedModels(${idx},this.value)"><select id="detected_select_${idx}" size="${Math.min(10,Math.max(3,options.length))}" ${options.length?'':'disabled'} style="margin-top:10px" onchange="rememberDetectedSelection(${idx})">${options.map(x=>`<option value="${esc(x)}" ${x===view.selected?'selected':''}>${esc(x)}</option>`).join('')}</select><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="btn primary" id="detected_add_${idx}" onclick="addDetectedModel(${idx})" ${options.length?'':'disabled'}>${btnText}</button><button class="btn" onclick="clearDetectedModels(${idx})">清空检测结果</button></div><div class="desc">支持按名称搜索；只添加当前选中的模型。</div></div>`;
+}
+function filterDetectedModels(i,value){
+  const p=providers()[i],tab=state.providerSubTab?.[i]||'chat',select=el('detected_select_'+i);if(!p||!select)return;
+  const view=detectedView(p,tab);view.query=String(value||'');
+  const options=detectedOptions(p,tab,view.query),selected=select.value||view.selected;
+  view.selected=options.includes(selected)?selected:options[0]||'';
+  select.innerHTML=options.map(x=>`<option value="${esc(x)}" ${x===view.selected?'selected':''}>${esc(x)}</option>`).join('');
+  select.value=view.selected;select.size=Math.min(10,Math.max(3,options.length));select.disabled=!options.length;
+  const btn=el('detected_add_'+i);if(btn)btn.disabled=!options.length;
+  const count=el('detected_count_'+i);if(count)count.textContent=options.length+' 个可添加 / '+(p.detected_models||[]).length+' 个已检测';
+}
+function openModelInput(i,kind){
+  modelInputState={providerIndex:i,kind:kind==='embedding'?'embedding':kind==='planner'?'planner':'chat'};
+  const modal=el('modelInputModal'),title=el('modelInputTitle'),label=el('modelInputLabel'),input=el('modelInputValue');
+  if(!modal||!input)return;
+  if(title)title.textContent=modelInputState.kind==='embedding'?'添加嵌入模型':modelInputState.kind==='planner'?'添加回复判断模型':'添加对话模型';
+  if(label)label.textContent=modelInputState.kind==='embedding'?'嵌入模型名称':modelInputState.kind==='planner'?'回复判断模型名称':'对话模型名称';
+  input.value='';
+  modal.style.display='flex';
+  requestAnimationFrame(()=>input.focus())
+}
 function closeModelInput(){const modal=el('modelInputModal');if(modal)modal.style.display='none';modelInputState={providerIndex:-1,kind:'chat'}}
-function submitModelInput(){const input=el('modelInputValue'),name=String(input?.value||'').trim(),i=modelInputState.providerIndex;if(!name||i<0)return toast('请输入模型名称',false);const ps=[...providers()];ps[i]=Object.assign({},ps[i]||{});if(modelInputState.kind==='embedding'){const exists=new Set((ps[i].embedding_models||[]).map(x=>x.name));if(exists.has(name))return toast('该嵌入模型已存在',false);ps[i].embedding_models=[...(ps[i].embedding_models||[]),{name,enabled:true,dimensions:0}]}else{const exists=new Set((ps[i].models||[]).map(x=>x.name));if(exists.has(name))return toast('该对话模型已存在',false);ps[i].models=[...(ps[i].models||[]),{name,enabled:true,supports_multimodal:false,timeout_seconds:60,reasoning_effort:'',context_window:Number((ps[i].detected_windows||{})[name]||0)}]}setProviders(ps);closeModelInput();forceRender()}
-function renderRotationList(){const r=rotation(),enabled=enabledProviderModels();return `<div class="card"><div class="section-head"><div><h3>模型轮换列表</h3><p>按顺序轮换</p></div></div><div style="display:grid;gap:8px">${r.length?r.map((x,i)=>`<div class="rot-row field"><b>${esc(providerModelLabel(x.provider_id,x.model))}</b><div><button class="btn" ${i===0?'disabled':''} onclick="moveRotation(${i},-1)">上移</button> <button class="btn" ${i===r.length-1?'disabled':''} onclick="moveRotation(${i},1)">下移</button></div></div>`).join(''):'<div class="desc">勾选模型后会出现在这里。</div>'}</div><div class="desc">可用模型：${esc(enabled.map(x=>x.label).join('，')||'无')}</div></div>`}
+function submitModelInput(){
+  const input=el('modelInputValue'),name=String(input?.value||'').trim(),i=modelInputState.providerIndex;
+  if(!name||i<0)return toast('请输入模型名称',false);
+  const ps=[...providers()];
+  ps[i]=Object.assign({},ps[i]||{});
+
+  if(modelInputState.kind==='embedding'){
+    const exists=new Set((ps[i].embedding_models||[]).map(x=>x.name));
+    if(exists.has(name))return toast('该嵌入模型已存在',false);
+    ps[i].embedding_models=[...(ps[i].embedding_models||[]),{name,enabled:true,dimensions:0}];
+  } else if(modelInputState.kind==='planner'){
+    const exists=new Set((ps[i].planner_models||[]).map(x=>x.name));
+    if(exists.has(name))return toast('该回复判断模型已存在',false);
+    ps[i].planner_models=[...(ps[i].planner_models||[]),{name,enabled:true,timeout_seconds:60}];
+  } else {
+    const exists=new Set((ps[i].models||[]).map(x=>x.name));
+    if(exists.has(name))return toast('该对话模型已存在',false);
+    ps[i].models=[...(ps[i].models||[]),{name,enabled:true,supports_multimodal:false,timeout_seconds:60,reasoning_effort:'',context_window:Number((ps[i].detected_windows||{})[name]||0)}];
+  }
+
+  setProviders(ps);
+  closeModelInput();
+  forceRender();
+}
+function renderRotationList(){const r=rotation(),enabled=enabledProviderModels();return `<div class="card"><div class="section-head"><div><h3>对话模型轮换列表</h3><p>按顺序轮换</p></div></div><div style="display:grid;gap:8px">${r.length?r.map((x,i)=>`<div class="rot-row field"><b>${esc(providerModelLabel(x.provider_id,x.model))}</b><div><button class="btn" ${i===0?'disabled':''} onclick="moveRotation(${i},-1)">上移</button> <button class="btn" ${i===r.length-1?'disabled':''} onclick="moveRotation(${i},1)">下移</button></div></div>`).join(''):'<div class="desc">勾选模型后会出现在这里。</div>'}</div><div class="desc">可用模型：${esc(enabled.map(x=>x.label).join('，')||'无')}</div></div>`}
 function forceRender(){const d=state.dirty,t=state.lastInputAt;state.dirty=false;state.lastInputAt=0;render();state.dirty=d;state.lastInputAt=t}
 function addProvider(){const ps=[...providers(),{id:'provider'+(providers().length+1),base_url:'',keys:[],http_proxy:'',models:[],detected_models:[]}];state.providerIndex=ps.length-1;setProviders(ps);forceRender()}
 function removeProvider(i){if(!confirm('确定删除该提供商？'))return;const ps=[...providers()];ps.splice(i,1);state.providerIndex=0;setProviders(ps);forceRender()}
-function updateProvider(i,k,v){const ps=[...providers()];ps[i]=Object.assign({},ps[i]||{});ps[i][k]=v;setProviders(ps)}
-function syncProviderFieldsFromDom(){const ps=[...providers()];let changed=false;ps.forEach((p,i)=>{const id=el('provider_id_'+i),base=el('provider_base_'+i),keys=el('provider_keys_'+i),proxy=el('provider_proxy_'+i);if(id||base||keys||proxy){ps[i]=Object.assign({},p||{});if(id)ps[i].id=id.value.trim();if(base)ps[i].base_url=base.value.trim();if(proxy)ps[i].http_proxy=proxy.value.trim();if(keys)ps[i].keys=keys.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);changed=true}});if(changed)setProviders(ps)}
+function updateProvider(i,k,v){const ps=[...providers()];if(!ps[i])return;providerIdentity(ps[i]);ps[i]=Object.assign({},ps[i]);ps[i][k]=v;setProviders(ps);refreshProviderDetectionUi()}
+function syncProviderFieldsFromDom(){const ps=[...providers()];let changed=false;ps.forEach((p,i)=>{const id=el('provider_id_'+i),base=el('provider_base_'+i),keys=el('provider_keys_'+i),proxy=el('provider_proxy_'+i);if(id||base||keys||proxy){const next=Object.assign({},p);if(id)next.id=id.value.trim();if(base)next.base_url=base.value.trim();if(proxy)next.http_proxy=proxy.value.trim();if(keys)next.keys=keys.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);if(!sameDraftValues(p,next)){ps[i]=next;changed=true}}});if(changed)setProviders(ps)}
 function updateProviderModel(i,mi,k,v){const ps=[...providers()];ps[i]=Object.assign({},ps[i]||{});ps[i].models=[...(ps[i].models||[])];ps[i].models[mi]=Object.assign({},ps[i].models[mi]||{});ps[i].models[mi][k]=v;setProviders(ps)}
-function addDetectedModel(i){const sel=el('detected_select_'+i),name=(sel?.value||'').trim();if(!name)return;const ps=[...providers()];ps[i]=Object.assign({},ps[i]||{});const exists=new Set((ps[i].models||[]).map(x=>x.name));if(!exists.has(name)){const win=Number((ps[i].detected_windows||{})[name]||0);ps[i].models=[...(ps[i].models||[]),{name,enabled:true,supports_multimodal:false,timeout_seconds:60,reasoning_effort:'',context_window:win>0?win:0}]}setProviders(ps);forceRender()}
+function addDetectedModel(i){
+  const tab = state.providerSubTab?.[i] || 'chat';
+  const sel=el('detected_select_'+i),name=(sel?.value||'').trim();
+  if(!name)return;
+
+  const ps=[...providers()];
+  ps[i]=Object.assign({},ps[i]||{});
+
+  if (tab === 'embedding') {
+    // 添加为嵌入模型
+    const exists=new Set((ps[i].embedding_models||[]).map(x=>x.name));
+    if(!exists.has(name)){
+      ps[i].embedding_models=[...(ps[i].embedding_models||[]),{name,enabled:true,dimensions:0}];
+    }
+  } else if (tab === 'planner') {
+    // 添加为回复判断模型
+    const exists=new Set((ps[i].planner_models||[]).map(x=>x.name));
+    if(!exists.has(name)){
+      ps[i].planner_models=[...(ps[i].planner_models||[]),{name,enabled:true,timeout_seconds:60}];
+    }
+  } else {
+    // 添加为对话模型（默认）
+    const exists=new Set((ps[i].models||[]).map(x=>x.name));
+    if(!exists.has(name)){
+      const win=Number((ps[i].detected_windows||{})[name]||0);
+      ps[i].models=[...(ps[i].models||[]),{name,enabled:true,supports_multimodal:false,timeout_seconds:60,reasoning_effort:'',context_window:win>0?win:0}];
+    }
+  }
+
+  setProviders(ps);
+  forceRender();
+}
 function clearDetectedModels(i){const ps=[...providers()];ps[i]=Object.assign({},ps[i]||{});ps[i].detected_models=[];ps[i].detect_error='';setProviders(ps);forceRender()}
 function removeProviderModel(i,mi){const ps=[...providers()];ps[i]=Object.assign({},ps[i]||{});ps[i].models=[...(ps[i].models||[])];ps[i].models.splice(mi,1);setProviders(ps);forceRender()}
 function moveRotation(i,d){const r=[...rotation()],j=i+d;if(j<0||j>=r.length)return;[r[i],r[j]]=[r[j],r[i]];setRotation(r);forceRender()}
-async function detectProviderModels(i){syncProviderFieldsFromDom();syncCurrentPageFieldsFromDom();const ps=providers(),p=ps[i];const box=el('providerDetect_'+i);if(box)box.textContent='检测中...';try{const data=await api('/api/providers/detect-models',{method:'POST',body:JSON.stringify({provider_id:p.id,base_url:p.base_url,keys:p.keys,http_proxy:p.http_proxy||''})});const models=data.models||[];const wins=data.context_windows||{};p.detected_models=models;
-// detected_windows 只是"检测到的建议值"，不落配置（sync_provider_config 会丢掉它）；
-// 添加模型时读它填进 context_window，已添加的模型也顺手补上还空着的窗口。
-p.detected_windows=wins;
-if(Object.keys(wins).length){p.models=(p.models||[]).map(m=>(!m.context_window&&wins[m.name])?Object.assign({},m,{context_window:wins[m.name]}):m)}
-p.detect_error=data.error||'';ps[i]=p;setProviders(ps);forceRender();const winCount=Object.keys(wins).length;toast(data.error?('检测失败：'+data.error):('检测到 '+models.length+' 个模型'+(winCount?('，'+winCount+' 个带上下文窗口'):'')),!data.error)}catch(e){if(box)box.textContent=e.message;toast(e.message,false)}}
+function refreshProviderDetectionUi(){
+  const i=state.providerIndex||0,p=providers()[i];if(state.current!=='providers'||!p)return;
+  const busy=providerDetections.has(providerIdentity(p)),btn=el('providerDetectBtn_'+i),box=el('providerDetect_'+i);
+  if(btn){btn.disabled=busy;btn.textContent=busy?'检测中…':'检测模型'}
+  if(box)box.textContent=busy?'检测中…':p.detect_error||'';
+  const results=el('providerDetected_'+i);if(results){rememberDetectedSelection(i);results.innerHTML=renderDetectedModels(p,i)}
+}
+async function detectProviderModels(i){
+  syncProviderFieldsFromDom();const p=providers()[i];if(!p)return;
+  const id=providerIdentity(p);if(providerDetections.has(id))return;
+  const request={params:providerDetectParams(p)};providerDetections.set(id,request);refreshProviderDetectionUi();
+  const currentIndex=()=>providers().findIndex(x=>providerIdentity(x)===id&&providerDetectParams(x)===request.params);
+  try{
+    const data=await api('/api/providers/detect-models',{method:'POST',body:request.params});
+    const index=currentIndex();if(index<0||providerDetections.get(id)!==request)return;
+    // 只合并检测字段，不拿 await 前的模型/提供商数组覆盖编辑或保存后的状态。
+    const ps=[...providers()],latest=ps[index];
+    ps[index]=Object.assign({},latest,{detected_models:[...new Set(data.models||[])],detected_windows:data.context_windows||{},detect_error:data.error||''});
+    setProviders(ps);refreshProviderDetectionUi();
+    toast(data.error?'检测失败：'+data.error:'检测到 '+ps[index].detected_models.length+' 个模型',!data.error);
+  }catch(e){
+    const index=currentIndex();if(index>=0&&providerDetections.get(id)===request){const ps=[...providers()];ps[index]=Object.assign({},ps[index],{detect_error:e.message});setProviders(ps);toast(e.message,false)}
+  }finally{if(providerDetections.get(id)===request)providerDetections.delete(id);refreshProviderDetectionUi()}
+}
 let knowledgeDocs=[];
 let knowledgeUploadState={active:false,name:'',phase:''};
 async function loadKnowledge(){try{knowledgeDocs=await api('/api/knowledge/documents');forceRender()}catch(e){toast(e.message,false)}}
@@ -1452,7 +1669,66 @@ if(v['Others.active_personality_preset']===id)setValue('Others.active_personalit
 if(v['Others.private_personality_preset']===id)setValue('Others.private_personality_preset','');
 if(v['Others.group_personality_preset']===id)setValue('Others.group_personality_preset','');
 setPersonaPresets(next);forceRender()}
-function renderForm(m){const v=state.bundle.form_values||{};const fields=m.fields||[];const byCat={},order=[];fields.forEach(f=>{const cat=f.category||'基础';if(!byCat[cat]){byCat[cat]=[];order.push(cat)}byCat[cat].push(f)});if(order.length<=1){return `<div class="card" id="section_${esc(m.key||'config')}"><div class="section-head"><div><h3>${esc(m.title)}</h3><p>${esc(m.desc)}</p></div></div><div class="form-grid">${fields.map(f=>renderField(f,v[f.path])).join('')}</div></div>`}return order.map((cat,i)=>{const sid=i===0?(m.key||'config'):('cfg_'+cat).replace(/[^a-zA-Z0-9_-]/g,'_');return `<div class="card" id="section_${esc(sid)}"><div class="section-head"><div><h3>${esc(i===0?m.title:cat)}</h3><p>${esc(i===0?m.desc:cat+'相关设置')}</p></div></div><div class="form-grid">${byCat[cat].map(f=>renderField(f,v[f.path])).join('')}</div></div>`}).join('')}
+function renderAiSettings(m){
+  const values=state.bundle.form_values||{},fields=m.fields||[];
+  // 路径优先于旧 category；未来新增的分段字段也必须留在同一用途组。
+  const split=fields.filter(f=>f.path.startsWith('Others.llm_split.')||f.category==='分段回复');
+  const memory=fields.filter(f=>!split.includes(f)&&f.category==='上下文与记忆');
+  const conversation=fields.filter(f=>!split.includes(f)&&!memory.includes(f));
+  const enabled=split.find(f=>f.path==='Others.llm_split.enabled')||{path:'Others.llm_split.enabled',label:'启用 LLM 分段回复',type:'bool',desc:'仅对大模型生成结果生效。'};
+  const options=split.filter(f=>f!==enabled);
+  const quote=!!state.bundle.feature_switches?.split_reply_quote;
+  return `<div class="card ai-settings-card" id="section_ai"><div class="section-head"><div><h3>对话设置</h3><p>配置回复过滤与分段回复。</p></div></div><div class="form-grid compact-form ai-conversation-fields">${conversation.map(f=>renderField(f,values[f.path],true)).join('')}<div class="field ai-split-toggles" id="section_ai_split">${renderField(enabled,values[enabled.path],true,true)}<div class="setting-row"><div class="label"><span>分段首段引用</span><div class="switch ${quote?'on':''}" onclick="toggleFeature('split_reply_quote',this)"></div></div><div class="desc">分段发送时仅首段引用原消息；与 LLM 分段开关独立。</div></div></div>${options.map(f=>renderField(f,values[f.path],true)).join('')}</div></div><div class="card ai-settings-card" id="section_ai_memory"><div class="section-head"><div><h3>上下文与记忆</h3><p>按完整对话轮次管理上下文；压缩复用对话模型及其轮换，不需要独立模型。</p></div></div><div class="form-grid compact-form ai-conversation-fields">${memory.map(f=>renderField(f,values[f.path],true)).join('')}</div></div>`;
+}
+function renderForm(m){if(m.key==='ai')return renderAiSettings(m);if(m.key==='proactive'||m.key==='webui')return renderOrganizedSettings(m);const v=state.bundle.form_values||{};const fields=m.fields||[];const byCat={},order=[];fields.forEach(f=>{const cat=f.category||'基础';if(!byCat[cat]){byCat[cat]=[];order.push(cat)}byCat[cat].push(f)});if(order.length<=1){return `<div class="card" id="section_${esc(m.key||'config')}"><div class="section-head"><div><h3>${esc(m.title)}</h3><p>${esc(m.desc)}</p></div></div><div class="form-grid">${fields.map(f=>renderField(f,v[f.path])).join('')}</div></div>`}return order.map((cat,i)=>{const sid=i===0?(m.key||'config'):('cfg_'+cat).replace(/[^a-zA-Z0-9_-]/g,'_');return `<div class="card" id="section_${esc(sid)}"><div class="section-head"><div><h3>${esc(i===0?m.title:cat)}</h3><p>${esc(i===0?m.desc:cat+'相关设置')}</p></div></div><div class="form-grid">${byCat[cat].map(f=>renderField(f,v[f.path])).join('')}</div></div>`}).join('')}
+function settingsTabs(key){
+  if(key==='proactive')return [{key:'group',title:'群聊主动回复',desc:'群内接话、冷场搭话与后续观察'}, {key:'private',title:'私聊主动回复',desc:'主动关怀、未回复限制与后续观察'}];
+  return [{key:'appearance',title:'界面外观',desc:'主题、背景与液态玻璃'}, {key:'service',title:'访问与服务',desc:'监听地址、端口与访问认证'}, {key:'network',title:'更新与网络',desc:'更新仓库、镜像与通用网络代理'}];
+}
+function settingsTabFields(key,tab){
+  const fields=(pages().find(p=>p.key===key)?.fields||[]);
+  if(key==='proactive')return fields.filter(f=>f.path.startsWith(`ProactiveReply.${tab}.`));
+  return fields.filter(f=>{
+    const category=f.category||'';
+    if(tab==='appearance')return category==='界面外观'||category==='液态玻璃UI'||/WebUI\.(theme_preset|background_|liquid_glass|disable_background_blur|card_background_blur)/.test(f.path);
+    if(tab==='service')return ['WebUI.host','WebUI.port','WebUI.access_token'].includes(f.path);
+    return f.path.startsWith('Others.');
+  });
+}
+function activeSettingsTab(key){
+  const tabs=settingsTabs(key),tab=state.settingsTabs?.[key];
+  return tabs.some(t=>t.key===tab)?tab:tabs[0].key;
+}
+function renderSettingsTab(key,tab){
+  const fields=settingsTabFields(key,tab),values=state.bundle.form_values||{};
+  if(key==='proactive'){
+    const prefix=`ProactiveReply.${tab}.`,enabled=!!values[prefix+'enabled'];
+    const groups=[
+      {title:'启用与频率',desc:'先开启此场景，再调整冷场主动说话的时机。',fields:fields.filter(f=>!f.path.includes('.observation.')&&!/\.(whitelist|blacklist)$/.test(f.path))},
+      {title:'允许与禁止对象',desc:'名单均空仅表示不限对象；黑名单优先，全局禁止规则仍然生效。',fields:fields.filter(f=>/\.(whitelist|blacklist)$/.test(f.path))},
+      {title:'发言后继续观察',desc:'AI 自己决定每次等多久；正常提问照常回应，不受这里的等待计时影响。',fields:fields.filter(f=>f.path.includes('.observation.'))},
+    ];
+    return `<div class="settings-status"><span class="pill ${enabled?'ok':''}">${tab==='group'?'群聊':'私聊'}主动回复 · ${enabled?'已开启':'未开启'}</span><span class="desc">判断模型决定是否发言，对话模型生成正文。<button class="inline-link" onclick="gotoPage('providers')">配置模型</button></span></div>`+groups.map(g=>`<section class="settings-block"><div class="section-head"><div><h3>${g.title}</h3><p>${g.desc}</p></div></div><div class="form-grid">${g.fields.map(f=>renderField(f,values[f.path])).join('')}</div></section>`).join('');
+  }
+  if(key==='webui'&&tab==='appearance'){
+    const glassFields=fields.filter(f=>['WebUI.liquid_glass','WebUI.disable_background_blur','WebUI.liquid_glass_refraction','WebUI.card_background_blur'].includes(f.path));
+    const wallpaperFields=fields.filter(f=>!glassFields.includes(f));
+    return `<section class="settings-block"><div class="section-head"><div><h3>主题与背景</h3><p>管理主题色、背景图片和普通背景模糊。</p></div></div><div class="form-grid compact-form">${wallpaperFields.map(f=>renderField(f,values[f.path])).join('')}</div></section><section class="settings-block glass-settings-family" id="section_glass_settings"><div class="section-head"><div><h3>液态玻璃</h3><p>下方三个选项都依赖液态玻璃开关；关闭液态玻璃后不生效，已保存的值不会丢失。</p></div></div><div class="glass-settings-controls">${glassFields.map(f=>renderField(f,values[f.path],false,true)).join('')}</div></section>`;
+  }
+  return `<div class="form-grid compact-form">${fields.map(f=>renderField(f,values[f.path])).join('')}</div>`;
+}
+function renderOrganizedSettings(m){
+  const key=m.key,tabs=settingsTabs(key),tab=activeSettingsTab(key);
+  return `<div class="card organized-settings" id="section_${key}"><div class="section-head"><div><h3>${esc(m.title)}</h3><p>${esc(m.desc||'')}</p></div></div><div class="subtab-nav settings-tabs" id="settingsTabs_${key}" role="tablist" aria-label="${esc(m.title)}">${tabs.map(t=>`<button class="btn ${tab===t.key?'primary':''}" role="tab" aria-selected="${tab===t.key}" data-page="${key}" data-tab="${t.key}" onclick="switchSettingsTab(this.dataset.page,this.dataset.tab)">${t.title}</button>`).join('')}</div><div class="subtab-panel" id="settingsPanel_${key}">${renderSettingsTab(key,tab)}</div></div>`;
+}
+function switchSettingsTab(key,tab){
+  if(!['proactive','webui'].includes(key)||!settingsTabs(key).some(t=>t.key===tab)||activeSettingsTab(key)===tab)return;
+  syncCurrentPageFieldsFromDom();(state.settingsTabs||(state.settingsTabs={}))[key]=tab;
+  const panel=el('settingsPanel_'+key);if(!panel)return;
+  panel.innerHTML=renderSettingsTab(key,tab);
+  el('settingsTabs_'+key)?.querySelectorAll('[data-tab]').forEach(b=>{b.classList.toggle('primary',b.dataset.tab===tab);b.setAttribute('aria-selected',String(b.dataset.tab===tab))});
+  animateSubtab(panel);liquidGlassLensController.refresh();
+}
 function scrollToRouteSection(section){const safe=String(section||'').replace(/[^a-zA-Z0-9_-]/g,'_');const target=document.getElementById('section_'+safe)||document.querySelector(`[data-section="${CSS.escape(String(section||''))}"]`);if(target)target.scrollIntoView({block:'start',behavior:'smooth'})}
 function enabledEmbeddingProviders(){return providers().filter(p=>p.id&&Array.isArray(p.embedding_models)&&p.embedding_models.some(m=>m.enabled!==false&&m.name))}
 function renderEmbeddingProviderSelect(path,value,id){const items=enabledEmbeddingProviders();return `<select id="${id}" onchange="setValue('${path}',this.value);forceRender()"><option value="">请选择</option>${items.map(p=>`<option value="${esc(p.id)}" ${String(p.id)===String(value)?'selected':''}>${esc(p.id)}</option>`).join('')}</select>`}
@@ -1472,7 +1748,7 @@ function setRangeValue(path,input){
   if(out)out.textContent=String(value);
   setValue(path,value);
 }
-function renderField(f,v,compact=false){const id='f_'+f.path.replace(/[^a-zA-Z0-9]/g,'_');let input='';if(f.type==='bool')input=`<div class="switch ${v?'on':''}" onclick="setBool('${f.path}',this)"></div>`;else if(f.type==='select')input=`<select id="${id}" onchange="setValue('${f.path}',this.value)">${(f.options||[]).map(o=>`<option value="${esc(o)}" ${String(o)===String(v)?'selected':''}>${esc(o)}</option>`).join('')}</select>`;else if(f.type==='multimodal_model')input=renderMultimodalModelSelect(f.path,v,id);else if(f.type==='embedding_model_ref')input=renderEmbeddingModelRefSelect(f.path,v,id);else if(f.type==='background_image')input=renderBackgroundImageField(f.path,v,id);else if(f.type==='list')input=`<textarea ${compact?'style="min-height:84px"':''} id="${id}" oninput="setValue('${f.path}',this.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean))">${esc(Array.isArray(v)?v.join('\n'):(v??''))}</textarea>`;else if(f.type==='textarea')input=`<textarea ${compact?'style="min-height:84px"':'style="min-height:280px"'} id="${id}" oninput="setValue('${f.path}',this.value)">${esc(v??'')}</textarea>`;else if(f.type==='endpoints')input=renderEndpointsEditor(v||[]);else if(f.type==='range')input=renderRangeField(f,v,id);else{input=`<input id="${id}" type="${f.type==='password'?'password':f.type==='number'?'number':'text'}" step="any" ${f.min!=null?`min="${f.min}"`:''} ${f.max!=null?`max="${f.max}"`:''} value="${esc(v??'')}" oninput="setValue('${f.path}',${f.type==='number'?'num(this.value)':'this.value'})">`;if(f.type==='password')input=`<div class="pwd-wrap">${input}<button class="pwd-eye" type="button" title="显示" aria-label="显示或隐藏内容" onclick="togglePwdField('${id}',this)">${SVG_EYE}</button></div>`}return `<div class="field"><div class="label"><span>${esc(f.label)}</span>${f.type==='bool'?input:''}</div>${f.type==='bool'?'':input}<div class="desc">${esc(f.desc||f.path)}</div></div>`}
+function renderField(f,v,compact=false,flat=false){const id='f_'+f.path.replace(/[^a-zA-Z0-9]/g,'_');let input='';if(f.type==='bool')input=`<div class="switch ${v?'on':''}" onclick="setBool('${f.path}',this)"></div>`;else if(f.type==='select')input=`<select id="${id}" onchange="setValue('${f.path}',this.value)">${(f.options||[]).map(o=>`<option value="${esc(o)}" ${String(o)===String(v)?'selected':''}>${esc(o)}</option>`).join('')}</select>`;else if(f.type==='multimodal_model')input=renderMultimodalModelSelect(f.path,v,id);else if(f.type==='embedding_model_ref')input=renderEmbeddingModelRefSelect(f.path,v,id);else if(f.type==='background_image')input=renderBackgroundImageField(f.path,v,id);else if(f.type==='list')input=`<textarea ${compact?'style="min-height:84px"':''} id="${id}" oninput="setValue('${f.path}',this.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean))">${esc(Array.isArray(v)?v.join('\n'):(v??''))}</textarea>`;else if(f.type==='textarea')input=`<textarea ${compact?'style="min-height:84px"':'style="min-height:280px"'} id="${id}" oninput="setValue('${f.path}',this.value)">${esc(v??'')}</textarea>`;else if(f.type==='endpoints')input=renderEndpointsEditor(v||[]);else if(f.type==='range')input=renderRangeField(f,v,id);else{input=`<input id="${id}" type="${f.type==='password'?'password':f.type==='number'?'number':'text'}" step="any" ${f.min!=null?`min="${f.min}"`:''} ${f.max!=null?`max="${f.max}"`:''} value="${esc(v??'')}" oninput="setValue('${f.path}',${f.type==='number'?'num(this.value)':'this.value'})">`;if(f.type==='password')input=`<div class="pwd-wrap">${input}<button class="pwd-eye" type="button" title="显示" aria-label="显示或隐藏内容" onclick="togglePwdField('${id}',this)">${SVG_EYE}</button></div>`}return `<div class="${flat?'setting-row':'field'}"><div class="label"><span>${esc(f.label)}</span>${f.type==='bool'?input:''}</div>${f.type==='bool'?'':input}<div class="desc">${esc(f.desc||f.path)}</div></div>`}
 // 密码类字段的显示/隐藏。图标用 SVG 而不是 emoji，并在 CSS 里关掉 Edge 自带的
 // ::-ms-reveal，否则输入框右侧会同时出现浏览器的眼睛和我们的眼睛。
 const SVG_EYE='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>';
@@ -1491,15 +1767,28 @@ function setBool(path,el){const v=!el.classList.contains('on');el.classList.togg
 function shouldAutoRefreshPage(){return state.current==='welcome'||state.current==='logs'||state.current==='stats'||state.current==='debug'||(state.current==='trace'&&!traceState.openId)}
 function renderFeatures(){
   const map=state.bundle.feature_switches||{},groups={};
+  // 仅过滤展示，保留插件运行时使用的旧开关及其配置。
+  const hidden=new Set(['check_account','weather','image_generation','ai_chat','compression_commands','quote','plugin_admin_commands','split_reply_quote']);
+  const visibleMeta=(state.bundle.feature_meta||[]).filter(x=>!hidden.has(x.key));
   const fields=(state.bundle.ui_schema.find(x=>x.key==='features')||{}).fields||[];
   const fieldMap=Object.fromEntries(fields.map(f=>[f.path,f]));
-  (state.bundle.feature_meta||[]).forEach(x=>(groups[x.group]||(groups[x.group]=[])).push(x));
+  const featureGroups=[
+    {title:'对话与触发',keys:['group_chat','private_chat','group_chat_context','sensitive_filter','weak_blacklist']},
+    {title:'群聊互动',keys:['poke_reply','group_join_welcome','emoji_plus_one','summary']},
+    {title:'插件与接口',keys:['plugins_external','http_send_api']},
+  ];
+  const assigned=new Set();featureGroups.forEach(g=>{const items=g.keys.map(key=>visibleMeta.find(x=>x.key===key)).filter(Boolean);if(items.length){groups[g.title]=items;items.forEach(x=>assigned.add(x.key))}});
+  visibleMeta.filter(x=>!assigned.has(x.key)).forEach(x=>(groups[x.group]||(groups[x.group]=[])).push(x));
+  const groupDescriptions={'对话与触发':'群聊 / 私聊响应是对应 QQ 场景的总闸门，关闭后需通过 WebUI 恢复。','群聊互动':'设置拍一拍、入群欢迎、表情复读与群聊记录总结，同样受群聊响应总闸门控制。','插件与接口':'管理外部插件加载及独立 HTTP 消息接口。'};
+  const gateDescriptions={group_chat:'群聊所有 QQ 响应总闸门。关闭后，命令、插件、模型、群聊事件及主动回复全部停止；请通过 WebUI 重新开启。',private_chat:'私聊所有 QQ 响应总闸门。关闭后，命令、插件、模型、私聊事件及主动回复全部停止；请通过 WebUI 重新开启。'};
+  const related=it=>(featureFieldMap[it.key]||[]).map(p=>fieldMap[p]).filter(Boolean);
+  const option=it=>{
+    const rel=related(it);
+    return `<div class="feature feature-option${rel.length?' feature-option-config':''}${rel.length>1?' feature-option-wide':''}" data-feature="${esc(it.key)}"><div class="feature-option-head"><h4>${esc(it.title)}</h4><div class="switch ${map[it.key]?'on':''}" onclick="toggleFeature('${it.key}',this)"></div></div><p>${esc(gateDescriptions[it.key]||it.desc)}</p>${rel.length?`<div class="feature-option-fields">${rel.map(f=>renderField(f,state.bundle.form_values[f.path],true,true)).join('')}</div>`:''}</div>`;
+  };
   const switchCards=Object.keys(groups).map(g=>{
     const sid=g.replace(/[^a-zA-Z0-9_-]/g,'_');
-    return `<div class="card" id="section_${sid}" data-section="${esc(g)}"><div class="section-head"><div><h3>${esc(g)}</h3><p>功能开关</p></div><span class="pill">${groups[g].length} 项</span></div><div class="feature-grid">${groups[g].map(it=>{
-      const rel=(featureFieldMap[it.key]||[]).map(p=>fieldMap[p]).filter(Boolean);
-      return `<div class="feature"><h4>${esc(it.title)}</h4><p>${esc(it.desc)}</p><div class="feature-foot"><span class="pill">${esc(it.key)}</span><div class="switch ${map[it.key]?'on':''}" onclick="toggleFeature('${it.key}',this)"></div></div>${rel.length?`<div style="margin-top:12px;display:grid;gap:10px">${rel.map(f=>renderField(f,state.bundle.form_values[f.path],true)).join('')}</div>`:''}</div>`;
-    }).join('')}</div></div>`;
+    return `<div class="card" id="section_${sid}" data-section="${esc(g)}"><div class="section-head"><div><h3>${esc(g)}</h3><p>${esc(groupDescriptions[g]||groups[g].map(it=>it.desc).join('；'))}</p></div><span class="pill">${groups[g].length} 项</span></div><div class="feature-options-grid">${groups[g].map(option).join('')}</div></div>`;
   }).join('');
   // 功能配置页原先只画 feature 开关，fields 里独立配置（如系统设置）不会显示。
   // 把没挂到某个开关下的 fields 按 category 单独成卡片，挂在底部。
@@ -1604,16 +1893,55 @@ function renderEndpointsEditor(list){const rows=(Array.isArray(list)?list:[]).ma
 function updateEndpoint(index,key,value){const arr=Array.isArray(state.bundle.form_values['Others.llm_endpoints'])?[...state.bundle.form_values['Others.llm_endpoints']]:[];arr[index]=Object.assign({base_url:'',model:'',keys:[],supports_multimodal:false},arr[index]||{});arr[index][key]=value;setValue('Others.llm_endpoints',arr)}
 function addEndpoint(){const arr=Array.isArray(state.bundle.form_values['Others.llm_endpoints'])?[...state.bundle.form_values['Others.llm_endpoints']]:[];arr.push({base_url:'',model:'',keys:[],supports_multimodal:false});setValue('Others.llm_endpoints',arr);forceRender()}
 function removeEndpoint(index){const arr=Array.isArray(state.bundle.form_values['Others.llm_endpoints'])?[...state.bundle.form_values['Others.llm_endpoints']]:[];arr.splice(index,1);setValue('Others.llm_endpoints',arr);forceRender()}
-async function saveAll(silent=false){if(!state.bundle||state.saving)return;state.saving=true;const save=el('saveState');if(save)save.textContent='正在保存...';try{syncCurrentPageFieldsFromDom();saveDraft();await flushPendingBackground();const manageUsers=state.bundle.form_values?.manage_users??state.bundle.manage_users;const blackList=state.bundle.form_values?.black_list??state.bundle.blacklist_file;const saved=await api('/api/ui-state',{method:'POST',body:JSON.stringify({form_values:state.bundle.form_values||{},feature_switches:state.bundle.feature_switches||{},agent_tools:state.bundle.agent_tools||{},super_users:manageUsers,manage_users:manageUsers,blacklist_file:blackList})});clearDraft();state.bundle=saved;await traceSavePending();state.dirty=false;state.lastInputAt=0;render();await refreshAll(true);if(!silent)toast('设置已保存并已从 config 重新同步',true)}catch(e){toast(e.message,false)}finally{state.saving=false}}
+async function saveAll(silent=false){
+  if(!state.bundle||state.saving)return;
+  state.saving=true;
+  const save=el('saveState');if(save)save.textContent='正在保存...';
+  try{
+    syncCurrentPageFieldsFromDom();saveDraft();await flushPendingBackground();
+    const manageUsers=state.bundle.form_values?.manage_users??state.bundle.manage_users;
+    const blackList=state.bundle.form_values?.black_list??state.bundle.blacklist_file;
+    const submitted=JSON.parse(JSON.stringify({form_values:state.bundle.form_values||{},feature_switches:state.bundle.feature_switches||{},agent_tools:state.bundle.agent_tools||{}}));
+    const saved=await api('/api/ui-state',{method:'POST',body:JSON.stringify({...submitted,super_users:manageUsers,manage_users:manageUsers,blacklist_file:blackList})});
+    const latest=state.bundle.form_values||{};
+    const pending=Object.keys(latest).filter(k=>!sameDraftValues(latest[k],submitted.form_values[k]));
+    let hasPending=pending.length>0;
+    adoptProviderIdentities(providers(),saved.form_values?.['Others.llm_providers']||[]);
+    saved.form_values=saved.form_values||{};
+    for(const k of pending)saved.form_values[k]=latest[k];
+    // 三类设置都可能在请求期间继续编辑，不能只保护普通表单字段。
+    for(const section of ['feature_switches','agent_tools']){
+      const current=state.bundle[section]||{},before=submitted[section],target=saved[section]||(saved[section]={});
+      for(const key of new Set([...Object.keys(current),...Object.keys(before)])){
+        if(sameDraftValues(current[key],before[key]))continue;
+        hasPending=true;
+        if(Object.prototype.hasOwnProperty.call(current,key))target[key]=current[key];else delete target[key];
+      }
+    }
+    clearDraft();state.bundle=saved;seedPluginConfigValues();await traceSavePending();
+    state.dirty=hasPending;state.lastInputAt=state.dirty?Date.now():0;if(state.dirty)saveDraft();forceRender();
+    if(!silent)toast(state.dirty?'已保存，仍有未保存修改':'已同步',true);
+  }catch(e){toast(e.message,false)}finally{state.saving=false}
+}
 function isEditingField(){const el=document.activeElement;return !!(el&&['INPUT','TEXTAREA','SELECT'].includes(el.tagName))}
 function shouldPauseAutoRefresh(){if(shouldAutoRefreshPage())return !!isEditingField();return !!(state.dirty||isEditingField()||(Date.now()-(state.lastInputAt||0)<15000))}
-async function refreshAll(force=false){if(!force&&!shouldAutoRefreshPage())return;if(shouldPauseAutoRefresh()&&!force)return;try{const uiPath=state.current==='logs'?'/api/ui-state?log_limit=1000':'/api/ui-state';const data=await api(uiPath);state.apiFailCount=0;if(shouldPauseAutoRefresh()&&!force)return;applyDraft(data);state.bundle=data;const installState=data?.status?.update_install?.state||'';if(['restarting','idle'].includes(installState)&&state.expectedReloadAfterUpdate){scheduleReloadAfterUpdate()}if(state.current==='chatroom'&&!force){applyWebuiAppearance();renderConnectionStatus()}else render();const save=el('saveState');if(save&&!state.dirty)save.textContent='已同步 '+new Date().toLocaleTimeString()}catch(e){state.apiFailCount=(state.apiFailCount||0)+1;if(state.expectedReloadAfterUpdate&&state.apiFailCount>=2)scheduleReloadAfterUpdate();if(!state.expectedReloadAfterUpdate)toast(e.message,false)}}
+async function refreshAll(force=false){if(!force&&!shouldAutoRefreshPage())return;if(shouldPauseAutoRefresh()&&!force)return;try{const uiPath=state.current==='logs'?'/api/ui-state?log_limit=1000':'/api/ui-state';const data=await api(uiPath);state.apiFailCount=0;if(shouldPauseAutoRefresh()&&!force)return;applyDraft(data);adoptProviderIdentities(providers(),data.form_values?.['Others.llm_providers']||[]);state.bundle=data;seedPluginConfigValues();const installState=data?.status?.update_install?.state||'';if(['restarting','idle'].includes(installState)&&state.expectedReloadAfterUpdate){scheduleReloadAfterUpdate()}if(state.current==='chatroom'&&!force){applyWebuiAppearance();renderConnectionStatus()}else render();const save=el('saveState');if(save&&!state.dirty)save.textContent='已同步'}catch(e){state.apiFailCount=(state.apiFailCount||0)+1;if(state.expectedReloadAfterUpdate&&state.apiFailCount>=2)scheduleReloadAfterUpdate();if(!state.expectedReloadAfterUpdate)toast(e.message,false)}}
 let chatState={sessions:[],current:null,session:null,models:[],personas:[],loading:false,stream:localStorage.webuiChatStream!=='0',requests:Object.create(null),errors:Object.create(null),attachments:Object.create(null),drafts:Object.create(null),reasonOpen:Object.create(null)};
-// 思维链折叠状态的 key 用「会话id:消息稳定标识」。不能用数组下标：
-// 服务端从消息数组头部裁剪旧消息、progress 消息也会插进来，下标会整体平移，
-// 旧 key 就错位到别的消息上了。这里优先用 ts+request_id 组合，实在没有才退回下标。
+// 新消息优先用落盘 ID；旧消息按内容指纹及同指纹序号区分，不能用全局数组下标。
+// 完全相同的旧消息从尾部计数，头部历史被裁剪时，保留下来的气泡 key 不漂移。
 function reasonKey(sid,idx){return String(sid||'')+':'+idx}
-function msgReasonId(m,i){return (m&&(m.ts||m.request_id))?('m'+(m.ts||0)+'_'+String(m.request_id||'')):('i'+i)}
+function msgReasonId(m,occurrence=0){
+  if(m?.id)return 'id_'+encodeURIComponent(String(m.id)).replace(/'/g,'%27');
+  const value=JSON.stringify([m?.role||'',m?.ts||0,m?.request_id||'',m?.content||'',m?.reasoning||'',!!m?.error,m?.attachments||[]]);
+  let a=2166136261,b=5381;
+  for(let i=0;i<value.length;i++){const code=value.charCodeAt(i);a=Math.imul(a^code,16777619);b=Math.imul(b,33)^code}
+  return 'legacy_'+(a>>>0).toString(36)+'_'+(b>>>0).toString(36)+'_'+occurrence;
+}
+function chatMessageReasonIds(messages){
+  const seen=new Map(),ids=new Array(messages.length);
+  for(let i=messages.length-1;i>=0;i--){const m=messages[i],base=msgReasonId(m);if(m?.id){ids[i]=base;continue}const count=seen.get(base)||0;ids[i]=msgReasonId(m,count);seen.set(base,count+1)}
+  return ids;
+}
 function reasonIsOpen(sid,idx){return !!chatState.reasonOpen[reasonKey(sid,idx)]}
 function chatToggleReason(sid,idx){const k=reasonKey(sid,idx);chatState.reasonOpen[k]=!chatState.reasonOpen[k];chatRender(false)}
 function renderReasonBlock(sid,idx,text,streaming){const t=String(text||'');if(!t.trim())return '';const open=reasonIsOpen(sid,idx);const label=streaming?'思考中':'思考过程';const chars=t.length>=1000?(Math.round(t.length/100)/10+'k 字'):(t.length+' 字');return `<div class="reason-block ${open?'open':''}"><button class="reason-head" onclick="chatToggleReason('${esc(String(sid))}','${esc(String(idx))}')"><span class="reason-caret">${open?'▾':'▸'}</span><span>💭 ${esc(label)}</span><span class="reason-meta">${esc(chars)}</span></button>${open?`<div class="reason-body">${esc(t.trim())}</div>`:''}</div>`}
@@ -1631,7 +1959,7 @@ function mdCells(line){let x=line.trim();if(x.startsWith('|'))x=x.slice(1);if(x.
 function isMdTableSep(line){return /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line||'')}
 function chatMarkdown(s){s=String(s||'').replace(/\r\n/g,'\n');const lines=s.split('\n'),out=[];let i=0;function para(buf){if(buf.length)out.push('<p>'+mdInline(buf.join(' ').trim())+'</p>')}while(i<lines.length){let line=lines[i];if(!line.trim()){i++;continue}if(/^```/.test(line.trim())){const lang=line.trim().replace(/^```/,'').trim()||'code',buf=[];i++;while(i<lines.length&&!/^```/.test(lines[i].trim()))buf.push(lines[i++]);if(i<lines.length)i++;out.push(`<div class="md-code"><div class="md-code-head"><span>${esc(lang)}</span><button class="md-copy" onclick="copyMdCode(this)">复制</button></div><pre><code>${esc(buf.join('\n'))}</code></pre></div>`);continue}if(line.includes('|')&&lines[i+1]&&isMdTableSep(lines[i+1])){const heads=mdCells(line),rows=[];i+=2;while(i<lines.length&&lines[i].includes('|')&&lines[i].trim()){rows.push(mdCells(lines[i++]));}out.push(`<div class="md-table-wrap"><table><thead><tr>${heads.map(h=>`<th>${mdInline(h)}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${heads.map((_,idx)=>`<td>${mdInline(r[idx]||'')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);continue}if(/^---+$/.test(line.trim())){out.push('<hr>');i++;continue}const hm=line.match(/^\s{0,3}(#{1,6})\s+(.+)$/);if(hm){const lv=Math.min(3,hm[1].length);out.push(`<h${lv}>${mdInline(hm[2])}</h${lv}>`);i++;continue}if(/^>\s?/.test(line)){const buf=[];while(i<lines.length&&/^>\s?/.test(lines[i]))buf.push(lines[i++].replace(/^>\s?/,''));out.push('<blockquote>'+mdInline(buf.join('\n')).replace(/\n/g,'<br>')+'</blockquote>');continue}if(/^\s*[-*+]\s+/.test(line)){const items=[];while(i<lines.length&&/^\s*[-*+]\s+/.test(lines[i]))items.push('<li>'+mdInline(lines[i++].replace(/^\s*[-*+]\s+/,''))+'</li>');out.push('<ul>'+items.join('')+'</ul>');continue}if(/^\s*\d+[.)]\s+/.test(line)){const items=[];while(i<lines.length&&/^\s*\d+[.)]\s+/.test(lines[i]))items.push('<li>'+mdInline(lines[i++].replace(/^\s*\d+[.)]\s+/,''))+'</li>');out.push('<ol>'+items.join('')+'</ol>');continue}const buf=[];while(i<lines.length&&lines[i].trim()&&!/^(\s{0,3}#{1,6})\s+/.test(lines[i])&&!/^```/.test(lines[i].trim())&&!/^---+$/.test(lines[i].trim())&&!/^>\s?/.test(lines[i])&&!/^\s*[-*+]\s+/.test(lines[i])&&!/^\s*\d+[.)]\s+/.test(lines[i])&&!(lines[i].includes('|')&&lines[i+1]&&isMdTableSep(lines[i+1])))buf.push(lines[i++]);para(buf)}return '<div class="md">'+out.join('')+'</div>'}
 function chatPlainText(s){return esc(String(s||'')).replace(/\r\n|\r|\n/g,'<br>')}
-function renderChatMsgs(){const s=chatState.session;if(!s)return '<div class="chat-empty">选择左侧会话，或新建一个开始对话吧</div>';const req=chatRequest(s.id),msgs=(s.messages||[]).filter(m=>m.role==='user'||m.role==='assistant');if(!msgs.length&&!req)return '<div class="chat-empty">发送第一条消息开始对话吧</div>';const one=(m,i)=>m.error?`<div class="msg assistant"><div class="av">⚠️</div><div class="msg-body"><div class="msg-name">生成失败</div><div class="bubble" style="border-color:var(--red,#f87171);color:var(--red,#f87171);white-space:pre-wrap">${esc(m.content||'生成失败')}</div></div></div>`:`<div class="msg ${m.role}"><div class="av">${m.role==='user'?'🧑':'Xc'}</div><div class="msg-body">${m.role==='assistant'?'<div class="msg-name">XcBot</div>':''}${m.role==='assistant'?renderReasonBlock(s.id,msgReasonId(m,i),m.reasoning,false):''}<div class="bubble">${m.role==='user'?chatPlainText(m.content):chatMarkdown(m.content||'')}</div></div></div>`;const waiting=req?'思考中…':'';const live=req?`<div class="msg assistant"><div class="av">Xc</div><div class="msg-body"><div class="msg-name">XcBot</div><div id="chatPartialReason">${renderReasonBlock(s.id,'live',req.reasoning,true)}</div><div class="bubble" id="chatPartial">${chatMarkdown(req.partial||waiting)}</div></div></div>`:'';return msgs.map(one).join('')+live}
+function renderChatMsgs(){const s=chatState.session;if(!s)return '<div class="chat-empty">选择左侧会话，或新建一个开始对话吧</div>';const req=chatRequest(s.id),msgs=(s.messages||[]).filter(m=>m.role==='user'||m.role==='assistant');if(!msgs.length&&!req)return '<div class="chat-empty">发送第一条消息开始对话吧</div>';const reasonIds=chatMessageReasonIds(msgs),one=(m,i)=>m.error?`<div class="msg assistant"><div class="av">⚠️</div><div class="msg-body"><div class="msg-name">生成失败</div><div class="bubble" style="border-color:var(--red,#f87171);color:var(--red,#f87171);white-space:pre-wrap">${esc(m.content||'生成失败')}</div></div></div>`:`<div class="msg ${m.role}"><div class="av">${m.role==='user'?'🧑':'Xc'}</div><div class="msg-body">${m.role==='assistant'?'<div class="msg-name">XcBot</div>':''}${m.role==='assistant'?renderReasonBlock(s.id,reasonIds[i],m.reasoning,false):''}<div class="bubble">${m.role==='user'?chatPlainText(m.content):chatMarkdown(m.content||'')}</div></div></div>`;const waiting=req?'思考中…':'';const live=req?`<div class="msg assistant"><div class="av">Xc</div><div class="msg-body"><div class="msg-name">XcBot</div><div id="chatPartialReason">${renderReasonBlock(s.id,'live',req.reasoning,true)}</div><div class="bubble" id="chatPartial">${chatMarkdown(req.partial||waiting)}</div></div></div>`:'';return msgs.map(one).join('')+live}
 function renderChatFiles(){const fs=chatAttachments();if(!fs.length)return '<div class="chat-files" id="chatFiles" style="display:none"></div>';return `<div class="chat-files" id="chatFiles">${fs.map((f,i)=>`<span class="chat-file" title="${esc(f.name)}">${f.type&&f.type.startsWith('image/')?'🖼':'📎'} ${esc(f.name)}<button onclick="chatRemoveFile(${i})">×</button></span>`).join('')}</div>`}
 function chatNearBottom(){const box=el('chatMsgs');return !box||(box.scrollHeight-box.scrollTop-box.clientHeight)<80}
 function chatRender(stick){const box=el('chatMsgs');chatState._stickBottom=stick??chatNearBottom();chatState._restoreScroll=(!chatState._stickBottom&&box)?box.scrollTop:null;render()}
@@ -1682,9 +2010,131 @@ async function chatRename(id){if(chatRequest(id))return toast('该会话正在�
 async function chatDelete(id){if(chatRequest(id))return toast('该会话正在生成，请先停止后再删除',false);if(!confirm('确定删除该会话？此操作不可恢复。'))return;try{await chatApi('/api/chat/delete',{method:'POST',body:JSON.stringify({id})});delete chatState.errors[id];delete chatState.attachments[id];delete chatState.drafts[id];if(chatState.current===id){chatState.current=null;chatState.session=null}await chatRefreshSessions();// list 接口在空目录时会自动补默认会话
 if(!chatState.sessions.length){chatState.sessions=await chatApi('/api/chat/sessions')}if(chatState.sessions.length){await chatOpen(chatState.sessions[0].id);return}if(state.current==='chatroom')render()}catch(e){toast(e.message,false)}}
 let _storeList=null;
-function renderStore(){const list=_storeList;if(list===null)return `<div class="card"><div class="section-head"><div><h3>插件商店</h3><p>来自 Qzy327422/XcBot-Plugins</p></div><button class="btn" onclick="loadStore()">刷新</button></div><div class="desc" style="margin-top:16px">正在加载…</div></div>`;if(list&&list.error)return `<div class="card"><div class="section-head"><div><h3>插件商店</h3></div><button class="btn" onclick="loadStore()">重试</button></div><div class="desc" style="color:var(--red,#f87171)">${esc(list.error)}</div></div>`;return `<div class="card"><div class="section-head"><div><h3>插件商店</h3><p>来自 Qzy327422/XcBot-Plugins · ${list.length} 个插件</p></div><div style="display:flex;gap:8px"><button class="btn" onclick="loadStore()">刷新</button><button class="btn primary" onclick="el('submitModal').style.display='flex'">提交插件</button></div></div><div style="display:grid;gap:12px;margin-top:8px">${(list||[]).map(p=>`<div class="field" style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center"><div><div style="font-weight:900">${esc(p.name)} <span class="pill">${esc('v'+p.version)}</span>${p.installed?'<span class="pill ok" style="margin-left:6px">已安装</span>':''}</div><div class="desc">${esc(p.description||'')} — 作者：${esc(p.author||'-')}</div></div>${p.installed?`<div style="display:flex;gap:6px"><button class="btn" id="storeReload_${esc(p.name)}" data-name="${esc(p.name)}" onclick="storeReload(this.dataset.name)">重载</button><button class="btn" id="storeBtn_${esc(p.name)}" data-name="${esc(p.name)}" onclick="storeUninstall(this.dataset.name)" style="color:var(--red,#f87171)">卸载</button></div>`:`<button class="btn primary" id="storeBtn_${esc(p.name)}" data-name="${esc(p.name)}" data-path="${esc(p.path||'')}" onclick="storeInstall(this.dataset.name,this.dataset.path)">安装</button>`}</div>`).join('')||'<div class="desc">暂无插件</div>'}</div><details style="margin-top:16px"><summary class="desc" style="cursor:pointer;user-select:none">如何向插件商店提交插件？</summary><div class="desc" style="margin-top:8px;line-height:1.8">1. Fork <b>https://github.com/Qzy327422/XcBot-Plugins</b><br>2. 在 <code>plugins/</code> 下新建文件夹，名称即插件名<br>3. 创建入口文件 <code>setup.py</code> 或 <code>main.py</code>，实现 <code>TRIGGHT_KEYWORD</code> 和 <code>on_message</code><br>4. 同目录添加 <code>metadata.yaml</code>：<br><pre style="background:var(--bg0);padding:8px;border-radius:8px;margin:4px 0">name: your_plugin\nversion: 1.0.0\ndescription: 插件描述\nauthor: 你的名字\nentry: setup.py</pre>5. 提交 Pull Request<br><br><span class="desc">↓ 或者点我提交 ↓</span><br><button class="btn primary" style="margin-top:4px" onclick="el('submitModal').style.display='flex'">点我提交插件</button></div></details></div>`;
+// 插件管理双子页状态：'config' = 插件配置（astrbot 风格），'store' = 插件下载
+let _pluginTab='config';
+let _pluginSchemas=null;
+// 仅会话 UI 状态；不进入业务配置、dirty 或持久草稿。
+const pluginConfigOpen=new Set();
+function rememberPluginConfigOpen(node){
+  if(!node?.isConnected)return; // DOM 替换后迟到的 toggle 不能覆盖新节点状态。
+  if(node.open)pluginConfigOpen.add(node.dataset.pluginName);else pluginConfigOpen.delete(node.dataset.pluginName);
 }
-async function loadStore(){_storeList=null;if(state.current==='store')render();try{const data=await api('/api/plugins/store');_storeList=data}catch(e){_storeList={error:e.message}}if(state.current==='store')render()}
+function snapshotPluginConfigOpen(){
+  el('pluginPanel')?.querySelectorAll?.('details.plugin-config-card').forEach(rememberPluginConfigOpen);
+}
+let _pluginSchemasFlight=null,_storeFlight=null;
+function ensurePluginTabLoaded(){if(_pluginTab==='config'){if(_pluginSchemas===null)loadPluginSchemas()}else if(_storeList===null)loadStore()}
+function switchPluginTab(tab){
+  if(!['config','store'].includes(tab)||tab===_pluginTab)return;
+  snapshotPluginConfigOpen();_pluginTab=tab;const panel=el('pluginPanel');
+  if(panel){panel.innerHTML=tab==='config'?renderPluginConfig():renderPluginStore();el('pluginTabs')?.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('primary',b.dataset.tab===tab));animateSubtab(panel)}
+  ensurePluginTabLoaded();
+}
+function refreshPluginPanel(tab){const panel=el('pluginPanel');if(state.current==='store'&&_pluginTab===tab&&panel){snapshotPluginConfigOpen();panel.innerHTML=tab==='config'?renderPluginConfig():renderPluginStore()}}
+function renderStore(){
+  return `<div class="plugin-root"><div class="subtab-nav" id="pluginTabs"><button class="btn ${_pluginTab==='config'?'primary':''}" data-tab="config" onclick="switchPluginTab(this.dataset.tab)">插件配置</button><button class="btn ${_pluginTab==='store'?'primary':''}" data-tab="store" onclick="switchPluginTab(this.dataset.tab)">插件下载</button></div><div class="subtab-panel plugin-panel" id="pluginPanel">${_pluginTab==='config'?renderPluginConfig():renderPluginStore()}</div></div>`;
+}
+function renderPluginConfig(){
+  if(_pluginSchemas===null){
+    return `<div class="card"><div class="section-head"><div><h3>插件配置</h3><p>已安装插件的可自定义配置项</p></div><button class="btn" onclick="loadPluginSchemas()">刷新</button></div><div class="desc" style="margin-top:16px">正在加载…</div></div>`;
+  }
+  if(_pluginSchemas.error){
+    return `<div class="card"><div class="section-head"><div><h3>插件配置</h3></div><button class="btn" onclick="loadPluginSchemas()">重试</button></div><div class="desc" style="color:var(--red,#f87171)">${esc(_pluginSchemas.error)}</div></div>`;
+  }
+  const names=Object.keys(_pluginSchemas||{});
+  if(!names.length){
+    return `<div class="card"><div class="section-head"><div><h3>插件配置</h3><p>已安装插件的可自定义配置项</p></div><button class="btn" onclick="loadPluginSchemas()">刷新</button></div>
+    <div class="desc" style="margin-top:16px;line-height:1.8">
+      当前没有插件提供配置项。<br><br>
+      <b>插件作者</b>：在 <code>metadata.yaml</code> 里加 <code>config_schema:</code> 字段，或在 <code>setup.py</code> 里定义 <code>CONFIG_SCHEMA = {...}</code> 即可让用户在此处配置。<br>
+      <b>用户</b>：去「插件下载」子页安装提供配置项的插件。
+    </div></div>`;
+  }
+  const cards=names.map(name=>{
+    const info=_pluginSchemas[name]||{};
+    const schema=info.schema||{};
+    const values=state.bundle.form_values||{};
+    const keys=Object.keys(schema);
+    if(!keys.length)return `<div class="card"><div class="section-head"><div><h3>${esc(name)}</h3><p>该插件未提供配置项</p></div></div><div class="desc">插件作者声明 config_schema 或 CONFIG_SCHEMA 后，这里会自动生成配置表单，无需作者编写网页。</div></div>`;
+    const fieldsHtml=keys.map(key=>{
+      const spec=schema[key]||{};
+      const typ=String(spec.type||'string').toLowerCase();
+      const label=spec.label||key;
+      const desc=spec.desc||'';
+      const cur=values[`PluginConfigs.${name}.${key}`];
+      const inputId=esc(`pluginCfg_${name}_${key}`);
+      const data=`data-name="${esc(name)}" data-key="${esc(key)}"`;
+      if(typ==='bool'||typ==='boolean'){
+        return `<div class="setting-row plugin-setting-row"><div class="label"><span>${esc(label)}</span><div class="switch ${cur?'on':''}" ${data} onclick="pluginCfgToggle(this.dataset.name,this.dataset.key,this)"></div></div><div class="desc">${esc(desc)}</div></div>`;
+      }
+      if(typ==='number'||typ==='int'||typ==='float'){
+        return `<div class="setting-row plugin-setting-row"><div class="label"><span>${esc(label)}</span></div><input type="number" id="${inputId}" value="${esc(cur??'')}" ${spec.min!=null?`min="${esc(spec.min)}"`:''} ${spec.max!=null?`max="${esc(spec.max)}"`:''} step="${esc(spec.step??'any')}" ${data} oninput="_pluginCfgSyncInput(this.dataset.name,this.dataset.key,this)"><div class="desc">${esc(desc)}</div></div>`;
+      }
+      if(typ==='select'&&Array.isArray(spec.options)){
+        const opts=spec.options.map(o=>`<option value="${esc(o)}" ${o===cur?'selected':''}>${esc(o)}</option>`).join('');
+        return `<div class="setting-row plugin-setting-row"><div class="label"><span>${esc(label)}</span></div><select id="${inputId}" ${data} oninput="_pluginCfgSyncInput(this.dataset.name,this.dataset.key,this)">${opts}</select><div class="desc">${esc(desc)}</div></div>`;
+      }
+      if(typ==='textarea'){
+        return `<div class="setting-row plugin-setting-row"><div class="label"><span>${esc(label)}</span></div><textarea id="${inputId}" rows="4" ${data} oninput="_pluginCfgSyncInput(this.dataset.name,this.dataset.key,this)">${esc(cur??'')}</textarea><div class="desc">${esc(desc)}</div></div>`;
+      }
+      if(typ==='list'){
+        const text=Array.isArray(cur)?cur.join('\n'):String(cur??'');
+        return `<div class="setting-row plugin-setting-row"><div class="label"><span>${esc(label)}</span></div><textarea id="${inputId}" rows="4" placeholder="一行一条" ${data} oninput="_pluginCfgSyncInput(this.dataset.name,this.dataset.key,this)">${esc(text)}</textarea><div class="desc">${esc(desc)} 一行一条</div></div>`;
+      }
+      const isPwd=typ==='password'||spec.password;
+      return `<div class="setting-row plugin-setting-row"><div class="label"><span>${esc(label)}</span></div><input type="${isPwd?'password':'text'}" id="${inputId}" value="${esc(cur??'')}" ${data} oninput="_pluginCfgSyncInput(this.dataset.name,this.dataset.key,this)"><div class="desc">${esc(desc)}</div></div>`;
+    }).join('');
+    return `<details class="card plugin-config-card" data-plugin-name="${esc(name)}" ontoggle="rememberPluginConfigOpen(this)"${pluginConfigOpen.has(name)?' open':''}><summary class="plugin-config-summary"><span><strong>${esc(name)}</strong><span class="desc">${keys.length} 个配置项</span></span><span class="plugin-config-caret" aria-hidden="true">⌄</span></summary><div class="plugin-settings-list">${fieldsHtml}</div></details>`;
+  }).filter(s=>s).join('');
+  return `<div class="card"><div class="section-head"><div><h3>插件配置</h3><p>已安装插件的可自定义配置项</p></div><button class="btn" onclick="loadPluginSchemas()">刷新</button></div></div><div class="plugin-config-cards">${cards}</div>
+  <div class="card" style="background:var(--bg1,#f8fafc)"><div class="desc" style="line-height:1.8">修改完点击页面右上角的「<b>保存设置</b>」按钮提交。所有配置改动会通过现有保存流程一并写入 config.json 的 <code>PluginConfigs.&lt;插件名&gt;.&lt;字段&gt;</code>。</div></div>`;
+}
+function seedPluginConfigValues(){
+  const values=state.bundle?.form_values;if(!values||!_pluginSchemas||_pluginSchemas.error)return;
+  for(const [name,info] of Object.entries(_pluginSchemas))for(const [key,spec] of Object.entries(info.schema||{})){
+    const path=`PluginConfigs.${name}.${key}`;if(Object.hasOwn(values,path))continue;
+    // schema 返回的服务端值仅作为缺失字段的初始值，不另存一份可编辑状态。
+    const current=state.bundle.config_json?.PluginConfigs?.[name];
+    if(current&&Object.hasOwn(current,key))values[path]=current[key];
+    else if(Object.hasOwn(info.values||{},key))values[path]=info.values[key];
+    else if(Object.hasOwn(spec||{},'default'))values[path]=spec.default;
+  }
+}
+function loadPluginSchemas(){
+  if(_pluginSchemasFlight)return _pluginSchemasFlight;
+  _pluginSchemasFlight=Promise.resolve().then(async()=>{
+    try{_pluginSchemas=await api('/api/plugins/schemas')||{};seedPluginConfigValues()}
+    catch(e){_pluginSchemas={error:e.message}}
+    finally{_pluginSchemasFlight=null;refreshPluginPanel('config')}
+  });return _pluginSchemasFlight;
+}
+function pluginCfgToggle(name,key,sw){
+  const path=`PluginConfigs.${name}.${key}`,value=!state.bundle.form_values[path];
+  setValue(path,value);sw.classList.toggle('on',value);saveDraft();
+}
+function _pluginCfgSyncInput(name,key,inp){
+  if(!inp||!Object.hasOwn(_pluginSchemas||{},name)||!Object.hasOwn(_pluginSchemas[name].schema||{},key))return;
+  const spec=_pluginSchemas[name].schema[key]||{},typ=String(spec.type||'string').toLowerCase();
+  let val=inp.value;
+  if(['number','int','float'].includes(typ))val=val===''?null:Number(val);
+  else if(typ==='list')val=val.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  const path=`PluginConfigs.${name}.${key}`;
+  if(!sameDraftValues(state.bundle.form_values[path],val)){setValue(path,val);saveDraft()}
+}
+function renderPluginStore(){
+  const list=_storeList;
+  if(list===null)return `<div class="card"><div class="section-head"><div><h3>插件下载</h3><p>来自 Qzy327422/XcBot-Plugins</p></div><button class="btn" onclick="loadStore()">刷新</button></div><div class="desc" style="margin-top:16px">正在加载…</div></div>`;
+  if(list&&list.error)return `<div class="card"><div class="section-head"><div><h3>插件下载</h3></div><button class="btn" onclick="loadStore()">重试</button></div><div class="desc" style="color:var(--red,#f87171)">${esc(list.error)}</div></div>`;
+  return `<div class="card"><div class="section-head"><div><h3>插件下载</h3><p>来自 Qzy327422/XcBot-Plugins · ${list.length} 个插件</p></div><button class="btn" onclick="loadStore()">刷新</button></div><div style="display:grid;gap:12px;margin-top:8px">${(list||[]).map(p=>`<div class="field" style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center"><div><div style="font-weight:900">${esc(p.name)} <span class="pill">${esc('v'+p.version)}</span>${p.installed?'<span class="pill ok" style="margin-left:6px">已安装</span>':''}</div><div class="desc">${esc(p.description||'')} — 作者：${esc(p.author||'-')}</div></div>${p.installed?`<div style="display:flex;gap:6px"><button class="btn" id="storeReload_${esc(p.name)}" data-name="${esc(p.name)}" onclick="storeReload(this.dataset.name)">重载</button><button class="btn" id="storeBtn_${esc(p.name)}" data-name="${esc(p.name)}" onclick="storeUninstall(this.dataset.name)" style="color:var(--bad,#f87171)">卸载</button></div>`:`<button class="btn primary" id="storeBtn_${esc(p.name)}" data-name="${esc(p.name)}" data-path="${esc(p.path||'')}" onclick="storeInstall(this.dataset.name,this.dataset.path)">安装</button>`}</div>`).join('')||'<div class="desc">暂无插件</div>'}</div><details style="margin-top:16px"><summary class="desc" style="cursor:pointer;user-select:none">如何向插件商店提交插件？</summary><div class="desc" style="margin-top:8px;line-height:1.8"><div style="margin-bottom:12px"><button class="btn primary" onclick="el('submitModal').style.display='flex'">点我提交插件</button></div><div style="margin:8px 0 8px;font-weight:800;color:var(--text)">手动提交 ▼</div>1. Fork <b>https://github.com/Qzy327422/XcBot-Plugins</b><br>2. 在 <code>plugins/</code> 下新建文件夹，名称即插件名<br>3. 创建入口文件 <code>setup.py</code> 或 <code>main.py</code>，实现 <code>TRIGGHT_KEYWORD</code> 和 <code>on_message</code><br>4. 同目录添加 <code>metadata.yaml</code>：<br><pre style="background:var(--bg0);padding:8px;border-radius:8px;margin:4px 0">name: your_plugin\nversion: 1.0.0\ndescription: 插件描述\nauthor: 你的名字\nentry: setup.py</pre>5. （可选）让插件支持配置：在 metadata.yaml 加 <code>config_schema</code> 字段<br>6. 提交 Pull Request</div></details></div>`;
+}
+function loadStore(){
+  if(_storeFlight)return _storeFlight;
+  _storeFlight=Promise.resolve().then(async()=>{
+    try{_storeList=await api('/api/plugins/store')}
+    catch(e){_storeList={error:e.message}}
+    finally{_storeFlight=null;refreshPluginPanel('store')}
+  });return _storeFlight;
+}
 async function storeInstall(name,path){const btn=el('storeBtn_'+name);if(btn){btn.disabled=true;btn.textContent='安装中…'}try{const r=await api('/api/plugins/install',{method:'POST',body:JSON.stringify({name,path})});toast(r.message||'安装成功');await loadStore()}catch(e){toast(e.message,false);if(btn){btn.disabled=false;btn.textContent='安装'}}}
 async function storeUninstall(name){const btn=el('storeBtn_'+name);if(btn){btn.disabled=true;btn.textContent='卸载中…'}try{const r=await api('/api/plugins/uninstall',{method:'POST',body:JSON.stringify({name})});toast(r.message||'卸载成功');await loadStore()}catch(e){toast(e.message,false);if(btn){btn.disabled=false;btn.textContent='卸载'}}}
 async function storeReload(name){const btn=el('storeReload_'+name);if(btn){btn.disabled=true;btn.textContent='重载中…'}try{const r=await api('/api/plugins/reload',{method:'POST',body:JSON.stringify({name})});toast(r.message||'重载成功')}catch(e){toast(e.message,false)}finally{if(btn){btn.disabled=false;btn.textContent='重载'}}}
@@ -1694,16 +2144,27 @@ setTheme(localStorage.webuiTheme||'light');window.addEventListener('hashchange',
 
 const AGENT_LEVEL_LABEL={user:'所有人',admin:'仅管理员'};
 function renderAgent(){
+  const tab=state.agentSettingsTab||'tools',tabs=[['tools','工具与权限'],['settings','执行与搜索'],['mcp','MCP 服务器']];
+  return `<div class="card organized-settings"><div class="section-head"><div><h3>Agent</h3><p>选择 AI 能用的工具、执行方式和外部 MCP 连接。</p></div><span class="pill ${state.bundle.form_values?.['Agent.enabled']?'ok':''}">${state.bundle.form_values?.['Agent.enabled']?'已启用':'未启用'}</span></div><div class="subtab-nav settings-tabs" id="agentSettingsTabs" role="tablist" aria-label="Agent 设置">${tabs.map(([key,title])=>`<button class="btn ${tab===key?'primary':''}" role="tab" aria-selected="${tab===key}" data-tab="${key}" onclick="switchAgentSettingsTab(this.dataset.tab)">${title}</button>`).join('')}</div><div id="agentSettingsPanel" class="subtab-panel settings-panel-grid">${renderAgentContent(tab)}</div></div>`;
+}
+function switchAgentSettingsTab(tab){
+  if(!['tools','settings','mcp'].includes(tab)||(state.agentSettingsTab||'tools')===tab)return;
+  syncCurrentPageFieldsFromDom();state.agentSettingsTab=tab;
+  const panel=el('agentSettingsPanel');if(!panel)return;panel.innerHTML=renderAgentContent(tab);
+  el('agentSettingsTabs')?.querySelectorAll('[data-tab]').forEach(b=>{b.classList.toggle('primary',b.dataset.tab===tab);b.setAttribute('aria-selected',String(b.dataset.tab===tab))});
+  animateSubtab(panel);liquidGlassLensController.refresh();
+}
+function renderAgentContent(tab){
+  if(tab==='mcp')return renderMcpPanel();
   const m=meta(),fields=m.fields||[],vals=state.bundle.form_values||{};
+  if(tab==='settings'){
+    const categories={};fields.forEach(f=>{const category=f.category||'执行设置';(categories[category]||(categories[category]=[])).push(f)});
+    return Object.entries(categories).map(([title,items])=>`<section class="settings-block"><div class="section-head"><div><h3>${esc(title)}</h3></div></div><div class="form-grid">${items.map(f=>renderField(f,vals[f.path])).join('')}</div></section>`).join('');
+  }
   const tools=state.bundle.agent_tools||{},metaList=state.bundle.agent_tool_meta||[];
   const groups={};metaList.forEach(x=>(groups[x.group]||(groups[x.group]=[])).push(x));
   const order=(state.bundle.agent_tool_groups||Object.keys(groups)).filter(g=>groups[g]&&groups[g].length);
   const enabled=metaList.filter(x=>tools[x.key]&&tools[x.key].enabled).length;
-  const rounds=Number(vals['Agent.max_rounds']??2);
-  const on=!!vals['Agent.enabled'];
-  const head=`<div class="card"><div class="section-head"><div><h3>Agent 设置</h3><p>${esc(m.desc||'')}</p></div><span class="pill ${on?'ok':''}">${on?'已启用':'未启用'} · ${enabled} 个工具</span></div>`
-    +`<div class="desc" style="margin-bottom:14px">已启用 ${enabled} 个工具，最大 ${rounds} 轮：单条消息最多产生 <b>${rounds+1}</b> 次模型请求。按次计费的接口请留意这个上限。</div>`
-    +`<div style="display:grid;gap:14px">${fields.map(f=>renderField(f,vals[f.path])).join('')}</div></div>`;
   const body=order.map(g=>{
     const sid=g.replace(/[^a-zA-Z0-9_-]/g,'_');
     const items=groups[g].map(it=>{
@@ -1720,7 +2181,8 @@ function renderAgent(){
     }).join('');
     return `<div class="card" id="section_${sid}" data-section="${esc(g)}"><div class="section-head"><div><h3>${esc(g)}</h3><p>工具开关与调用权限</p></div><span class="pill">${groups[g].length} 项</span></div><div class="feature-grid">${items}</div></div>`;
   }).join('');
-  return head+renderMcpPanel()+body;
+  const mainSwitch=fields.find(f=>f.path==='Agent.enabled');
+  return `<section class="settings-block agent-overview"><div class="section-head"><div><h3>工具总开关</h3><p>原有工具权限保持不变；关闭 Agent 不会自动替你关闭主动回复。</p></div><span class="pill">${enabled} 个工具已启用</span></div>${mainSwitch?renderField(mainSwitch,vals[mainSwitch.path]):''}</section>`+body;
 }
 function agentToolEntry(key){
   const tools=state.bundle.agent_tools||(state.bundle.agent_tools={});
@@ -1766,18 +2228,18 @@ function renderMcpPanel(){
     return `<div class="feature"><h4>${esc(n)}</h4>
       <div class="feature-foot"><span class="pill">${isUrl?'SSE':'stdio'}</span>
       <div class="switch ${c.enabled!==false?'on':''}" data-mcp-act="toggle" data-mcp-name="${esc(n)}"></div></div>
-      <div class="field" style="margin-top:10px"><div class="label"><span>名称</span></div>
+      <div class="mcp-server-fields"><div class="field"><div class="label"><span>名称</span></div>
       <input value="${esc(n)}" data-mcp-act="rename" data-mcp-name="${esc(n)}"><div class="desc">工具会以 mcp__名称__工具名 注册</div></div>
       ${isUrl?`<div class="field"><div class="label"><span>SSE 地址</span></div><input value="${esc(c.url||'')}" data-mcp-act="field" data-mcp-key="url" data-mcp-name="${esc(n)}"></div>`
       :`<div class="field"><div class="label"><span>启动命令</span></div><input value="${esc(c.command||'')}" data-mcp-act="field" data-mcp-key="command" data-mcp-name="${esc(n)}"><div class="desc">如 npx、uvx、python</div></div>
-        <div class="field"><div class="label"><span>命令参数</span></div><textarea style="min-height:70px" data-mcp-act="args" data-mcp-name="${esc(n)}">${esc((c.args||[]).join('\n'))}</textarea><div class="desc">一行一个参数</div></div>`}
+        <div class="field"><div class="label"><span>命令参数</span></div><textarea style="min-height:70px" data-mcp-act="args" data-mcp-name="${esc(n)}">${esc((c.args||[]).join('\n'))}</textarea><div class="desc">一行一个参数</div></div>`}</div>
       <div style="margin-top:8px"><button class="btn" data-mcp-act="remove" data-mcp-name="${esc(n)}">删除</button></div></div>`;
   }).join('');
   return `<div class="card" id="section_MCP_" data-section="MCP"><div class="section-head">
     <div><h3>MCP 服务器</h3><p>接入外部 MCP 工具生态，配置文件 ${esc(d.config_path||'')}</p></div>
     <span class="pill ${tools.length?'ok':''}">已注册 ${tools.length} 个工具</span></div>
     ${warn}
-    <div style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+    <div style="display:flex;gap:10px;margin-top:${warn?12:0}px;margin-bottom:14px;flex-wrap:wrap">
       <button class="btn" onclick="addMcpServer(false)">+ 添加 stdio 服务器</button>
       <button class="btn" onclick="addMcpServer(true)">+ 添加 SSE 服务器</button>
       <button class="btn" onclick="saveMcp()">保存配置</button>

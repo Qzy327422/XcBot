@@ -36,7 +36,7 @@ _check_version()
 # ==================== 插件元信息 ====================
 TRIGGHT_KEYWORD = "生图"
 
-HELP_MESSAGE = "/生图 [搜索词] —— 搜图/发图（插件）"
+HELP_MESSAGE = "{reminder}生图 [搜索词] —— 搜图/发图（插件）"
 
 # 个人冷却，管理员豁免。原主程序用全局 cooldowns，迁移后由插件自管理。
 COOLDOWN_SECONDS = 18

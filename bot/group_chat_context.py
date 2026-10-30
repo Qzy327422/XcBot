@@ -90,6 +90,15 @@ def _trim_left(
             record_ids.popleft()
 
 
+class GroupContextRecord(str):
+    """保留字符串契约，同时让读取端能按结构化作者实时过滤。"""
+
+    def __new__(cls, text: str, author_id=None):
+        record = super().__new__(cls, text)
+        record.author_id = str(author_id) if author_id is not None else None
+        return record
+
+
 @dataclass(frozen=True)
 class GroupContextReservation:
     """一次请求暂存的旁听内容，成功确认或最终失败时恢复。"""
@@ -116,11 +125,14 @@ class GroupChatContextManager:
     def _key(group_id) -> str:
         return str(group_id)
 
-    def record(self, group_id, formatted_text: str, max_cnt: int | None = None) -> str:
+    def record(self, group_id, formatted_text: str, max_cnt: int | None = None,
+               *, author_id=None) -> str:
         """追加一条旁听消息，返回 record_id。"""
         text = str(formatted_text or "").strip()
         if not text:
             return ""
+        text = GroupContextRecord(text, author_id if author_id is not None
+                                  else getattr(formatted_text, "author_id", None))
         key = self._key(group_id)
         limit = positive_int(max_cnt, self._default_max_cnt) if max_cnt is not None else self._default_max_cnt
         record_id = uuid.uuid4().hex
@@ -133,7 +145,7 @@ class GroupChatContextManager:
         return record_id
 
     def reserve_for_inject(self, group_id, record_id: str | None = None,
-                           max_cnt: int | None = None) -> GroupContextReservation | None:
+                           max_cnt: int | None = None, *, visible=None) -> GroupContextReservation | None:
         """暂存当前触发条之前的旁听，待 LLM 成功后确认或失败后恢复。"""
         key = self._key(group_id)
         limit = positive_int(max_cnt, self._default_max_cnt) if max_cnt is not None else self._default_max_cnt
@@ -153,7 +165,8 @@ class GroupChatContextManager:
             if prompt_idx >= len(raw_list):
                 return None
 
-            to_inject = tuple(raw_list[:prompt_idx])
+            to_inject = tuple(text for text in raw_list[:prompt_idx]
+                              if visible is None or visible(text))
             remaining = raw_list[prompt_idx + 1 :]
             remaining_ids = id_list[prompt_idx + 1 :]
             records.clear()
@@ -271,6 +284,26 @@ class GroupChatContextManager:
         key = self._key(group_id)
         with self._lock:
             return len(self._records.get(key, ()))
+
+    def tail(self, group_id, n: int, *, visible=None) -> list[str]:
+        """只读返回最近 n 条旁听，不消费、不修改任何状态。
+
+        供主动回复 planner 调用——它需要看上下文决定要不要发言，但不能
+        像 reserve_for_inject 那样把已读条目从缓冲里抹掉，否则后续的
+        正常 @ 触发会丢上下文。
+        """
+        key = self._key(group_id)
+        try:
+            n = max(0, int(n))
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 0:
+            return []
+        with self._lock:
+            records = self._records.get(key)
+            if not records:
+                return []
+            return [text for text in records if visible is None or visible(text)][-n:]
 
 
 # 进程级单例，供 main.py 直接使用

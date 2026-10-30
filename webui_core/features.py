@@ -13,13 +13,13 @@ GROUP_JOIN_WELCOME_PLACEHOLDERS = ("bot_name", "user_nickname", "user_id", "grou
 
 FEATURE_META = [
     {"key": "ai_chat", "title": "AI 对话", "desc": "AI 回复总开关", "group": "对话"},
-    {"key": "private_chat", "title": "私聊响应", "desc": "允许私聊直接触发 AI", "group": "对话"},
-    {"key": "group_chat", "title": "群聊响应", "desc": "允许群内 @ / 名字 / 前缀触发 AI", "group": "对话"},
+    {"key": "private_chat", "title": "私聊响应", "desc": "私聊所有响应总开关，含命令、插件、AI、拍一拍及主动观察；关闭后只能从 WebUI 恢复", "group": "对话"},
+    {"key": "group_chat", "title": "群聊响应", "desc": "群聊所有响应总开关，含命令、插件、AI、拍一拍、入群欢迎及主动观察；关闭后只能从 WebUI 恢复", "group": "对话"},
     {"key": "sensitive_filter", "title": "屏蔽词过滤", "desc": "只对用户发给机器人的消息执行屏蔽词替换", "group": "对话"},
     {"key": "plugin_admin_commands", "title": "插件/模型命令", "desc": "允许使用 /插件视角、/model、/重载插件 等命令", "group": "功能配置"},
-    {"key": "group_chat_context", "title": "群聊上下文感知", "desc": "旁听群消息，触发 AI 时注入上次回复后的群聊内容；默认关闭", "group": "功能配置"},
+    {"key": "group_chat_context", "title": "群聊上下文感知", "desc": "旁听群消息，触发 AI 时注入上次回复后的群聊内容；默认开启，会增加上下文用量", "group": "功能配置"},
     {"key": "summary", "title": "群聊总结", "desc": "总结群聊记录与数据看板", "group": "功能配置"},
-    {"key": "compression_commands", "title": "记忆压缩", "desc": "自动压缩上下文，并允许使用压缩相关命令", "group": "功能配置"},
+    {"key": "compression_commands", "title": "允许手动压缩命令", "desc": "允许使用手动压缩及压缩管理命令；不影响 AI 配置中的自动压缩", "group": "功能配置"},
     {"key": "emoji_plus_one", "title": "表情 +1", "desc": "单个表情自动复读", "group": "功能配置"},
     {"key": "split_reply_quote", "title": "分段首段引用", "desc": "开启后：仅多段回复默认首段引用发送者消息", "group": "功能配置"},
     {"key": "weak_blacklist", "title": "弱黑名单", "desc": "按概率拦截触发", "group": "功能配置"},
@@ -33,12 +33,13 @@ FEATURE_META = [
     {"key": "http_send_api", "title": "HTTP 消息发送", "desc": "允许外部程序/插件通过 POST /api/send 推送 QQ 消息，需先设置 WebUI 访问 Token", "group": "外部接口"},
 ]
 
-# 绝大多数功能默认开；仅下列明确默认关（与 config.default.json 保持一致）
-_FEATURE_DEFAULT_OFF = frozenset({
-    "group_chat_context",  # 旁听会增 token，默认关，需在功能配置里手动开
-})
+def compression_trigger_rounds(others):
+    """旧双阈值取较大值；保存规范配置后只保留 auto_compress_after_messages。"""
+    trigger = max(1, int(others.get("auto_compress_after_messages", 40)))
+    if "compression_threshold" in others:
+        trigger = max(trigger, int(others["compression_threshold"]))
+    return trigger
 
-DEFAULT_FEATURE_SWITCHES = {
-    item["key"]: (item["key"] not in _FEATURE_DEFAULT_OFF)
-    for item in FEATURE_META
-}
+
+# 主动回复使用独立配置，仍默认关闭；这里的普通功能默认开启。
+DEFAULT_FEATURE_SWITCHES = {item["key"]: True for item in FEATURE_META}

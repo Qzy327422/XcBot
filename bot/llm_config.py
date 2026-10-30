@@ -262,27 +262,16 @@ def convert_legacy_endpoints_to_providers(others: Dict[str, Any]) -> list[dict]:
 
 def normalize_llm_providers_config(others: Dict[str, Any]) -> tuple[list[Dict[str, Any]], list[Dict[str, str]]]:
     others = others if isinstance(others, dict) else {}
-    providers = others.get("llm_providers", [])
+    # 显式配置的提供商列表（包括 [] 或仅配置 planner_models/embedding_models 的提供商）
+    # 始终作为配置依据，不能被过期的 llm_endpoints 派生缓存覆盖。
+    if "llm_providers" not in others:
+        providers = convert_legacy_endpoints_to_providers(others)
+        if not providers:
+            providers = [{"id": "provider1", "base_url": "", "keys": [], "http_proxy": "", "models": [], "detected_models": []}]
+    else:
+        providers = others.get("llm_providers", [])
     if not isinstance(providers, list):
         providers = []
-    if not providers:
-        providers = [{"id": "provider1", "base_url": "", "keys": [], "http_proxy": "", "models": [], "detected_models": []}]
-
-    provider_has_model = any(
-        isinstance(p, dict)
-        and str(p.get("base_url", "") or "").strip()
-        and p.get("keys")
-        and any(
-            isinstance(m, dict)
-            and str(m.get("name", "") or m.get("model", "") or "").strip()
-            for m in (p.get("models", []) if isinstance(p.get("models", []), list) else [])
-        )
-        for p in providers
-    )
-    if not provider_has_model:
-        converted = convert_legacy_endpoints_to_providers(others)
-        if converted:
-            providers = converted
 
     normalized_providers = []
     seen_provider_ids = set()
@@ -335,6 +324,32 @@ def normalize_llm_providers_config(others: Dict[str, Any]) -> tuple[list[Dict[st
                     "enabled": normalize_bool_config(item.get("enabled", True), True),
                     "dimensions": int(item.get("dimensions", 0) or 0),
                 })
+
+        raw_planner_models = raw.get("planner_models", []) if isinstance(raw.get("planner_models", []), list) else []
+        planner_models = []
+        for item in raw_planner_models:
+            if isinstance(item, str):
+                item = {"name": item, "enabled": True}
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "") or item.get("model", "") or "").strip()
+            if not name:
+                continue
+            try:
+                timeout_seconds = int(float(item.get("timeout_seconds", others.get("api_request_timeout_seconds", 60)) or 60))
+            except (TypeError, ValueError, OverflowError):
+                try:
+                    timeout_seconds = int(float(others.get("api_request_timeout_seconds", 60) or 60))
+                except (TypeError, ValueError, OverflowError):
+                    timeout_seconds = 60
+            if name in {m.get("name") for m in planner_models}:
+                continue
+            planner_models.append({
+                "name": name,
+                "enabled": normalize_bool_config(item.get("enabled", True), True),
+                "timeout_seconds": max(1, timeout_seconds),
+            })
+
         detected = raw.get("detected_models", [])
         if isinstance(detected, str):
             detected = [x.strip() for x in detected.splitlines() if x.strip()]
@@ -355,6 +370,7 @@ def normalize_llm_providers_config(others: Dict[str, Any]) -> tuple[list[Dict[st
             "http_proxy": normalize_proxy_url(raw.get("http_proxy", "")),
             "models": models,
             "embedding_models": embedding_models,
+            "planner_models": planner_models,
             "detected_models": detected,
         })
 
@@ -421,6 +437,32 @@ def build_llm_endpoints_from_providers(others: Dict[str, Any]) -> list[Dict[str,
             "reasoning_effort": normalize_reasoning_effort(model_cfg.get("reasoning_effort", "")),
             "context_window": normalize_context_window(model_cfg.get("context_window", 0)),
         })
+    return result
+
+
+def build_planner_endpoints(others: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """仅从已启用的 planner_models 构建与 key_manager 兼容的端点槽位。"""
+    providers, _ = normalize_llm_providers_config(others)
+    result = []
+    for provider in providers:
+        keys = normalize_provider_keys(provider.get("keys", []), strict_ascii=True)
+        if not keys or not provider.get("base_url"):
+            continue
+        for model in provider.get("planner_models", []):
+            if not model.get("enabled"):
+                continue
+            result.append({
+                "provider_id": provider["id"],
+                "base_url": provider["base_url"],
+                "model": model["name"],
+                "display_model": provider_display_model(provider["id"], model["name"]),
+                "keys": keys[:],
+                "http_proxy": provider["http_proxy"],
+                "supports_multimodal": False,
+                "timeout_seconds": model["timeout_seconds"],
+                "reasoning_effort": "",
+                "context_window": 0,
+            })
     return result
 
 
@@ -539,7 +581,7 @@ def force_apply_llm_endpoints_from_config(cfg: Dict[str, Any], set_endpoints=Non
     if not isinstance(others, dict):
         others = cfg if isinstance(cfg, dict) else {}
     endpoints = build_llm_endpoints_from_providers(others)
-    if not endpoints:
+    if not endpoints and "llm_providers" not in others:
         endpoints = normalize_legacy_endpoints(others.get("llm_endpoints", []))
     if callable(set_endpoints):
         set_endpoints(endpoints)
@@ -553,5 +595,7 @@ def normalize_llm_provider_rotation(cfg: dict) -> list:
     endpoints = build_llm_endpoints_from_providers(cfg)
     if endpoints:
         return endpoints
-    # Compatibility fallback for configs that still only have llm_endpoints.
+    # 显式配置为空的对话轮换必须保持为空，不能回退到过期缓存。
+    if "llm_providers" in cfg:
+        return []
     return normalize_legacy_endpoints(cfg.get("llm_endpoints", []))

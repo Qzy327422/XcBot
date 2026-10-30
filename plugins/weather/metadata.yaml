@@ -4,3 +4,21 @@ description: 天气查询（/天气 [城市]），数据源 open-meteo，无需 
 author: XcBot
 entry: setup.py
 min_xcbot_version: v2.4
+config_schema:
+  default_city:
+    type: string
+    label: 默认城市
+    desc: 用户输入 /天气 不带城市名时使用此默认城市
+    default: 北京
+  cache_minutes:
+    type: number
+    label: 缓存分钟数
+    desc: 同一城市查询结果缓存时间，0 表示不缓存
+    default: 30
+    min: 0
+    max: 1440
+  show_detail:
+    type: bool
+    label: 显示详细天气
+    desc: 开启后返回更完整的湿度/风力/紫外线等信息
+    default: false

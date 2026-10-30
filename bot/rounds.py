@@ -30,34 +30,83 @@ def _tool_call_ids(message: dict) -> set[str]:
 
 
 def fix_messages(messages: list[dict]) -> list[dict]:
-    """删除不完整的 assistant.tool_calls / tool 配对，避免 API 拒绝历史。"""
+    """仅保留完整、ID 唯一的相邻工具组；不猜配对，也不修改原始消息。"""
+    from copy import deepcopy
+
+    # 同一 ID 跨 assistant 复用也有歧义，相关组全部失效，不为旧结果猜新调用。
+    id_counts: dict[str, int] = {}
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            call_id = call.get("id") if isinstance(call, dict) else None
+            if isinstance(call_id, str) and call_id.strip():
+                id_counts[call_id] = id_counts.get(call_id, 0) + 1
+
     fixed: list[dict] = []
     pending: dict | None = None
-    pending_tools: list[dict] = []
+    expected: set[str] = set()
+    pending_tools: dict[str, dict] = {}
+    valid = False
 
     def flush() -> None:
-        nonlocal pending, pending_tools
+        nonlocal pending, expected, pending_tools, valid
         if pending is not None:
-            expected = _tool_call_ids(pending)
-            actual = {str(item.get("tool_call_id") or "") for item in pending_tools}
-            if expected and expected.issubset(actual):
+            if valid and expected and expected == set(pending_tools):
                 fixed.append(pending)
-                fixed.extend(item for item in pending_tools if str(item.get("tool_call_id") or "") in expected)
-        pending = None
-        pending_tools = []
+                fixed.extend(pending_tools.values())
+            elif pending.get("content"):
+                # 工具组无效只剥工具协议，保住助手普通正文；绝不伪造结果。
+                pending.pop("tool_calls", None)
+                fixed.append(pending)
+        pending, expected, pending_tools, valid = None, set(), {}, False
 
-    for message in messages:
+    for original in messages:
+        if not isinstance(original, dict):
+            continue
+        message = deepcopy(original)
         role = message.get("role")
         if role == "tool":
-            if pending is not None and str(message.get("tool_call_id") or "") in _tool_call_ids(pending):
-                pending_tools.append(message)
-            continue
-        if role == "assistant" and message.get("tool_calls"):
-            flush()
-            pending = message
+            call_id = message.get("tool_call_id")
+            if (pending is not None and valid and isinstance(call_id, str)
+                    and call_id in expected and call_id not in pending_tools):
+                pending_tools[call_id] = message
             continue
         flush()
+        if role == "assistant" and message.get("tool_calls"):
+            pending = message
+            calls = message["tool_calls"]
+            valid = isinstance(calls, list) and bool(calls)
+            for call in calls if isinstance(calls, list) else []:
+                if not isinstance(call, dict):
+                    valid = False
+                    continue
+                call_id = call.get("id")
+                function = call.get("function")
+                if (not isinstance(call_id, str) or not call_id.strip()
+                        or id_counts.get(call_id) != 1
+                        or call.get("type") != "function"
+                        or not isinstance(function, dict)
+                        or not isinstance(function.get("name"), str)
+                        or not function["name"].strip()):
+                    valid = False
+                    continue
+                expected.add(call_id)
+                arguments = function.get("arguments")
+                if isinstance(arguments, dict):
+                    try:
+                        function["arguments"] = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
+                    except (TypeError, ValueError, RecursionError):
+                        valid = False
+                elif not isinstance(arguments, str):
+                    valid = False
+            continue
         if role in ("user", "assistant"):
+            if role == "assistant":
+                message.pop("tool_calls", None)
             fixed.append(message)
     flush()
     return fixed
@@ -158,9 +207,16 @@ def describe_message(message: dict, limit: int = 1000) -> str:
     return text[:limit]
 
 
-def extract_agent_trail(messages: list[dict]) -> list[dict]:
-    """只提取 agent 真实产生的 assistant.tool_calls 和 tool 消息。"""
+def extract_agent_trail(messages: list[dict], *,
+                        request_user_messages: list[dict] | None = None) -> list[dict]:
+    """提取工具链；仅请求级重试可按对象 identity 额外保留框架注入的 user。
+
+    默认不提取 user，避免图片 data URL 进入普通持久化历史。旁表必须持有本轮
+    实际注入的消息对象，不按内容、角色顺序或可伪造的消息字段猜测来源。
+    """
+    request_user_ids = {id(message) for message in (request_user_messages or [])}
     return [dict(message) for message in messages if (
         message.get("role") == "tool"
         or (message.get("role") == "assistant" and message.get("tool_calls"))
+        or (message.get("role") == "user" and id(message) in request_user_ids)
     )]

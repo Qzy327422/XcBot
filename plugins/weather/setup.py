@@ -4,6 +4,10 @@
 数据源：open-meteo（免费，无需 API Key）。
 """
 import re
+import math
+import threading
+import time
+from collections import OrderedDict
 
 import aiohttp
 
@@ -41,7 +45,7 @@ _check_version()
 # ==================== 插件元信息 ====================
 TRIGGHT_KEYWORD = "天气"
 
-HELP_MESSAGE = "/天气 [城市] —— 查询天气（插件）"
+HELP_MESSAGE = "{reminder}天气 [城市] —— 查询天气（插件）"
 
 WEATHER_CODE_MAP = {
     0: "晴朗", 1: "大部晴朗", 2: "局部多云", 3: "阴", 45: "有雾", 48: "冻雾",
@@ -54,6 +58,19 @@ WEATHER_CODE_MAP = {
 GEO_API = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_API = "https://api.open-meteo.com/v1/forecast"
 TIMEOUT_SECONDS = 20
+_CACHE_MAX_CITIES = 128
+_weather_cache = OrderedDict()
+_cache_lock = threading.RLock()
+
+
+def _cache_ttl(cache_minutes) -> float:
+    try:
+        minutes = float(cache_minutes)
+    except (TypeError, ValueError):
+        minutes = 30
+    if not math.isfinite(minutes):
+        minutes = 30
+    return max(0, min(minutes, 1440)) * 60
 
 
 def _normalize_location_query(name: str) -> str:
@@ -99,7 +116,7 @@ def _pick_best_location(results: list, city_name: str):
     return max(exact_results, key=score)
 
 
-def _format_weather(weather_data: dict, city_name: str, clean) -> str:
+def _format_weather(weather_data: dict, city_name: str, clean, show_detail: bool = True) -> str:
     try:
         display_city = weather_data.get("display_name") or city_name
         current = weather_data.get("current") or {}
@@ -117,9 +134,9 @@ def _format_weather(weather_data: dict, city_name: str, clean) -> str:
             if temp is not None:
                 result += f" | 🌡️ {temp}°C"
             result += "\n"
-            if wind is not None:
+            if show_detail and wind is not None:
                 result += f"💨 风速: {wind} km/h\n"
-            if humidity is not None:
+            if show_detail and humidity is not None:
                 result += f"💧 湿度: {humidity}%\n"
 
         dates = daily.get("time") or []
@@ -150,11 +167,25 @@ def _format_weather(weather_data: dict, city_name: str, clean) -> str:
         return f"❌ 天气查询失败: {clean(str(e))}"
 
 
-async def _get_weather(city_name: str, clean, log) -> str:
+async def _get_weather(city_name: str, clean, log, cache_minutes=30, show_detail=True) -> str:
     try:
         city_name = (city_name or "").strip()
         if not city_name:
             return "❌ 请输入要查询的城市名称"
+        ttl = _cache_ttl(cache_minutes)
+        cache_key = re.sub(r"\s+", "", city_name).casefold()
+        now = time.monotonic()
+        with _cache_lock:
+            # Store raw data so changing show_detail takes effect on cache hits.
+            for key, (created, lifetime, _) in list(_weather_cache.items()):
+                if now - created >= lifetime:
+                    del _weather_cache[key]
+            cached = _weather_cache.get(cache_key)
+            if ttl and cached and now - cached[0] < ttl:
+                _weather_cache.move_to_end(cache_key)
+                return _format_weather(cached[2], city_name, clean, show_detail)
+            if cached:
+                del _weather_cache[cache_key]
 
         if log:
             log(f"geo {city_name}", "HTTP")
@@ -203,7 +234,13 @@ async def _get_weather(city_name: str, clean, log) -> str:
                 weather_data = await response.json()
 
             weather_data["display_name"] = display_name
-            return _format_weather(weather_data, city_name, clean)
+            if ttl:
+                with _cache_lock:
+                    _weather_cache[cache_key] = (time.monotonic(), ttl, weather_data)
+                    _weather_cache.move_to_end(cache_key)
+                    while len(_weather_cache) > _CACHE_MAX_CITIES:
+                        _weather_cache.popitem(last=False)
+            return _format_weather(weather_data, city_name, clean, show_detail)
     except Exception as e:
         return f"❌ 天气查询失败: {clean(str(e))}"
 
@@ -221,7 +258,7 @@ def _match(order: str) -> bool:
 async def on_message(order, actions, Manager, Segments, bot_name, reminder,
                      is_group=False, group_id=None, user_id=None,
                      filter_sensitive_content=None, is_feature_enabled=None,
-                     log=None, **kwargs):
+                     log=None, get_plugin_config=None, **kwargs):
     order = str(order or "").strip()
     if not _match(order):
         return False
@@ -242,11 +279,16 @@ async def on_message(order, actions, Manager, Segments, bot_name, reminder,
 
     # 精确匹配后参数就是「天气 」之后的部分，不能再用 replace：
     # 城市名本身可能含「天气」二字，replace 会把它一起删掉
+    config = get_plugin_config if callable(get_plugin_config) else lambda key, default: default
     city_name = order[len("天气"):].strip()
+    if not city_name:
+        city_name = str(config("default_city", "北京") or "").strip()
     if not city_name:
         await send(f"请指定城市名称，例如：{reminder}天气 北京")
         return True
 
     await send(f"{bot_name}正在查询 {city_name} 的天气... ☁️")
-    await send(await _get_weather(city_name, clean, log))
+    await send(await _get_weather(city_name, clean, log,
+                                 cache_minutes=config("cache_minutes", 30),
+                                 show_detail=config("show_detail", False)))
     return True

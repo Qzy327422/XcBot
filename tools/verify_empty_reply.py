@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import ast
 import re
 import sys
 from pathlib import Path
@@ -103,10 +104,21 @@ def test_main_production_path_whitespace_raises():
     assert 'raise ValueError("模型返回了空白回复")' in child_src, (
         "子类 EnhancedLimitedDeepSeekContext.agen_content 缺少空白抛错"
     )
-    # 并且必须出现在子类自己的 rstrip 之后
-    rstrip_idx = child_src.index('result.rstrip')
-    raise_idx = child_src.index('raise ValueError("模型返回了空白回复")')
-    assert raise_idx > rstrip_idx, "子类 ValueError 应在 rstrip 之后"
+    # 通过 AST 定位生产方法，避免命中注释或旧的 result.rstrip 写法。
+    tree = ast.parse(src)
+    child = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                 and node.name == "EnhancedLimitedDeepSeekContext")
+    method = next(node for node in child.body if isinstance(node, ast.AsyncFunctionDef)
+                  and node.name == "agen_content")
+    assignments = [node for node in ast.walk(method) if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "result" for target in node.targets)
+                   and isinstance(node.value, ast.Call)
+                   and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "rstrip"]
+    raises = [node for node in ast.walk(method) if isinstance(node, ast.Raise)
+              and '模型返回了空白回复' in ast.unparse(node)]
+    assert assignments and raises and raises[0].lineno > assignments[-1].lineno, (
+        "生产方法必须在清理最终 result 后检查空白并抛错"
+    )
     # 全文件共 2 处（父类 + 子类）
     count = src.count('raise ValueError("模型返回了空白回复")')
     assert count == 2, f"应有 2 处 ValueError（父+子），实际 {count}"
@@ -317,8 +329,13 @@ def test_agent_empty_final_reply_goes_to_retry():
     """
     src = (ROOT / "bot/agent.py").read_text(encoding="utf-8")
     # 空响应的就地重试判断
-    assert 'if getattr(message, "tool_calls", None) or str(getattr(message, "content", "") or "").strip():' in src, (
-        "缺少空回复的就地重试入口判断"
+    tree = ast.parse(src)
+    loop = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
+                and node.name == "_run_tool_loop_inner")
+    checks = [node.test for node in ast.walk(loop) if isinstance(node, ast.If)]
+    assert any('tool_calls' in ast.unparse(test) and 'content' in ast.unparse(test)
+               and '.strip()' in ast.unparse(test) for test in checks), (
+        "缺少同时检查原生调用与非空正文的就地重试入口"
     )
     # 重试提示
     assert "模型返回空响应，第" in src, "缺少空响应重试日志"

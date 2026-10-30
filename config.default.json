@@ -30,7 +30,7 @@
   "_comment_protocol": "协议类型，固定 OneBot。Hyper 框架启动时硬索引此字段，改成其他值会启动失败。",
   "Others": {
     "project_name": "XcBot",
-    "version_name": "v3.7",
+    "version_name": "v4.0",
     "slogan": "✨ 忻城 ✨",
     "robot_name_triggers": [
       "忻城"
@@ -42,7 +42,7 @@
     "_comment_emoji_plus_one_cooldown_seconds": "表情 +1 的防抖时间，单位秒。",
     "poke_reply_enabled": true,
     "_comment_poke_reply_enabled": "是否开启拍一拍自动回复。",
-    "group_join_welcome_text": "欢迎 {at}{user_nickname} 加入{bot_name}的大家庭！\n经常 @{bot_name} 看看{bot_name}又学会做什么新事情啦~o((>ω< ))o\n祝你在{bot_name}的大家庭里生活愉快！♪(≧∀≦)ゞ☆",
+    "group_join_welcome_text": "{at}🎉 欢迎 {user_nickname} 加入本群！很高兴认识你～",
     "_comment_group_join_welcome_text": "新成员入群欢迎语正文。占位符：{at} @新成员、{user_nickname} 昵称、{user_id} QQ号、{group_id} 群号、{bot_name} 机器人名字；其他花括号原样保留。",
     "group_join_welcome_send_avatar": true,
     "_comment_group_join_welcome_send_avatar": "开启后发送欢迎消息时同时附上新成员头像图片；关闭后只发 @ + 欢迎语。",
@@ -50,18 +50,14 @@
     "_comment_poke_cooldown_seconds": "拍一拍回复防抖时间，单位秒。",
     "api_request_timeout_seconds": 120,
     "_comment_api_request_timeout_seconds": "LLM/API 请求超时时间，单位秒。",
-    "summary_per_day_limit": 2,
-    "_comment_summary_per_day_limit": "每个群每天允许总结的次数。",
     "summary_max_messages": 600,
     "_comment_summary_max_messages": "每次最多可总结多少条消息。",
     "context_max_messages": 60,
-    "_comment_context_max_messages": "单个会话最多保留多少条上下文消息。",
-    "compression_threshold": 40,
-    "_comment_compression_threshold": "消息达到多少条后，允许触发上下文压缩。",
+    "_comment_context_max_messages": "单个会话保留的完整对话轮数上限，超限裁旧；建议大于自动压缩触发轮数。",
     "compression_keep_recent": 20,
-    "_comment_compression_keep_recent": "压缩时保留最近多少条消息不压缩。",
+    "_comment_compression_keep_recent": "压缩时保留最近多少个完整对话轮次不压缩。",
     "auto_compress_after_messages": 44,
-    "_comment_auto_compress_after_messages": "自动压缩触发阈值。",
+    "_comment_auto_compress_after_messages": "自动压缩触发轮数，也是手动压缩最低准入轮数；复用对话模型及其轮换。",
     "system": {
       "log_retention_days": 7,
       "_comment_log_retention_days": "data/webui 下 runtime-*.log 的保留天数，超出的自动删除。",
@@ -70,9 +66,9 @@
     },
     "_comment_system": "系统设置：日志保留与追踪容量。",
     "weak_blacklist_trigger_probability": 0.3,
-    "_comment_weak_blacklist_trigger_probability": "弱黑名单用户被拦截/特殊处理的概率，0 到 1。",
+    "_comment_weak_blacklist_trigger_probability": "弱黑名单用户获准 AI 回复的概率，支持 0~1，也兼容 0~100；0 表示不回复，1 表示全部放行。作用于群聊和私聊 AI 回复，不影响命令和插件；群聊主动仅在引用他人消息时检查该作者，未引用或引用自己不套用用户弱名单。",
     "weak_blacklist_users": [],
-    "_comment_weak_blacklist_users": "弱黑名单用户列表。",
+    "_comment_weak_blacklist_users": "全局弱黑名单用户列表。限制这些用户的 AI 回复，不影响命令和插件；群聊主动仅在引用他人消息时检查该作者，未引用或引用自己不套用用户弱名单。",
     "group_random_reply_probability": 0.01,
     "_comment_group_random_reply_probability": "普通群消息下机器人概率触发对话的概率。支持 0~1，也兼容 0~100；填 0 表示关闭。",
     "group_random_reply_quote": true,
@@ -141,7 +137,7 @@
     "llm_split": {
       "enabled": true,
       "mode": "auto_prompt",
-      "prompt_suffix": "当你想回复第二句甚至更多句时，用 <split> 分隔符将两句话分开，以此类推，我会依次发送，但要保持多句话连贯。在用户要求（或你想）回复长段时不必遵守。",
+      "prompt_suffix": "当你想把一句话分段发送或有多句话想说时，请使用 <split> 作为分隔符将它们拆开（例如：第一部分<split>第二部分<split>第三部分），系统会依次发送，像真人在连续打字聊天一样。如果遇到用户要求长文，或需要输出大段解释、代码等情况，则直接整段输出，无需使用分隔符。",
       "split_regex": ".*?[。？！~。]+|.+$",
       "filter_regex": "\\n|\\r|<split>",
       "max_chars_no_split": 150
@@ -285,12 +281,57 @@
     "liquid_glass_refraction": 1,
     "card_background_blur": 3
   },
+  "ProactiveReply": {
+    "_comment": "主动回复：AI 在群里或私聊里沉默一段时间后主动开口。完全由 AI 判断要不要发，桥接只做闸门（黑白名单/空闲阈值/概率/熔断）。两边主动回复都默认关闭。黑白名单都为空仅表示不限制对象，不会开启主动回复。主动发言后可由 AI 每次自行选择等待多久再判断，无人说话不催发，普通一问一答不等这些计时。",
+    "group": {
+      "enabled": false,
+      "trigger_probability": 0.3,
+      "check_interval_seconds": 60,
+      "idle_threshold_seconds": 900,
+      "max_consecutive_bot_messages": 3,
+      "min_interval_between_proactive_seconds": 1800,
+      "whitelist": [],
+      "blacklist": [],
+      "_comment_observation": "普通回复或首次主动发言成功后，按 observation.trigger_probability（默认 0.5）决定是否开启观察；一轮观察只抽一次，与冷场概率独立。AI 自行选择等多久再判断；等待到期不代表必须发送，无人说话不催发，仍受原连发熔断限制。普通一问一答不等待这些计时。",
+      "observation": {
+        "enabled": true,
+        "trigger_probability": 0.5,
+        "default_wait_seconds": 60,
+        "min_wait_seconds": 10,
+        "max_wait_seconds": 600,
+        "debounce_seconds": 8,
+        "max_debounce_seconds": 20,
+        "min_continuation_interval_seconds": 30
+      }
+    },
+    "private": {
+      "enabled": false,
+      "trigger_probability": 0.1,
+      "check_interval_seconds": 120,
+      "idle_threshold_seconds": 43200,
+      "max_unanswered_messages": 3,
+      "min_interval_between_proactive_seconds": 86400,
+      "whitelist": [],
+      "blacklist": [],
+      "_comment_observation": "普通回复或首次主动发言成功后，按 observation.trigger_probability（默认 0.5）决定是否开启观察；一轮观察只抽一次，与冷场概率独立。AI 自行选择等多久再判断；等待到期不代表必须发送，无人说话不催发，仍受原未回复熔断限制。普通一问一答不等待这些计时。",
+      "observation": {
+        "enabled": true,
+        "trigger_probability": 0.5,
+        "default_wait_seconds": 60,
+        "min_wait_seconds": 10,
+        "max_wait_seconds": 600,
+        "debounce_seconds": 8,
+        "max_debounce_seconds": 20,
+        "min_continuation_interval_seconds": 30
+      }
+    }
+  },
   "FeatureSwitches": {
     "_comment": "功能热开关。可在 WebUI 中直接切换，保存后无需重启即可生效。",
     "ai_chat": true,
     "private_chat": true,
     "group_chat": true,
-    "group_chat_context": false,
+    "group_chat_context": true,
     "sensitive_filter": true,
     "plugin_admin_commands": true,
     "summary": true,

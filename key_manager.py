@@ -39,6 +39,7 @@ class SiliconFlowKeyManager:
 
     def set_endpoints(self, endpoints: List[Dict]):
         with self._lock:
+            previous_signature = self.rotation_signature()
             prev_current_identity = self._get_slot_identity(self._resolve_current_slot_pos())
             # start_index 是管理员用 /model 选定的轮询起点，必须和 current_index
             # 一样按身份还原。只还原 current_index 的话，保存一次配置就会让实际
@@ -67,7 +68,23 @@ class SiliconFlowKeyManager:
             # 反过来，在表尾追加模型不影响前面的位次，指定继续有效。
             restored_start = self._find_slot_pos_by_identity(prev_start_identity)
             self.start_index = restored_start if (restored_start is not None and restored_start == prev_start_pos) else 0
+            if previous_signature != self.rotation_signature():
+                self.start_index = self.current_index = 0
             self._ensure_slot_state()
+
+    def rotation_signature(self):
+        return tuple((str(ep.get("provider_id", "") or "").strip(),
+                      str(ep.get("model", "") or "").strip())
+                     for ep in self.endpoints if str(ep.get("model", "") or "").strip())
+
+    def exclude_model_slot(self, tried_keys, base_url, key, model, proxy=""):
+        """只排除本次请求的模型槽，不禁用模型或其它请求的 Key。"""
+        identity = self.make_attempt_identity(base_url, key, model, proxy)
+        with self._lock:
+            for slot in self.model_slots:
+                if any(self._attempt_identity(self.key_list[i]) == identity for i in slot["indices"]):
+                    tried_keys.update(self._attempt_identity(self.key_list[i]) for i in slot["indices"])
+                    return
 
     def _normalize_bool(self, value, default: bool = False) -> bool:
         if isinstance(value, bool):
@@ -298,7 +315,7 @@ class SiliconFlowKeyManager:
         if total <= 0:
             return []
         start = self.start_index if 0 <= self.start_index < total else 0
-        return [(start + offset) % total for offset in range(total)]
+        return [start] + [pos for pos in range(total) if pos != start]
 
     def _switch_current_slot(self, slot_pos: int, reason: str, manual: bool = False):
         total = len(self.model_slots)
@@ -344,6 +361,9 @@ class SiliconFlowKeyManager:
                 return None
             tried_keys = tried_keys or set()
             preferred_model = str(preferred_model or "").strip()
+            if preferred_model and not any(slot.get("display_model") == preferred_model for slot in self.model_slots):
+                if sum(slot.get("model") == preferred_model for slot in self.model_slots) > 1:
+                    preferred_model = ""
             if preferred_model:
                 for i, slot in enumerate(self.model_slots):
                     if preferred_model not in {slot.get("model"), slot.get("display_model")}:
@@ -372,6 +392,9 @@ class SiliconFlowKeyManager:
                                   allow_non_multimodal_fallback: bool = True) -> Optional[Tuple[str, str, str, bool, int, str, str, Dict]]:
         """优先从指定模型取一个可用 Key，不改变全局默认轮换起点。"""
         preferred_model = str(preferred_model or "").strip()
+        if preferred_model and not any(slot.get("display_model") == preferred_model for slot in self.model_slots):
+            if sum(slot.get("model") == preferred_model for slot in self.model_slots) > 1:
+                preferred_model = ""
         if not preferred_model:
             return self.get_next_for_request(
                 tried_keys=tried_keys,

@@ -52,6 +52,7 @@
       </a>
       <div class="nav-links" id="nav-links">
         <a href="#features">特性</a>
+        <a href="#proactive">主动聊天</a>
         <a href="#roleplay">角色扮演</a>
         <a href="#agent">Agent</a>
         <a href="#quickstart">快速开始</a>
@@ -75,7 +76,7 @@
       <div class="hero-copy reveal">
         <div class="eyebrow"><span></span> OPEN-SOURCE · AI QQ BOT</div>
         <h1>给你的 QQ<br><strong>一个有人格的灵魂</strong></h1>
-        <p class="hero-lead">XcBot 是一款开源 QQ 机器人。设定人格、扮演角色，用你喜欢的大模型自然对话；群聊私聊都能接住话题。需要时，它还能自己调用工具完成任务。</p>
+        <p class="hero-lead">XcBot 是一款开源 QQ 机器人。聊天不再只是一问一答：设定人格、扮演角色，用你喜欢的大模型自然对话；开启主动回复后，它会在群聊中主动接话、寻找话题、活跃气氛，在私聊中主动关心你、主动找你聊天；需要时也能自己调用工具完成任务。</p>
         <div class="hero-actions">
           <a class="button primary" href="guide.html#install">开始部署 <span>→</span></a>
           <a class="button secondary" href="https://github.com/Qzy327422/XcBot" target="_blank" rel="noreferrer">
@@ -106,6 +107,11 @@
         </div>
         <div class="floating-chip chip-a"><span>◆</span> 人格可自定义</div>
         <div class="floating-chip chip-b"><span>✓</span> 多模型切换</div>
+        <div class="proactive-chip reveal" aria-label="主动聊天示意（开启主动回复后）">
+          <div class="proactive-chip-head"><i></i> 主动聊天 <small>开启主动回复后</small></div>
+          <div class="proactive-chip-line"><span>观察中</span><p>正在听群里的新话题…</p></div>
+          <div class="proactive-chip-line"><span>想起了你</span><p>准备主动找你聊两句</p></div>
+        </div>
       </div>
     </section>
 
@@ -146,10 +152,36 @@
         <article class="feature-card accent-orange reveal">
           <span class="feature-no">04</span>
           <div class="feature-symbol">⌘</div>
-          <h3>Agent 工具调用<small class="tag-addon">附加</small></h3>
+          <h3>Agent 工具调用</h3>
           <p>需要时，AI 可自主联网搜索、调用插件、操作 QQ、读写文件，多步任务自动串联，全程可追踪。</p>
           <ul><li>自主决策</li><li>权限分级</li><li>可观测</li></ul>
         </article>
+      </div>
+    </section>
+
+    <section class="section shell proactive-section" id="proactive">
+      <div class="section-heading reveal">
+        <div><span class="kicker">PROACTIVE CHAT</span><h2>聊天不再是一问一答</h2></div>
+        <p>开启主动回复后，它会观察聊天节奏，自己寻找话题。群聊里接话活跃气氛，私聊里想起你就主动来关心你。</p>
+      </div>
+      <div class="proactive-layout">
+        <div class="proactive-copy reveal">
+          <div class="capability-list">
+            <div><span>01</span><p><strong>听上下文</strong><small>结合近期聊天与历史记忆，判断时机与话题</small></p></div>
+            <div><span>02</span><p><strong>自己找话题</strong><small>群里自然接话、冷场起个新话题，保持气氛不冷</small></p></div>
+            <div><span>03</span><p><strong>主动关心你</strong><small>私聊里记得你聊过的事，隔段时间来问候近况</small></p></div>
+            <div><span>04</span><p><strong>发完再判断</strong><small>每次发言后规划器决定继续观察、等待还是结束</small></p></div>
+          </div>
+        </div>
+        <div class="proactive-demo glass-card reveal">
+          <div class="proactive-demo-head"><i></i> 主动聊天 <small>群聊 · 示意</small></div>
+          <div class="proactive-flow">
+            <div class="proactive-step"><span>观察</span><p>群聊最近很安静…</p></div>
+            <div class="proactive-step"><span>找话题</span><p>昨天不是约好了今晚开黑？</p></div>
+            <div class="proactive-step"><span>再观察</span><p>有人接话就自然聊下去</p></div>
+          </div>
+          <div class="proactive-demo-foot"><span><i></i> 有冷却与防刷屏</span><span>开关与策略可在 WebUI 调整</span></div>
+        </div>
       </div>
     </section>
 
@@ -258,6 +290,7 @@
         <details><summary>XcBot 主要能做什么？<span>＋</span></summary><p>它是一个有人格、会角色扮演的 QQ 聊天机器人：可以自定义性格与说话风格，用多种大模型自然对话，群聊私聊都能用。此外还支持插件扩展和可选的 Agent 工具调用。</p></details>
         <details><summary>怎么设定人格 / 角色扮演？<span>＋</span></summary><p>在 WebUI 的人格设定里写一段描述，定义它的性格、语气和边界即可。多轮对话中它会尽量保持这个角色，聊起来更有代入感。</p></details>
         <details><summary>支持哪些大模型？<span>＋</span></summary><p>兼容 OpenAI 格式接口的模型都可以接入，例如 DeepSeek 等，可以配置多个并设置轮换。</p></details>
+        <details><summary>它会主动找我聊天吗？<span>＋</span></summary><p>可以。在 WebUI 开启「主动回复」并配置好策略后，它会观察聊天节奏、自己寻找话题：群聊里接话活跃气氛，私聊里想起你就主动来关心你。发言时机由规划器结合上下文判断，并受冷却与防刷屏限制，不会无条件刷屏。</p></details>
         <details><summary>必须开启 Agent 吗？<span>＋</span></summary><p>不需要。Agent 是附加能力，关掉也能正常聊天和角色扮演。需要联网搜索、操作 QQ、执行多步任务时再开启即可。</p></details>
         <details><summary>需要付费吗？<span>＋</span></summary><p>XcBot 本身开源免费。你只需要准备一个大模型接口（部分模型有免费额度），以及运行环境。</p></details>
       </div>

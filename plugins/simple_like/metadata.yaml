@@ -1,0 +1,14 @@
+name: simple_like
+version: 1.1.0
+description: 发送赞我给用户点赞
+author: Qzy327422
+entry: setup.py
+config_schema:
+  like_times:
+    type: int
+    label: 每次点赞次数
+    desc: 每次收到“赞我”时请求的点赞次数，1–10 次；当天剩余额度不足时按剩余额度发送，实际结果受 QQ 平台限制。
+    default: 10
+    min: 1
+    max: 10
+    step: 1

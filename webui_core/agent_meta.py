@@ -57,6 +57,18 @@ AGENT_TOOL_META = [
     {"key": "send_message", "title": "主动汇报消息", "level": "user", "default_enabled": True,
      "hidden": True, "group": "QQ 操作", "desc": "让 AI 在长任务中间汇报进度、或把长结果分批发到当前会话"},
 
+    # ---------- 会话社交：请求内候选/意图，由运行时 availability 再收窄 ----------
+    {"key": "list_visible_messages", "title": "查看可见消息", "level": "user", "default_enabled": True,
+     "hidden": True, "group": "会话社交", "desc": "只列出本次请求当前会话的消息摘要"},
+    {"key": "select_reply", "title": "选择引用消息", "level": "user", "default_enabled": True,
+     "hidden": True, "group": "会话社交", "desc": "为下一次发送选择一次性引用，不立即发送"},
+    {"key": "wait_for_messages", "title": "计划等待新消息", "level": "user", "default_enabled": True,
+     "hidden": True, "group": "会话社交", "desc": "仅主动观察且对应开关开启时记录等待意图"},
+    {"key": "finish_observation", "title": "结束主动观察", "level": "user", "default_enabled": True,
+     "hidden": True, "group": "会话社交", "desc": "仅结束本轮主动观察，不发送消息"},
+    {"key": "recall_own_message", "title": "撤回自己的消息", "level": "user", "default_enabled": True,
+     "hidden": True, "group": "会话社交", "desc": "对应主动回复开关开启时撤回本会话机器人 120 秒内的消息"},
+
     # ---------- 群管理：有真实且难撤销的副作用，保留独立开关 ----------
     {"key": "set_group_ban", "title": "禁言群成员", "level": "admin", "default_enabled": True,
      "group": "群管理", "desc": "禁言本群成员，最长 30 天"},

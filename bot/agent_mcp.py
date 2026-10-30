@@ -172,11 +172,14 @@ class MCPClient:
         self.session = await self._stack.enter_async_context(ClientSession(read_stream, write_stream))
         await self.session.initialize()
         listed = await self.session.list_tools()
+        from copy import deepcopy
+
         self.tools = [
             {
                 "name": str(t.name),
                 "description": str(getattr(t, "description", "") or ""),
                 "parameters": _normalize_schema(getattr(t, "inputSchema", None)),
+                "validation_parameters": deepcopy(getattr(t, "inputSchema", None)),
             }
             for t in (listed.tools or [])
         ]
@@ -207,16 +210,14 @@ class MCPClient:
 
 
 def _normalize_schema(schema) -> dict:
-    """把 MCP 的 inputSchema 归一化成 OpenAI tools 认的 parameters。"""
+    """只移除展示层 $schema；保留本地引用、组合与额外字段的完整语义。"""
+    from copy import deepcopy
+
     if not isinstance(schema, dict):
-        return {"type": "object", "properties": {}}
-    out = dict(schema)
-    out.setdefault("type", "object")
-    if not isinstance(out.get("properties"), dict):
-        out["properties"] = {}
-    # OpenAI 不认 $schema 之类的 JSON Schema 元字段，部分厂商会直接报错
-    for key in ("$schema", "additionalProperties", "definitions", "$defs"):
-        out.pop(key, None)
+        # 无效输入不能静默降级成开放对象，交给统一 schema 校验拒绝执行。
+        return {"type": "invalid-mcp-schema"}
+    out = deepcopy(schema)
+    out.pop("$schema", None)
     return out
 
 
@@ -317,6 +318,8 @@ async def refresh() -> dict:
                     description=f"[MCP:{name}] {item['description']}",
                     parameters=item["parameters"],
                     handler=_make_handler(name, item["name"]),
+                    filter_unknown_args=False,
+                    validation_parameters=item.get("validation_parameters", item["parameters"]),
                     # MCP 工具能力未知（可能读写文件、访问网络），统一按 admin 起步
                     level="admin",
                     untrusted_output=True,

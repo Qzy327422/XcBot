@@ -82,23 +82,20 @@ class TraceStore:
     # 相比每条一个 JSON 文件，SQLite 可在一次事务中批量写入，避免大量 fsync/小文件。
     DETAIL_DB_SUFFIX = "_details.sqlite3"
 
-    SYSTEM_PROMPT_MAX = 6000
-    TEXT_MAX = 4000
-    ERROR_MAX = 400
+    SYSTEM_PROMPT_MAX = None
+    TEXT_MAX = None
+    ERROR_MAX = None
     PREVIEW_MAX = 80
-    # 历史条目：条数与单条长度都比当前消息收得更紧。
-    # 详情改存 SQLite 后磁盘仍需控制单条体积；历史会让每条记录携带一份完整
-    # 上下文），而排查时看历史只需要知道大概说了什么，不需要全文。
+    # 详情正文保留全文；仍以历史/工具条数和总记录数控制保留规模。
     HISTORY_ITEMS_MAX = 30
-    HISTORY_TEXT_MAX = 1500
-    # Agent 工具调用明细：条数上限 + 单条参数/结果的截断长度。
-    # 30 轮循环每轮可能并发多个工具，不限条数会让单条记录膨胀。
+    HISTORY_TEXT_MAX = None
+    # Agent 工具调用明细仍限制条数，已保留条目的参数和结果不截断。
     TOOL_CALLS_MAX = 40
-    TOOL_ARGS_MAX = 1000
-    TOOL_RESULT_MAX = 2000
+    TOOL_ARGS_MAX = None
+    TOOL_RESULT_MAX = None
     # Follow-Up 注入明细（用户在 Agent 执行途中插的话）
     FOLLOW_UPS_MAX = 20
-    FOLLOW_UP_TEXT_MAX = 500
+    FOLLOW_UP_TEXT_MAX = None
 
     def __init__(self, path: Optional[Path] = None, max_records: Optional[int] = None):
         self.path = Path(path) if path else self.SAVE_PATH
@@ -331,9 +328,9 @@ class TraceStore:
     # ==================== 内部 ====================
 
     @staticmethod
-    def _clip(text: Any, limit: int) -> tuple[str, bool]:
+    def _clip(text: Any, limit: int | None) -> tuple[str, bool]:
         raw = str(text or "")
-        if len(raw) <= limit:
+        if limit is None or len(raw) <= limit:
             return raw, False
         return raw[:limit], True
 
@@ -494,6 +491,8 @@ class TraceStore:
             "duration_ms": int(record.get("duration_ms") or 0),
             "session_id": str(record.get("session_id") or ""),
             "context_type": str(record.get("context_type") or ""),
+            "source": str(record.get("source") or ""),
+            "stage": str(record.get("stage") or ""),
             "chat_id": str(chat_id) if chat_id is not None else "",
             "system_prompt": prompt_text,
             "prompt_chars": len(raw_prompt),
@@ -549,6 +548,8 @@ class TraceStore:
             "duration_ms": int(entry.get("duration_ms") or 0),
             "session_id": entry.get("session_id", ""),
             "context_type": entry.get("context_type", ""),
+            "source": entry.get("source", ""),
+            "stage": entry.get("stage", ""),
             "chat_id": entry.get("chat_id", ""),
             "model": entry.get("display_model") or entry.get("model") or "",
             "attempt_count": int(entry.get("attempt_count") or 0),

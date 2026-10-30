@@ -184,9 +184,20 @@ def run(pg, page_html: str, glass: bool) -> None:
     ok("滚动后 topbar 仍在视口内", tb <= 60, f"topbarY={tb}")
     pg.evaluate("window.scrollTo(0,0)")
 
+    status_above = pg.evaluate("""()=>{const s=document.getElementById('saveState'),t=document.querySelector('.toolbar');
+      return !t.contains(s)&&s.getBoundingClientRect().bottom<=t.getBoundingClientRect().top+1}""")
+    ok("同步状态位于按钮行上方", status_above)
+    ok("同步状态与标题同行", pg.evaluate("""()=>{const s=document.getElementById('saveState').getBoundingClientRect(),
+      t=document.querySelector('.title').getBoundingClientRect();return s.top<t.bottom&&s.bottom>t.top}"""))
+    # 工具条两端都能到达，不能用 end 对齐把左端挤到不可滚回的负坐标。
+    pg.evaluate("document.querySelector('.toolbar').scrollLeft=0")
+    first_visible = pg.evaluate("""()=>{const t=document.querySelector('.toolbar');
+      const b=t.firstElementChild.getBoundingClientRect(),r=t.getBoundingClientRect();
+      return b.left>=r.left-1&&b.right<=r.right+1}""")
+    ok("工具条起点可见", first_visible)
+    ok("窄屏工具条有横向滚动范围", pg.evaluate("document.querySelector('.toolbar').scrollWidth>document.querySelector('.toolbar').clientWidth"))
     # 工具条：「保存设置」必须能滑到（横向可滚），且按钮不被压成两行。
-    # 用垂直中心比对而不是 top —— saveState 是 32px 的 pill，按钮是 42px，
-    # align-items:center 下同一行的 top 本来就不同。
+    # 用垂直中心比较，确认所有操作按钮仍在同一行。
     tbar = pg.evaluate("""()=>{const t=document.querySelector('.toolbar');
       const btn=[...t.querySelectorAll('button')].pop();
       const mids=[...t.children].map(c=>{const r=c.getBoundingClientRect();return Math.round(r.top+r.height/2)});
@@ -216,6 +227,12 @@ def run(pg, page_html: str, glass: bool) -> None:
        pg.evaluate("document.documentElement.scrollWidth - innerWidth") <= 1)
     ok("桌面正文与侧栏并排",
        pg.evaluate("()=>{const s=document.querySelector('.sidebar').getBoundingClientRect();const m=document.querySelector('.main').getBoundingClientRect();return m.x>=s.right-1}"))
+
+    for width in (981, 1440):
+        pg.set_viewport_size({"width": width, "height": 900})
+        same_row = pg.evaluate("""()=>{const a=document.getElementById('saveState').getBoundingClientRect(),
+          b=document.querySelector('.toolbar').getBoundingClientRect();return Math.abs(a.top+a.height/2-b.top-b.height/2)<2}""")
+        ok(f"{width}px 同步状态与按钮保持同排", same_row)
 
     # 放宽窗口时残留的 nav-open 必须被清掉
     pg.set_viewport_size({"width": 390, "height": 844})
