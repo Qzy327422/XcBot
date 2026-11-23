@@ -94,7 +94,10 @@ def environment():
     blacklist = set()
     env = {
         "asyncio": asyncio, "time": time, "random": random, "json": json, "re": re,
-        "urllib": urllib, "OrderedDict": OrderedDict, "threading": threading,
+        "urllib": urllib, "OrderedDict": OrderedDict,
+        "threading": types.SimpleNamespace(RLock=threading.RLock, Lock=threading.Lock,
+                                             Thread=Mock()),
+        "_proactive_bootstrap_connection": Mock(),
         "CURRENT_REQUEST": CURRENT_REQUEST, "ReplyDecision": ReplyDecision,
         "ReplySuppressed": ReplySuppressed, "RequestState": RequestState, "bind_request": bind_request,
         "INDEX": MessageIndex(), "Events": types.SimpleNamespace(Event=Event, GroupMessageEvent=GroupMessageEvent,
@@ -156,7 +159,8 @@ class PolicyTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(state.handled)
                     if isinstance(event, (GroupMessageEvent, PrivateMessageEvent)):
                         complete.assert_called_once_with(state.is_group, state.chat_id,
-                            normal_handled=True, message_id="10", ticket=ticket, reply_sent=False)
+                            normal_handled=True, message_id="10", ticket=ticket,
+                            reply_sent=False, account_id=state.self_id)
                         self.assertIsNotNone(env["INDEX"].resolve(*state.key, 10))
                         env["log_receive_group" if state.is_group else "log_receive_private"].assert_called_once()
                     self.assertIsNone(CURRENT_REQUEST.get())
@@ -520,7 +524,10 @@ class PolicyTests(unittest.IsolatedAsyncioTestCase):
         state.pending_reply = "42"
         with bind_request(state), patch.object(proactive_reply, "cancel_observations") as cancel:
             env["clear_current_qq_actions"]()
-        cancel.assert_called_once_with("disconnect")
+        cancel.assert_called_once()
+        self.assertEqual(cancel.call_args.args, ("disconnect",))
+        guard = cancel.call_args.kwargs.get("guard")
+        self.assertTrue(callable(guard) and guard())
         self.assertIsNone(state.social)
         self.assertIsNone(state.pending_reply)
         self.assertIsNone(env["_current_qq_actions"])
@@ -677,8 +684,51 @@ class PolicyTests(unittest.IsolatedAsyncioTestCase):
         sent = [call.kwargs["message"].contents for call in actions.send.await_args_list]
         self.assertEqual(sent[0][0].id, "42")
         self.assertIsInstance(sent[1][0], Text)
-        self.assertEqual(sent[2][0].id, "10")
+        self.assertIsInstance(sent[2][0], Text)
         self.assertIsNone(state.social.quote_id)
+
+    async def test_reply_quote_switch_controls_single_and_split_automatic_quotes(self):
+        from bot import proactive_reply
+        env, _, _, _ = environment()
+        extract({"process_and_send"}, env)
+        event = GroupMessageEvent()
+        for enabled in (False, True):
+            for content in ("单段", "第一段<split>第二段"):
+                with self.subTest(enabled=enabled, content=content):
+                    actions = types.SimpleNamespace(send=AsyncMock(return_value={
+                        "status": "ok", "retcode": 0, "data": {"message_id": 90}}))
+                    state = state_for(event, actions=actions)
+                    env.update(build_final_send_parts=lambda value: value.split("<split>"),
+                               find_llm_reply_failover_keyword=lambda value: "",
+                               is_split_reply_quote_enabled=lambda value: enabled,
+                               attach_trace_send=Mock(return_value=True),
+                               asyncio=types.SimpleNamespace(sleep=AsyncMock()))
+                    with bind_request(state), patch.object(proactive_reply, "notify_bot_message_sent"):
+                        await env["process_and_send"](actions, event, content, True, reply_to_first=True)
+                    sent = [call.kwargs["message"].contents for call in actions.send.await_args_list]
+                    if enabled:
+                        self.assertEqual(sent[0][0].id, "10")
+                    else:
+                        self.assertIsInstance(sent[0][0], Text)
+                    for part in sent[1:]:
+                        self.assertIsInstance(part[0], Text)
+
+    async def test_split_reply_does_not_override_caller_random_quote_policy(self):
+        from bot import proactive_reply
+        env, _, _, _ = environment()
+        extract({"process_and_send"}, env)
+        event = GroupMessageEvent()
+        actions = types.SimpleNamespace(send=AsyncMock(return_value={
+            "status": "ok", "retcode": 0, "data": {"message_id": 90}}))
+        env.update(build_final_send_parts=lambda value: value.split("<split>"),
+                   find_llm_reply_failover_keyword=lambda value: "",
+                   is_split_reply_quote_enabled=lambda value: True,
+                   attach_trace_send=Mock(return_value=True),
+                   asyncio=types.SimpleNamespace(sleep=AsyncMock()))
+        with bind_request(state_for(event, actions=actions)), patch.object(proactive_reply, "notify_bot_message_sent"):
+            await env["process_and_send"](actions, event, "第一段<split>第二段", True, reply_to_first=False)
+        for call in actions.send.await_args_list:
+            self.assertIsInstance(call.kwargs["message"].contents[0], Text)
 
     async def test_send_message_validates_explicit_candidate_then_consumes_for_final(self):
         from bot.social_tools import SocialContext
@@ -746,8 +796,8 @@ class PolicyTests(unittest.IsolatedAsyncioTestCase):
                 async def planner(cid, cfg):
                     return False
                 scheduler = proactive.ProactiveReplyScheduler(lambda: {"private": {"enabled": True,
-                    "observation": {"trigger_probability": 1}}, "group": {"enabled": True,
-                    "observation": {"trigger_probability": 1}}}, planner, planner, logs.append)
+                    "observation": {"enabled": True, "trigger_probability": 1}}, "group": {"enabled": True,
+                    "observation": {"enabled": True, "trigger_probability": 1}}}, planner, planner, logs.append)
                 async def send(**kwargs):
                     sends.append(kwargs)
                     if case == "send_error":
@@ -900,7 +950,8 @@ class GroupContextBlacklistTests(unittest.TestCase):
         from bot.group_chat_context import format_group_message, format_history_block
         self.env.update(group_chat_context=self.manager, is_group_chat_context_enabled=lambda: True,
                         get_group_chat_context_max_messages=lambda: 30,
-                        format_group_message=format_group_message, format_history_block=format_history_block)
+                        format_group_message=format_group_message, format_history_block=format_history_block,
+                        extract_image_urls_from_message=lambda message: [])
 
     def test_dynamic_tail_and_reserve_rollback_preserve_author_and_string_contract(self):
         self.manager.record("3", "旧作者正文", author_id="8")

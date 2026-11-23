@@ -17,11 +17,11 @@ FEATURE_META = [
     {"key": "group_chat", "title": "群聊响应", "desc": "群聊所有响应总开关，含命令、插件、AI、拍一拍、入群欢迎及主动观察；关闭后只能从 WebUI 恢复", "group": "对话"},
     {"key": "sensitive_filter", "title": "屏蔽词过滤", "desc": "只对用户发给机器人的消息执行屏蔽词替换", "group": "对话"},
     {"key": "plugin_admin_commands", "title": "插件/模型命令", "desc": "允许使用 /插件视角、/model、/重载插件 等命令", "group": "功能配置"},
-    {"key": "group_chat_context", "title": "群聊上下文感知", "desc": "旁听群消息，触发 AI 时注入上次回复后的群聊内容；默认开启，会增加上下文用量", "group": "功能配置"},
+    {"key": "group_chat_context", "title": "群聊上下文感知", "desc": "旁听群消息，触发 AI 时注入近期群聊内容及最新 1 张旁听图；实际触发图随历史保留，压缩后删除旧图。默认开启，会增加上下文用量", "group": "功能配置"},
     {"key": "summary", "title": "群聊总结", "desc": "总结群聊记录与数据看板", "group": "功能配置"},
     {"key": "compression_commands", "title": "允许手动压缩命令", "desc": "允许使用手动压缩及压缩管理命令；不影响 AI 配置中的自动压缩", "group": "功能配置"},
     {"key": "emoji_plus_one", "title": "表情 +1", "desc": "单个表情自动复读", "group": "功能配置"},
-    {"key": "split_reply_quote", "title": "分段首段引用", "desc": "开启后：仅多段回复默认首段引用发送者消息", "group": "功能配置"},
+    {"key": "split_reply_quote", "title": "回复时引用", "desc": "普通 AI 回复时自动引用触发消息，多段仅首段引用；不影响读取用户引用或主动发言自主选择引用", "group": "功能配置"},
     {"key": "weak_blacklist", "title": "弱黑名单", "desc": "按概率拦截触发", "group": "功能配置"},
     {"key": "poke_reply", "title": "拍一拍回复", "desc": "收到拍一拍时自动回复", "group": "功能配置"},
     {"key": "group_join_welcome", "title": "入群欢迎", "desc": "新成员入群时发送 @ + 欢迎语，可选同时发送头像图片；欢迎语和发图开关在下方自定义", "group": "功能配置"},
@@ -33,11 +33,26 @@ FEATURE_META = [
     {"key": "http_send_api", "title": "HTTP 消息发送", "desc": "允许外部程序/插件通过 POST /api/send 推送 QQ 消息，需先设置 WebUI 访问 Token", "group": "外部接口"},
 ]
 
+def clamp_compression_trigger_rounds(trigger, max_rounds=None):
+    """自动压缩触发轮数必须小于最大上下文轮数（max_rounds > 1 时），避免先被截断而永远压不到。"""
+    val = max(1, int(trigger))
+    if max_rounds is not None:
+        try:
+            cap = int(max_rounds)
+        except (TypeError, ValueError):
+            cap = 0
+        if cap > 1 and val >= cap:
+            return cap - 1
+    return val
+
+
 def compression_trigger_rounds(others):
     """旧双阈值取较大值；保存规范配置后只保留 auto_compress_after_messages。"""
     trigger = max(1, int(others.get("auto_compress_after_messages", 40)))
     if "compression_threshold" in others:
         trigger = max(trigger, int(others["compression_threshold"]))
+    if "context_max_messages" in others:
+        trigger = clamp_compression_trigger_rounds(trigger, others.get("context_max_messages"))
     return trigger
 
 

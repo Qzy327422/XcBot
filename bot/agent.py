@@ -67,6 +67,8 @@ class FollowUpTicket:
     # 插话时带的图片（原始 URL / data URL）。不能塞进 tool 消息——OpenAI 协议
     # 只允许 user 消息携带 image_url，所以这些图会在注入时单独拼成一条 user 消息。
     image_urls: list = field(default_factory=list)
+    # 元素为 frozen ImageSource；不借用入队调用方的可变字典或请求状态。
+    image_sources: tuple = ()
 
 FOLLOW_UP_NOTICE_TEMPLATE = (
     "\n\n[SYSTEM NOTICE] User sent follow-up messages while tool execution "
@@ -165,6 +167,14 @@ def _append_request_user_message(messages: list[dict], ctx: AgentContext, conten
     ctx.extra.setdefault("request_user_messages", []).append(message)
 
 
+class FollowUpImages(list):
+    """保持旧 URL 列表接口，同时携带不随索引淘汰的冻结来源。"""
+
+    def __init__(self):
+        super().__init__()
+        self.sources = ()
+
+
 async def _resolve_follow_up_image_blocks(ctx: AgentContext, urls: list[str]) -> list[dict]:
     """把插话里的图片 URL 变成能塞进 user 消息的内容块。
 
@@ -172,6 +182,7 @@ async def _resolve_follow_up_image_blocks(ctx: AgentContext, urls: list[str]) ->
     这些依赖在 main.py，所以由它注册一个 builder 到 ctx.extra。这里只负责
     调用并兜底——图片处理失败绝不能把整条插话丢掉，文字部分照常注入。
     """
+    sources = tuple(getattr(urls, "sources", ()))
     urls = [str(u).strip() for u in (urls or []) if str(u).strip()]
     if not urls:
         return []

@@ -125,7 +125,12 @@ _connection_status = {
 from webui_core.resources import format_uptime as _format_uptime
 from webui_core.resources import get_resource_usage as _get_resource_usage
 
-from webui_core.features import DEFAULT_FEATURE_SWITCHES, FEATURE_META as _FEATURE_META, compression_trigger_rounds
+from webui_core.features import (
+    DEFAULT_FEATURE_SWITCHES,
+    FEATURE_META as _FEATURE_META,
+    clamp_compression_trigger_rounds,
+    compression_trigger_rounds,
+)
 from webui_core.agent_meta import (
     AGENT_TOOL_META, AGENT_TOOL_GROUPS,
     visible_tools, card_members, configurable_keys,
@@ -354,24 +359,57 @@ from bot.llm_config import sync_provider_config
 from bot.reasoning import split_model_output as split_reasoning_output
 from bot.reasoning import ThinkStreamSplitter
 
+_PERSONA_PRESET_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _stable_preset_id(seed: str, ordinal: int = 0) -> str:
+    """从原始 id/名称派生稳定 id。
+
+    绝不用列表长度或“当前序号”做身份：删掉前面的预设后，后面的生活不能
+    被另一个预设继承。同一个 seed 永远得到同一个 id；完全同名的重复项才按
+    出现顺序追加序号。
+    """
+    clean = re.sub(r"[^A-Za-z0-9_-]", "", str(seed or ""))[:40]
+    base = clean or ("preset_" + hashlib.sha256(str(seed or "").encode("utf-8")).hexdigest()[:10])
+    return base if not ordinal else f"{base}_{ordinal + 1}"
+
+
 def sync_personality_presets(others: Dict[str, Any]) -> None:
+    """归一化人格预设，但**不改已有合法 id**。
+
+    - 合法且不重复的 id 原样保留，无关保存不会重编号、不会串生活。
+    - 非法 id 按原始字符串派生稳定 id；重复 id 只给后出现的那条派生新 id，
+      第一条保持不动。派生只依赖原始 id/名称，不依赖当前列表长度。
+    - active/private/group 的“空串=跟随默认”语义保持不变。
+    """
     prompt = str(others.get("personality_prompt", "") or "")
     presets = others.get("personality_presets", [])
     if not isinstance(presets, list) or not presets:
         presets = [{"id": "default", "name": "默认", "prompt": prompt}]
     normalized = []
     seen = set()
+    duplicate_ordinals: Dict[str, int] = {}
     for item in presets:
         if not isinstance(item, dict):
             continue
-        pid = re.sub(r"[^a-zA-Z0-9_-]", "", str(item.get("id", "") or "").strip()) or f"preset{len(normalized)+1}"
-        if pid in seen:
-            pid = f"{pid}_{len(normalized)+1}"
+        raw_id = str(item.get("id", "") or "").strip()
+        name = str(item.get("name", "") or "").strip()
+        body = str(item.get("prompt", "") or "")
+        pid = raw_id if _PERSONA_PRESET_ID_RE.match(raw_id) and raw_id not in seen else ""
+        if not pid:
+            seed = raw_id or name or "preset"
+            ordinal = duplicate_ordinals.get(seed, 0)
+            duplicate_ordinals[seed] = ordinal + 1
+            pid = _stable_preset_id(seed, ordinal)
+            while pid in seen:
+                ordinal += 1
+                duplicate_ordinals[seed] = ordinal + 1
+                pid = _stable_preset_id(seed, ordinal)
         seen.add(pid)
         normalized.append({
             "id": pid,
-            "name": str(item.get("name", "") or pid).strip() or pid,
-            "prompt": str(item.get("prompt", "") or ""),
+            "name": name or raw_id or pid,
+            "prompt": body,
         })
     ids = {x["id"] for x in normalized}
     active = str(others.get("active_personality_preset", "") or "").strip()
@@ -1560,6 +1598,9 @@ def reload_mcp_servers() -> str:
 def collect_config_bundle() -> Dict[str, Any]:
     cfg = read_json(CONFIG_PATH, {})
     features = dict(DEFAULT_FEATURE_SWITCHES)
+    legacy_quote = cfg.get("split_reply_quote", {})
+    if isinstance(legacy_quote, dict) and "default_enabled" in legacy_quote:
+        features["split_reply_quote"] = normalize_bool_config(legacy_quote["default_enabled"], default=True)
     raw_features = cfg.get("FeatureSwitches", {})
     if isinstance(raw_features, dict):
         for key in list(features.keys()):
@@ -1685,6 +1726,725 @@ def _validate_proactive_config(raw) -> None:
             # QQ 号列表及 observation 跨字段约束由真实 normalize_config 校验并归一化。
 
 
+# ==================== 角色生活（运行时由 main 注册） ====================
+# webui 不 import main，也不自己启动生活引擎。main 绑定账号后调用
+# set_role_life_runtime(...) 注入一组可调用对象；独立 WebUI 没有注入时
+# 页面必须显示“只读/待连接”，不能假装生成成功。
+_role_life_runtime: Any = None
+_role_life_runtime_lock = threading.Lock()
+
+ROLE_LIFE_ACTIONS = frozenset({
+    "enqueue", "retry", "regenerate_plan", "clear",
+    "upsert_plan_item", "delete_plan_item", "trigger_activity",
+    "update_experience", "delete_experience", "add_life_note", "delete_life_note",
+})
+ROLE_LIFE_JOB_KINDS = frozenset({"plan", "activity", "diary", "dream", "maintenance"})
+_ROLE_LIFE_ACCOUNT_RE = re.compile(r"^(?:global|[1-9][0-9]{0,19})$")
+_ROLE_LIFE_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_local_role_life_engine = None
+_local_role_life_lock = threading.Lock()
+
+
+class RoleLifeUnavailableError(Exception):
+    """临时读取失败（运行时/磁盘）：可重试，不代表数据损坏。"""
+
+
+def set_role_life_runtime(runtime) -> None:
+    """main 启动时注入；退出时传 None。"""
+    global _role_life_runtime
+    with _role_life_runtime_lock:
+        _role_life_runtime = runtime if runtime else None
+
+
+def get_role_life_runtime():
+    with _role_life_runtime_lock:
+        return _role_life_runtime
+
+
+def _get_local_role_life_runtime() -> Dict[str, Any]:
+    """独立 WebUI 模式下使用的本地 RoleLife 运行时：支持直接读写本地生活档案与手动管理。"""
+    global _local_role_life_engine
+    rl_mod = _role_life_module()
+    from bot.role_life_store import (
+        GLOBAL_ACCOUNT,
+        GLOBAL_ROLE,
+        RoleLifeConflict,
+        RoleLifeCorruptError,
+        RoleLifeStore,
+        migrate_legacy_global_state,
+    )
+
+    from bot import role_life_store as _rls
+    data_dir_key = str(getattr(_rls, "DATA_DIR", ""))
+    with _local_role_life_lock:
+        if (_local_role_life_engine is None
+                or getattr(_local_role_life_engine, "_webui_data_dir", None) != data_dir_key):
+            store = RoleLifeStore()
+            try:
+                migrate_legacy_global_state(store)
+            except Exception:
+                pass
+
+            def _cfg_getter():
+                raw = read_json(CONFIG_PATH, {})
+                return _role_life_section_from_config(raw if isinstance(raw, dict) else {})
+
+            def _others_getter():
+                raw = read_json(CONFIG_PATH, {})
+                others = raw.get("Others") if isinstance(raw, dict) else {}
+                return others if isinstance(others, dict) else {}
+
+            def _bot_name_getter():
+                others = _others_getter()
+                return str(others.get("bot_name") or "")
+
+            async def _noop_generate(_job, _reserve):
+                return None
+
+            eng = rl_mod.RoleLifeEngine(
+                store,
+                config_getter=_cfg_getter,
+                persona_getter=_others_getter,
+                bot_name=_bot_name_getter,
+                generate=_noop_generate,
+            )
+            eng.bind_account(GLOBAL_ACCOUNT, 1)
+            eng._webui_data_dir = data_dir_key
+            _local_role_life_engine = eng
+        engine = _local_role_life_engine
+
+    def _crud_error(exc: Exception, *, job: bool = False) -> Dict[str, Any]:
+        msg = str(exc)[:200]
+        if isinstance(exc, ValueError):
+            err_type = "validation"
+        elif isinstance(exc, RoleLifeConflict):
+            err_type = "conflict"
+            if not msg or msg.isascii():
+                msg = "页面状态已更新，请刷新后重试"
+        elif isinstance(exc, (OSError, RoleLifeCorruptError)):
+            err_type = "storage"
+        else:
+            err_type = "storage"
+        base: Dict[str, Any] = {"job_id": None} if job else {"ok": False}
+        base.update({"error": msg, "error_type": err_type})
+        return base
+
+    def _need_main(*_a, **_kw) -> Dict[str, Any]:
+        return {
+            "job_id": None,
+            "error": "当前仅启动了 WebUI，请先启动主程序后再触发模型生成",
+            "error_type": "unavailable",
+        }
+
+    def status(account: str = GLOBAL_ACCOUNT, role_id: str = GLOBAL_ROLE) -> Dict[str, Any]:
+        return engine.status(GLOBAL_ACCOUNT, GLOBAL_ROLE)
+
+    def records(account: str = GLOBAL_ACCOUNT, role_id: str = GLOBAL_ROLE,
+                kind: str = "experiences", page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        return engine.list_records(GLOBAL_ACCOUNT, GLOBAL_ROLE, str(kind),
+                                   page=int(page or 1), page_size=int(page_size or 20))
+
+    def accounts() -> Dict[str, Any]:
+        return {"current": GLOBAL_ACCOUNT, "known": [GLOBAL_ACCOUNT],
+                "roles": {GLOBAL_ACCOUNT: [GLOBAL_ROLE]}}
+
+    def clear(account, role_id, request_id, expected_revision, expected_epoch,
+              expected_state_version, allow_corrupt: bool = False) -> Dict[str, Any]:
+        try:
+            ok = engine.clear_role(
+                GLOBAL_ACCOUNT, GLOBAL_ROLE, request_id=str(request_id or ""),
+                expected_revision=str(expected_revision or ""),
+                expected_epoch=None if expected_epoch is None else int(expected_epoch),
+                expected_state_version=None if expected_state_version is None else int(expected_state_version),
+                allow_corrupt=bool(allow_corrupt),
+            )
+            return {"ok": bool(ok), "error": "" if ok else "未能清空：页面状态已更新，请刷新后重试"}
+        except Exception as exc:
+            return _crud_error(exc)
+
+    def upsert_plan_item(account, role_id, params, request_id, expected_revision,
+                         expected_epoch, expected_state_version) -> Dict[str, Any]:
+        p = params if isinstance(params, dict) else {}
+        try:
+            item = engine.upsert_plan_item(
+                GLOBAL_ACCOUNT, GLOBAL_ROLE,
+                item_id=str(p.get("item_id") or ""),
+                title=str(p.get("title") or ""),
+                purpose=str(p.get("purpose") or ""),
+                start_hhmm=str(p.get("start") or ""),
+                end_hhmm=str(p.get("end") or ""),
+                date=str(p.get("date") or ""),
+                request_id=str(request_id or ""),
+                expected_revision=str(expected_revision or ""),
+                expected_epoch=None if expected_epoch is None else int(expected_epoch),
+                expected_state_version=None if expected_state_version is None else int(expected_state_version),
+            )
+            return {"ok": True, "item": item}
+        except Exception as exc:
+            return _crud_error(exc)
+
+    def delete_plan_item(account, role_id, item_id, request_id, expected_revision,
+                         expected_epoch, expected_state_version) -> Dict[str, Any]:
+        try:
+            ok = engine.delete_plan_item(
+                GLOBAL_ACCOUNT, GLOBAL_ROLE, item_id=str(item_id or ""),
+                request_id=str(request_id or ""),
+                expected_revision=str(expected_revision or ""),
+                expected_epoch=None if expected_epoch is None else int(expected_epoch),
+                expected_state_version=None if expected_state_version is None else int(expected_state_version),
+            )
+            return {"ok": bool(ok), "error": "" if ok else "删除失败"}
+        except Exception as exc:
+            return _crud_error(exc)
+
+    def update_experience(account, role_id, params, request_id, expected_revision,
+                          expected_epoch, expected_state_version) -> Dict[str, Any]:
+        p = params if isinstance(params, dict) else {}
+        try:
+            exp = engine.update_experience(
+                GLOBAL_ACCOUNT, GLOBAL_ROLE,
+                experience_id=str(p.get("experience_id") or ""),
+                plan_item_id=str(p.get("plan_item_id") or ""),
+                text=str(p.get("text") or ""),
+                request_id=str(request_id or ""),
+                expected_revision=str(expected_revision or ""),
+                expected_epoch=None if expected_epoch is None else int(expected_epoch),
+                expected_state_version=None if expected_state_version is None else int(expected_state_version),
+            )
+            return {"ok": True, "experience": exp}
+        except Exception as exc:
+            return _crud_error(exc)
+
+    def delete_experience(account, role_id, experience_id, request_id, expected_revision,
+                          expected_epoch, expected_state_version) -> Dict[str, Any]:
+        try:
+            ok = engine.delete_experience(
+                GLOBAL_ACCOUNT, GLOBAL_ROLE, experience_id=str(experience_id or ""),
+                request_id=str(request_id or ""),
+                expected_revision=str(expected_revision or ""),
+                expected_epoch=None if expected_epoch is None else int(expected_epoch),
+                expected_state_version=None if expected_state_version is None else int(expected_state_version),
+            )
+            return {"ok": bool(ok), "error": "" if ok else "删除失败"}
+        except Exception as exc:
+            return _crud_error(exc)
+
+    def add_life_note(account, role_id, text, request_id, expected_revision,
+                      expected_epoch, expected_state_version) -> Dict[str, Any]:
+        try:
+            note = engine.add_life_note(
+                GLOBAL_ACCOUNT, GLOBAL_ROLE, str(text or ""), source="manual",
+                request_id=str(request_id or ""),
+                expected_revision=str(expected_revision or ""),
+                expected_epoch=None if expected_epoch is None else int(expected_epoch),
+                expected_state_version=None if expected_state_version is None else int(expected_state_version),
+            )
+            return {"ok": True, "note": note}
+        except Exception as exc:
+            return _crud_error(exc)
+
+    def delete_life_note(account, role_id, note_id, request_id, expected_revision,
+                         expected_epoch, expected_state_version) -> Dict[str, Any]:
+        try:
+            ok = engine.delete_life_note(
+                GLOBAL_ACCOUNT, GLOBAL_ROLE, note_id=str(note_id or ""),
+                request_id=str(request_id or ""),
+                expected_revision=str(expected_revision or ""),
+                expected_epoch=None if expected_epoch is None else int(expected_epoch),
+                expected_state_version=None if expected_state_version is None else int(expected_state_version),
+            )
+            return {"ok": bool(ok), "error": "" if ok else "删除失败"}
+        except Exception as exc:
+            return _crud_error(exc)
+
+    return {
+        "status": status, "records": records, "accounts": accounts,
+        "connected": lambda: True,
+        "clear": clear,
+        "upsert_plan_item": upsert_plan_item,
+        "delete_plan_item": delete_plan_item,
+        "update_experience": update_experience,
+        "delete_experience": delete_experience,
+        "add_life_note": add_life_note,
+        "delete_life_note": delete_life_note,
+        "enqueue": _need_main,
+        "retry": _need_main,
+        "regenerate_plan": _need_main,
+        "trigger_activity": _need_main,
+    }
+
+
+def _effective_role_life_runtime() -> Tuple[Any, bool]:
+    """优先主程序运行时；未启动主程序时降级到本地只/写存储引擎。"""
+    rt = get_role_life_runtime()
+    if rt is not None:
+        return rt, True
+    return _get_local_role_life_runtime(), False
+
+
+def _role_life_call(runtime, name: str, *args, **kwargs):
+    if runtime is None:
+        raise RuntimeError("角色生活运行时未连接")
+    if isinstance(runtime, dict):
+        fn = runtime.get(name)
+    else:
+        fn = getattr(runtime, name, None)
+    if not callable(fn):
+        raise RuntimeError(f"角色生活运行时不支持 {name}")
+    return fn(*args, **kwargs)
+
+
+def _role_life_enqueue_call(runtime, account, role_id, kind, request_id,
+                            revision, epoch, state_version, args):
+    """单一最终契约：`enqueue(..., args=None)`（main 的闭包已固定该签名）。"""
+    if runtime is None:
+        raise RuntimeError("角色生活运行时未连接")
+    target = runtime.get("enqueue") if isinstance(runtime, dict) else getattr(runtime, "enqueue", None)
+    if not callable(target):
+        raise RuntimeError("角色生活运行时不支持 enqueue")
+    return target(account, role_id, kind, request_id, revision, epoch,
+                  state_version, args=args)
+
+
+def _role_life_module():
+    from bot import role_life as module
+    return module
+
+
+def _role_life_section_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    raw = cfg.get("RoleLife") if isinstance(cfg, dict) else None
+    rl_mod = _role_life_module()
+    try:
+        return rl_mod.resolve_global_config(raw)
+    except Exception:
+        return copy.deepcopy(getattr(rl_mod, "DEFAULT_ROLE_CONFIG", {}))
+
+
+def _role_life_active_persona_name(cfg: Dict[str, Any]) -> str:
+    """返回当前生效的人格显示名，供角色生活顶栏展示。"""
+    others = cfg.get("Others") if isinstance(cfg, dict) else {}
+    if not isinstance(others, dict):
+        return "默认人设"
+    active_id = str(others.get("active_personality_preset") or "").strip()
+    presets = others.get("personality_presets", [])
+    if active_id and isinstance(presets, list):
+        for item in presets:
+            if isinstance(item, dict) and str(item.get("id") or "").strip() == active_id:
+                name = str(item.get("name") or "").strip()
+                if name:
+                    return name
+    bot_disp = str(others.get("bot_name") or "").strip()
+    return bot_disp or "默认人设"
+
+
+def collect_role_life_presets(cfg: Dict[str, Any]) -> list[Dict[str, str]]:
+    """可选人格：只下发 id 与显示名，不下发人设正文。"""
+    others = cfg.get("Others") if isinstance(cfg, dict) else {}
+    presets = others.get("personality_presets", []) if isinstance(others, dict) else []
+    out: list[Dict[str, str]] = []
+    seen = set()
+    for item in presets if isinstance(presets, list) else []:
+        if not isinstance(item, dict):
+            continue
+        pid = str(item.get("id", "") or "").strip()
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        out.append({"id": pid, "name": str(item.get("name", "") or pid)})
+    return out
+
+
+def collect_enabled_chat_models(cfg: Dict[str, Any]) -> list[Dict[str, str]]:
+    """沿用已配置的对话模型（提供商/模型），供“生活模型”下拉选择。"""
+    others = cfg.get("Others") if isinstance(cfg, dict) else {}
+    providers = others.get("llm_providers", []) if isinstance(others, dict) else []
+    out: list[Dict[str, str]] = []
+    for provider in providers if isinstance(providers, list) else []:
+        if not isinstance(provider, dict):
+            continue
+        pid = str(provider.get("id", "") or "").strip()
+        for model in provider.get("models", []) if isinstance(provider.get("models"), list) else []:
+            if not isinstance(model, dict):
+                continue
+            name = str(model.get("name", "") or "").strip()
+            if not pid or not name or model.get("enabled") is False:
+                continue
+            out.append({"provider_id": pid, "model": name, "label": f"{pid}/{name}"})
+    return out
+
+
+def _role_life_account_snapshot(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """当前账号与已配置角色。运行时不猜账号，独立 WebUI 只读已有配置。"""
+    runtime = get_role_life_runtime()
+    current = ""
+    known: list[str] = []
+    roles: Dict[str, list[str]] = {}
+    connected = False
+    if runtime is not None:
+        try:
+            connected = bool(_role_life_call(runtime, "connected"))
+        except Exception:
+            connected = False
+        if connected:
+            try:
+                data = _role_life_call(runtime, "accounts") or {}
+            except Exception:
+                data = {}
+            if isinstance(data, dict):
+                current = str(data.get("current") or "").strip()
+                known = [str(x) for x in (data.get("known") or []) if str(x or "").strip()]
+                raw_roles = data.get("roles")
+                if isinstance(raw_roles, dict):
+                    for account, items in raw_roles.items():
+                        roles[str(account)] = [str(x) for x in (items or []) if str(x or "").strip()]
+    section = _role_life_section_from_config(cfg)
+    for account, by_role in (section.get("roles") or {}).items():
+        if account not in known:
+            known.append(account)
+        bucket = roles.setdefault(account, [])
+        for role_id in by_role:
+            if role_id not in bucket:
+                bucket.append(role_id)
+    if current and current not in known:
+        known.append(current)
+    if current:
+        # 在线账号允许为任意现有人格预设开启生活；已有配置角色始终保留。
+        bucket = roles.setdefault(current, [])
+        for preset in collect_role_life_presets(cfg):
+            if preset["id"] not in bucket:
+                bucket.append(preset["id"])
+    return {"connected": connected, "current": current,
+            "known": known, "roles": roles}
+
+
+def _role_life_valid_role(cfg: Dict[str, Any], account: str, role_id: str) -> bool:
+    """角色必须是现有人格预设，或已有独立生活配置的旧角色。"""
+    if not role_id or len(role_id) > 64:
+        return False
+    if any(p["id"] == role_id for p in collect_role_life_presets(cfg)):
+        return True
+    section = _role_life_section_from_config(cfg)
+    return role_id in ((section.get("roles") or {}).get(account) or {})
+
+
+def _role_life_selected_status(account: str = "global", role_id: str = "default") -> Dict[str, Any] | None:
+    """读取统一角色生活状态。
+
+    只有引擎明确返回 `corrupt=True` 才算数据损坏；临时运行时异常/磁盘错误
+    一律标记 `read_error`，页面不能把它显示成“损坏”并诱导用户清空。
+    """
+    runtime, _running = _effective_role_life_runtime()
+    acct = str(account or "").strip() or "global"
+    rid = str(role_id or "").strip() or "default"
+    try:
+        data = _role_life_call(runtime, "status", acct, rid)
+    except Exception as exc:
+        return {"read_error": f"读取失败：{exc}", "available": False,
+                "corrupt": False, "account": acct, "role_id": rid}
+    if not isinstance(data, dict):
+        return {"read_error": "读取失败：状态返回格式无效", "available": False,
+                "corrupt": False, "account": acct, "role_id": rid}
+    return data
+
+
+def _role_life_experiences_page(account: str, role_id: str, kinds: set[str],
+                                page: int, page_size: int,
+                                state_version: int = 0) -> Dict[str, Any]:
+    """按 kind 过滤 experiences 后分页。"""
+    runtime, _running = _effective_role_life_runtime()
+    acct = str(account or "").strip() or "global"
+    rid = str(role_id or "").strip() or "default"
+    cache_key = (id(runtime), acct, rid, state_version,
+                 tuple(sorted(kinds)), page, page_size)
+    now = time.time()
+    with _role_life_runtime_lock:
+        cached = _ROLE_LIFE_RECORD_CACHE.get(cache_key)
+        if cached and now - cached[0] < 20:
+            return copy.deepcopy(cached[1])
+    collected: list[Dict[str, Any]] = []
+    page_no = 1
+    while page_no <= 8:
+        data = _role_life_call(runtime, "records", acct, rid, "experiences",
+                               page_no, 50) or {}
+        if data.get("corrupt") or data.get("read_error"):
+            return data
+        items = data.get("items") or []
+        for item in items:
+            if isinstance(item, dict) and str(item.get("kind") or "") in kinds:
+                collected.append(item)
+        pages = int(data.get("pages") or 1)
+        if page_no >= pages or not items:
+            break
+        page_no += 1
+    result = {"items": collected[(page - 1) * page_size: page * page_size],
+              "page": page, "page_size": page_size, "total": len(collected),
+              "pages": max(1, (len(collected) + page_size - 1) // page_size)}
+    with _role_life_runtime_lock:
+        if len(_ROLE_LIFE_RECORD_CACHE) > 64:
+            _ROLE_LIFE_RECORD_CACHE.clear()
+        _ROLE_LIFE_RECORD_CACHE[cache_key] = (now, copy.deepcopy(result))
+    return result
+
+
+_ROLE_LIFE_RECORD_CACHE: Dict[Any, Tuple[float, Dict[str, Any]]] = {}
+
+
+def _role_life_records_for_route(runtime, account: str, role_id: str, kind: str,
+                                 page: int, page_size: int) -> Dict[str, Any]:
+    """GET /api/role-life/records 的真实分发逻辑（可独立测试）。
+
+    - 临时读取异常 → RoleLifeUnavailableError（路由 503，可重试）。
+    - 真损坏 → 直接返回 corrupt 响应，不读 records、不命中旧缓存
+      （损坏状态没有 state_version，旧缓存会泄露损坏前内容）。
+    - 正常 → 按真实 state_version 走分页缓存。
+    """
+    if kind in ("activity", "diary", "dream", "experiences"):
+        status = _role_life_selected_status(account, role_id) or {}
+        if status.get("read_error"):
+            raise RoleLifeUnavailableError(str(status["read_error"]))
+        if status.get("corrupt"):
+            return {"items": [], "page": page, "page_size": page_size, "total": 0,
+                    "pages": 1, "corrupt": True,
+                    "error": str(status.get("error") or "状态文件损坏或身份不符")}
+        kinds = ({kind} if kind != "experiences"
+                 else {"activity", "diary", "dream"})
+        return _role_life_experiences_page(account, role_id, kinds, page,
+                                           page_size,
+                                           int(status.get("state_version") or 0))
+    return _role_life_call(runtime, "records", account, role_id, kind, page, page_size)
+
+
+def collect_role_life_state(account: str = "", role_id: str = "") -> Dict[str, Any]:
+    """页面一次性拉取统一全局角色生活配置与当前状态（不依赖 QQ 连接）。"""
+    from bot.role_life_store import GLOBAL_ACCOUNT, GLOBAL_ROLE
+    cfg = read_json(CONFIG_PATH, {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    role_cfg = _role_life_section_from_config(cfg)
+    _rt, runtime_running = _effective_role_life_runtime()
+    status = _role_life_selected_status(GLOBAL_ACCOUNT, GLOBAL_ROLE)
+    active_persona_name = _role_life_active_persona_name(cfg)
+    return {
+        "connected": True,
+        "runtime_running": bool(runtime_running),
+        "current_account": GLOBAL_ACCOUNT,
+        "known_accounts": [GLOBAL_ACCOUNT],
+        "roles": {GLOBAL_ACCOUNT: [GLOBAL_ROLE]},
+        "account": GLOBAL_ACCOUNT,
+        "role_id": GLOBAL_ROLE,
+        "active_persona_name": active_persona_name,
+        "editable": True,
+        "read_only_reason": "",
+        "presets": collect_role_life_presets(cfg),
+        "models": collect_enabled_chat_models(cfg),
+        "default_config": copy.deepcopy(
+            getattr(_role_life_module(), "DEFAULT_ROLE_CONFIG", {})),
+        "config": copy.deepcopy(role_cfg),
+        "config_revision": _role_life_module().config_revision(role_cfg),
+        "status": status,
+    }
+
+
+def _role_life_require_online(account: str = "", role_id: str = ""):
+    """统一全局角色生活不再依赖 QQ 连接，始终允许在本地管理。"""
+    from bot.role_life_store import GLOBAL_ACCOUNT
+    text = str(account or "").strip() or GLOBAL_ACCOUNT
+    if not _ROLE_LIFE_ACCOUNT_RE.match(text):
+        raise ValueError("账号标识无效")
+    return GLOBAL_ACCOUNT
+
+
+def _role_life_require_versions(payload: Dict[str, Any]) -> Tuple[str, int, int, str]:
+    request_id = str(payload.get("request_id", "") or "").strip()
+    if not _ROLE_LIFE_REQUEST_ID_RE.match(request_id):
+        raise ValueError("请求参数无效，请刷新页面后重试")
+    revision = str(payload.get("expected_revision", "") or "").strip()
+    if not revision:
+        raise ValueError("页面状态信息不完整，请刷新页面后重试")
+    try:
+        epoch = payload.get("expected_epoch")
+        state_version = payload.get("expected_state_version")
+        if epoch is None or state_version is None:
+            raise ValueError
+        epoch = int(epoch)
+        state_version = int(state_version)
+        if epoch < 0 or state_version < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("页面状态信息不完整，请刷新页面后重试") from None
+    return request_id, epoch, state_version, revision
+
+
+def _raise_role_life_action_error(result: Any, fallback: str) -> None:
+    """将核心运行时的失败结果按 error_type 映射为对应 HTTP 语义异常。"""
+    if isinstance(result, dict):
+        msg = str(result.get("error") or "").strip() or fallback
+        err_type = str(result.get("error_type") or "").strip().lower()
+        if err_type == "validation":
+            raise ValueError(msg)
+        if err_type == "permission":
+            raise PermissionError(msg)
+        if err_type in ("storage", "unavailable"):
+            raise RoleLifeUnavailableError(msg)
+    else:
+        msg = fallback
+    raise RuntimeError(msg)
+
+
+def role_life_action(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST 入口：统一全局角色生活写操作（不依赖 QQ 连接）。"""
+    from bot.role_life_store import GLOBAL_ACCOUNT, GLOBAL_ROLE
+    payload = payload if isinstance(payload, dict) else {}
+    action = str(payload.get("action", "") or "").strip()
+    if action not in ROLE_LIFE_ACTIONS:
+        raise ValueError("不支持该操作")
+    account = GLOBAL_ACCOUNT
+    role_id = GLOBAL_ROLE
+    runtime, _running = _effective_role_life_runtime()
+    status = _role_life_selected_status(account, role_id) or {}
+    if status.get("read_error"):
+        # 临时读取异常：没有可信版本可回传，拒绝写操作（可重试），
+        # 也不能走“损坏→清空”路径，避免用户误清数据。
+        raise RoleLifeUnavailableError(str(status["read_error"]))
+    corrupt = bool(status.get("corrupt"))
+    request_id = str(payload.get("request_id", "") or "").strip()
+    if not _ROLE_LIFE_REQUEST_ID_RE.match(request_id):
+        raise ValueError("请求参数无效，请刷新页面后重试")
+    if corrupt:
+        # 损坏状态没有可校验的 revision/epoch/state_version：只有“清空重建”
+        # 且页面已二次确认（allow_corrupt）才允许；仍必须带幂等 ID。
+        if action != "clear" or not bool(payload.get("allow_corrupt")):
+            raise PermissionError("当前状态文件已损坏，请先清空重建后再操作")
+        result = _role_life_call(runtime, "clear", account, role_id, request_id,
+                                 "", None, None, True)
+        ok = bool(result.get("ok")) if isinstance(result, dict) else bool(result)
+        if not ok:
+            _raise_role_life_action_error(result, "清空失败：无法写入状态文件，请检查目录权限后重试")
+        return {"ok": True, "job_id": None}
+    request_id, epoch, state_version, revision = _role_life_require_versions(payload)
+    if action == "clear":
+        result = _role_life_call(runtime, "clear", account, role_id, request_id,
+                                 revision, epoch, state_version, False)
+        ok = bool(result.get("ok")) if isinstance(result, dict) else bool(result)
+        if not ok:
+            _raise_role_life_action_error(result, "清空失败：页面状态已更新，请刷新后重试")
+        return {"ok": True, "job_id": None}
+    if action == "upsert_plan_item":
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else payload
+        result = _role_life_call(runtime, "upsert_plan_item", account, role_id, params,
+                                 request_id, revision, epoch, state_version)
+        if not (isinstance(result, dict) and result.get("ok")):
+            _raise_role_life_action_error(result, "保存日程失败")
+        return {"ok": True, "item": result.get("item")}
+    if action == "delete_plan_item":
+        item_id = str(payload.get("item_id", "") or "").strip()
+        if not item_id or len(item_id) > 80:
+            raise ValueError("未指定有效的日程项")
+        result = _role_life_call(runtime, "delete_plan_item", account, role_id, item_id,
+                                 request_id, revision, epoch, state_version)
+        if not (isinstance(result, dict) and result.get("ok")):
+            _raise_role_life_action_error(result, "删除日程失败")
+        return {"ok": True}
+    if action == "update_experience":
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else payload
+        result = _role_life_call(runtime, "update_experience", account, role_id, params,
+                                 request_id, revision, epoch, state_version)
+        if not (isinstance(result, dict) and result.get("ok")):
+            _raise_role_life_action_error(result, "保存记录失败")
+        return {"ok": True, "experience": result.get("experience")}
+    if action == "delete_experience":
+        exp_id = str(payload.get("experience_id", "") or "").strip()
+        if not exp_id or len(exp_id) > 80:
+            raise ValueError("未指定有效的记录项")
+        result = _role_life_call(runtime, "delete_experience", account, role_id, exp_id,
+                                 request_id, revision, epoch, state_version)
+        if not (isinstance(result, dict) and result.get("ok")):
+            _raise_role_life_action_error(result, "删除记录失败")
+        return {"ok": True}
+    if action == "add_life_note":
+        text = str(payload.get("text", "") or "").strip()
+        if not text:
+            raise ValueError("备注内容不能为空")
+        result = _role_life_call(runtime, "add_life_note", account, role_id, text,
+                                 request_id, revision, epoch, state_version)
+        if not (isinstance(result, dict) and result.get("ok")):
+            _raise_role_life_action_error(result, "添加备注失败")
+        return {"ok": True, "note": result.get("note")}
+    if action == "delete_life_note":
+        note_id = str(payload.get("note_id", "") or "").strip()
+        if not note_id or len(note_id) > 80:
+            raise ValueError("未指定有效的备注项")
+        result = _role_life_call(runtime, "delete_life_note", account, role_id, note_id,
+                                 request_id, revision, epoch, state_version)
+        if not (isinstance(result, dict) and result.get("ok")):
+            _raise_role_life_action_error(result, "删除备注失败")
+        return {"ok": True}
+    if not status.get("enabled"):
+        raise PermissionError("请先打开页面顶部的「角色生活总开关」并保存设置")
+    if action == "enqueue":
+        kind = str(payload.get("kind", "") or "").strip()
+        if kind not in ROLE_LIFE_JOB_KINDS:
+            raise ValueError("不支持的任务类型")
+        args = payload.get("args") if isinstance(payload.get("args"), dict) else None
+        result = _role_life_enqueue_call(runtime, account, role_id, kind,
+                                         request_id, revision, epoch,
+                                         state_version, args)
+    elif action == "trigger_activity":
+        item_id = str(payload.get("item_id", "") or "").strip()
+        if not item_id or len(item_id) > 80:
+            raise ValueError("未指定有效的日程项")
+        result = _role_life_call(runtime, "trigger_activity", account, role_id,
+                                 item_id, request_id, revision, epoch, state_version)
+    elif action == "retry":
+        job_id = str(payload.get("job_id", "") or "").strip()
+        if not job_id or len(job_id) > 80:
+            raise ValueError("未指定有效的任务")
+        result = _role_life_call(runtime, "retry", account, role_id, job_id,
+                                 request_id, revision, epoch, state_version)
+    else:
+        result = _role_life_call(runtime, "regenerate_plan", account, role_id,
+                                 request_id, revision, epoch, state_version)
+    if isinstance(result, dict):
+        job_id = result.get("job_id")
+    else:
+        job_id = result
+    if not job_id:
+        _raise_role_life_action_error(result, "未能执行操作：页面状态已更新或当前暂不可执行，请刷新后重试")
+    return {"ok": True, "job_id": str(job_id)}
+
+
+def _role_life_config_changed(old_section: Dict[str, Any],
+                              new_section: Dict[str, Any]) -> Tuple[bool, str]:
+    """统一全局角色生活配置不再依赖 QQ 连接，始终允许在 WebUI 保存。"""
+    return old_section != new_section, ""
+
+
+def save_role_life_config(
+    account: str = "", role_id: str = "", cfg: Dict[str, Any] | None = None, *,
+    expected_config_revision: str = "",
+) -> Dict[str, Any]:
+    """局部合并保存统一角色生活配置，核对 config_revision 防多页面旧快照覆盖。"""
+    # 兼容直接传 (cfg_dict,) 或 (account, role_id, cfg_dict) 两种调用方式
+    if isinstance(account, dict) and cfg is None:
+        cfg = account
+    if not isinstance(cfg, dict):
+        raise ValueError("配置必须是对象")
+    rl_mod = _role_life_module()
+    expected_rev = str(expected_config_revision or "").strip()
+    with config_transaction(CONFIG_PATH):
+        existing = read_json(CONFIG_PATH, {})
+        if not isinstance(existing, dict):
+            existing = {}
+        existing_role_cfg = _role_life_section_from_config(existing)
+        actual_rev = rl_mod.config_revision(existing_role_cfg)
+        if expected_rev and expected_rev != actual_rev:
+            raise RuntimeError("角色生活配置已被其他页面修改，请刷新后再保存")
+        merged_cfg = dict(existing_role_cfg)
+        merged_cfg.update(cfg)
+        normalized = rl_mod.normalize_role_config(merged_cfg)
+        return _save_config_bundle_locked({"config_json": {"RoleLife": normalized}})
+
+
 def save_config_bundle(data: Dict[str, Any]):
     """保存整份配置。整段读-改-写必须在同一把锁内：ThreadingHTTPServer 会并发
     处理保存请求，两个请求各读一份旧配置、各改不同字段再写回，
@@ -1705,21 +2465,53 @@ def _save_config_bundle_locked(data: Dict[str, Any]):
     cfg = _merge_config_patch(existing, incoming)
     # 显式提交统一键即为新值；否则迁移旧双阈值，避免旧门槛反复覆盖新设置。
     others = cfg.get("Others")
-    if isinstance(others, dict) and ("compression_threshold" in others or "auto_compress_after_messages" in others):
+    if isinstance(others, dict) and (
+        "compression_threshold" in others
+        or "auto_compress_after_messages" in others
+        or "context_max_messages" in others
+    ):
         incoming_others = incoming.get("Others", {})
         if isinstance(incoming_others, dict) and "auto_compress_after_messages" in incoming_others and "compression_threshold" not in incoming_others:
-            others["auto_compress_after_messages"] = max(1, int(incoming_others["auto_compress_after_messages"]))
+            raw_trigger = max(1, int(incoming_others["auto_compress_after_messages"]))
         else:
-            others["auto_compress_after_messages"] = compression_trigger_rounds(others)
+            raw_trigger = compression_trigger_rounds(others)
+        max_rounds = others.get("context_max_messages", 60)
+        others["auto_compress_after_messages"] = clamp_compression_trigger_rounds(raw_trigger, max_rounds)
         others.pop("compression_threshold", None)
         others.pop("_comment_compression_threshold", None)
     _validate_plugin_configs(cfg, existing)
+    # RoleLife 独立配置段：统一全局扁平配置，随时可在 WebUI 修改保存；非法字段严格拒绝写盘。
+    if "RoleLife" in incoming:
+        try:
+            rl_mod = _role_life_module()
+            incoming_rl = incoming.get("RoleLife")
+            if incoming_rl is None:
+                new_section = copy.deepcopy(rl_mod.DEFAULT_ROLE_CONFIG)
+            elif not isinstance(incoming_rl, dict):
+                raise ValueError("RoleLife 必须是对象")
+            elif "roles" in incoming_rl and not any(k in rl_mod.DEFAULT_ROLE_CONFIG for k in incoming_rl):
+                # 旧格式提交：严格校验每一项后再提取为统一扁平配置
+                validated = rl_mod.normalize_role_life_section(incoming_rl)
+                new_section = rl_mod.resolve_global_config(validated)
+            else:
+                unknown_keys = [k for k in incoming_rl if k not in rl_mod.DEFAULT_ROLE_CONFIG and k != "chat_feedback_enabled"]
+                if unknown_keys:
+                    raise ValueError(f"包含不支持的字段：{', '.join(unknown_keys[:5])}")
+                base_rl = rl_mod.resolve_global_config(existing.get("RoleLife"))
+                base_rl.update(incoming_rl)
+                new_section = rl_mod.normalize_role_config(base_rl)
+        except ValueError as exc:
+            raise ValueError(f"RoleLife 配置无效：{exc}") from None
+        cfg["RoleLife"] = new_section
     if "ProactiveReply" in cfg:
         _validate_proactive_config(cfg["ProactiveReply"])
         from bot.proactive_reply import normalize_config
         cfg["ProactiveReply"] = normalize_config(cfg["ProactiveReply"])
 
     feature_switches = dict(DEFAULT_FEATURE_SWITCHES)
+    legacy_quote = cfg.get("split_reply_quote", {})
+    if isinstance(legacy_quote, dict) and "default_enabled" in legacy_quote:
+        feature_switches["split_reply_quote"] = normalize_bool_config(legacy_quote["default_enabled"], default=True)
     raw = cfg.get("FeatureSwitches", {})
     if isinstance(raw, dict):
         for key in list(feature_switches.keys()):
@@ -1959,7 +2751,7 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
         ]},
         {"key": "ai", "title": "AI 配置", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>', "desc": "配置上下文、回复过滤与分段回复", "fields": [
             field("Others.auto_compress_after_messages", "自动压缩触发轮数", "number", "完整对话达到此轮数时自动尝试压缩，也是手动压缩的最低准入轮数；仍需满足保留轮数与冷却条件", 40, category="上下文与记忆", min=1),
-            field("Others.compression_keep_recent", "保留近期对话轮数", "number", "压缩时保留最近的完整对话轮次，其余较早对话生成摘要", 20, category="上下文与记忆", min=1),
+            field("Others.compression_keep_recent", "保留近期对话轮数", "number", "保留最近完整轮次及其图片；较早对话合并为详细结构化记忆，摘要保存成功后删除被压缩轮次的原图，压缩仍可能损失细节", 20, category="上下文与记忆", min=1),
             field("Others.context_max_messages", "上下文保留上限（轮）", "number", "按完整对话轮次计算，超限裁掉较早对话；建议上限大于自动压缩触发轮数，避免触发前就被裁剪", 60, category="上下文与记忆", min=1),
             field("Others.llm_reply_failover_keywords", "回复过滤关键词", "list", "一行一个。仅在最终要发给用户的回复上检查（不检查 Agent 中间步骤）；命中任一关键词则跳过当前模型的全部 Key，按轮换列表尝试下一模型；全部命中则失败、不发送", category="上下文与过滤"),
             field("Others.llm_split.enabled", "启用 LLM 分段回复", "bool", "仅对大模型生成结果生效，不影响普通群聊回复是否引用", category="分段回复"),
@@ -1991,6 +2783,7 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("Others.group_personality_preset", "群聊人格", "text"),
             field("Others.personality_prompt", "编辑人设", "textarea", "可使用 {bot_name} 与 {user_name} 占位符"),
         ]},
+        {"key": "role-life", "title": "角色生活", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22c4-3.5 8-7 8-11a8 8 0 1 0-16 0c0 4 4 7.5 8 11Z"/><path d="M8 11a4 4 0 0 1 4-4"/></svg>', "desc": "让机器人拥有自己的日常作息、经历、日记与梦，让聊天更有活人感", "fields": []},
         {"key": "features", "title": "功能配置", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="14" y="3" rx="1"/><path d="M10 21V8a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5a1 1 0 0 0-1-1H3"/></svg>', "desc": "配置功能", "fields": [
             field("Others.sensitive_words", "屏蔽词", "list", "一行一条，格式「原词=替换成的词」；只写原词则删掉它。只替换用户发给机器人的消息，机器人回复、昵称、人设、群聊总结等不受影响"),
             field("Others.emoji_plus_one_cooldown_seconds", "表情 +1 冷却秒数", "number", "单个表情自动复读的防抖时间"),
@@ -2007,42 +2800,44 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("Others.system.trace_max_records", "追踪保存条数", "number", "AI 对话追踪最多保留多少条记录，超出丢最旧的。条数越多占用磁盘和内存越大", 100, category="系统设置", min=1, max=1000),
         ]},
         {"key": "proactive", "title": "主动回复", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M8 9h8"/><path d="M8 13h6"/></svg>', "desc": "群聊与私聊的主动回复", "fields": [
-            field("ProactiveReply.group.enabled", "群聊：启用主动回复", "bool", "仅控制群聊主动回复，不影响私聊开关；同时受「群聊响应」总闸门约束，关闭后需通过 WebUI 恢复。开启后按下方参数检查群聊，由判断模型决定是否发言", False, category="群聊"),
-            field("ProactiveReply.group.trigger_probability", "群聊：触发概率", "number", "0~1，命中概率后才会真正叫醒 AI；调高更活跃，调低更省资源", 0.3, category="群聊", min=0, max=1, step=0.05),
-            field("ProactiveReply.group.check_interval_seconds", "群聊：检查间隔（秒）", "number", "调度器对同一个群的最小检查间隔，过小会反复空判", 60, category="群聊", min=10, max=3600),
-            field("ProactiveReply.group.idle_threshold_seconds", "群聊：群空闲阈值（秒）", "number", "群里最后一条消息距现在超过这个时长才考虑主动发言", 900, category="群聊", min=60, max=86400),
-            field("ProactiveReply.group.max_consecutive_bot_messages", "群聊：连发熔断", "number", "AI 连发 N 条没人接话就停，等有真人说话才会再主动", 3, category="群聊", min=1, max=10),
-            field("ProactiveReply.group.min_interval_between_proactive_seconds", "群聊：最小主动间隔（秒）", "number", "同一群两次主动消息的最小间隔，防止刷屏", 1800, category="群聊", min=300, max=86400),
-            field("ProactiveReply.group.whitelist", "群聊：白名单", "list", "一行一个群号。非空时只对白名单内的群主动，留空 = 全部群都开（除黑名单）", category="群聊"),
-            field("ProactiveReply.group.blacklist", "群聊：黑名单", "list", "一行一个群号。命中黑名单的群永不主动", category="群聊"),
-            field("ProactiveReply.group.observation.enabled", "群聊：发完后继续观察", "bool", "仅在群聊主动回复已开启时生效。普通回复或首次主动发言成功后，按下方观察概率决定是否进入观察，再由规划器判断是否续聊；不额外抽冷场触发概率。AI 每次自行选择等多久再判断，等到期只是再次判断，不是必须发送；无人说话不催发，仍受原连发熔断限制。普通一问一答不等这些计时，不会延迟正常回复", True, category="群聊观察"),
-            field("ProactiveReply.group.observation.trigger_probability", "群聊：发言后继续观察概率", "number", "0~1，普通回复或首次主动发言成功后，只在开启新观察时抽一次；0=不进入，1=全部进入。已进入观察的等待和续聊不重复抽取，与冷场触发概率独立", 0.5, category="群聊观察", min=0, max=1, step=0.05),
-            field("ProactiveReply.group.observation.default_wait_seconds", "默认等多久再判断（秒）", "number", "首次也由规划器自主选择等待时长；返回无效或超过此默认值时回退此值，此值也是规划器等待上限，不是固定总观察窗口", 60, category="群聊观察", min=1, max=3600, step=1),
-            field("ProactiveReply.group.observation.min_wait_seconds", "最少等多久再判断（秒）", "number", "AI 每次选择等待时长的下限，不能超过默认等待时长", 10, category="群聊观察", min=1, max=3600, step=1),
-            field("ProactiveReply.group.observation.max_wait_seconds", "最多等多久再判断（秒）", "number", "主模型等待工具的时长上限，不能小于默认等待时长；规划器另以默认时长为上限，超过则回退默认值；到期不会强制发言", 600, category="群聊观察", min=1, max=3600, step=1),
-            field("ProactiveReply.group.observation.debounce_seconds", "有人接话后合并几秒再判断", "number", "把短时间内的群消息合并后再交给 AI 判断，填 0 表示不额外合并等待", 8, category="群聊观察", min=0, max=300, step=1),
-            field("ProactiveReply.group.observation.max_debounce_seconds", "最多合并等待几秒", "number", "从第一条新消息起最多合并等待多久，避免不断有人说话导致一直不判断；不能小于合并秒数", 20, category="群聊观察", min=0, max=300, step=1),
-            field("ProactiveReply.group.observation.min_continuation_interval_seconds", "续聊最小发言间隔（秒）", "number", "观察续聊的两次主动发言至少相隔多久，最少 1 秒；原有熔断仍生效", 30, category="群聊观察", min=1, max=3600, step=1),
-            field("ProactiveReply.private.enabled", "私聊：启用主动回复", "bool", "仅控制私聊主动回复，不影响群聊开关；同时受「私聊响应」总闸门约束，关闭后需通过 WebUI 恢复。开启后由判断模型决定是否主动开口，可能打扰用户，请谨慎启用", False, category="私聊"),
-            field("ProactiveReply.private.trigger_probability", "私聊：触发概率", "number", "0~1。仅控制满足冷场条件时是否调用规划器主动搭话，不影响普通回复成功后的观察及观察续聊。建议比群聊低很多，私聊主动消息更容易打扰人", 0.1, category="私聊", min=0, max=1, step=0.05),
-            field("ProactiveReply.private.check_interval_seconds", "私聊：检查间隔（秒）", "number", "对同一个用户的最小检查间隔", 120, category="私聊", min=30, max=7200),
-            field("ProactiveReply.private.idle_threshold_seconds", "私聊：用户沉默阈值（秒）", "number", "用户最后一条消息距现在超过这个时长才考虑主动开口。建议至少半天，否则像催回复", 43200, category="私聊", min=3600, max=604800),
-            field("ProactiveReply.private.max_unanswered_messages", "私聊：未回复熔断", "number", "AI 主动发了 N 条用户都没回，就再也不会主动开口，直到用户回复任何消息", 3, category="私聊", min=1, max=10),
-            field("ProactiveReply.private.min_interval_between_proactive_seconds", "私聊：最小主动间隔（秒）", "number", "同一用户两次主动消息的最小间隔，建议至少几小时", 86400, category="私聊", min=3600, max=604800),
-            field("ProactiveReply.private.whitelist", "私聊：白名单", "list", "一行一个 QQ 号。非空时只对白名单内用户主动，留空 = 全部用户都开（除黑名单）", category="私聊"),
-            field("ProactiveReply.private.blacklist", "私聊：黑名单", "list", "一行一个 QQ 号。命中黑名单的用户永不主动", category="私聊"),
-            field("ProactiveReply.private.observation.enabled", "私聊：发完后继续观察", "bool", "仅在私聊主动回复已开启时生效。普通回复或首次主动发言成功后，按下方观察概率决定是否进入观察，再由规划器判断是否续聊；与冷场触发概率独立。AI 每次自行选择等多久再判断，等到期只是再次判断，不是必须发送；无人说话不催发，仍受原未回复熔断限制。普通一问一答不等这些计时，不会延迟正常回复", True, category="私聊观察"),
-            field("ProactiveReply.private.observation.trigger_probability", "私聊：发言后继续观察概率", "number", "0~1，普通回复或首次主动发言成功后，只在开启新观察时抽一次；0=不进入，1=全部进入。已进入观察的等待和续聊不重复抽取，与冷场触发概率独立", 0.5, category="私聊观察", min=0, max=1, step=0.05),
-            field("ProactiveReply.private.observation.default_wait_seconds", "默认等多久再判断（秒）", "number", "首次也由规划器自主选择等待时长；返回无效或超过此默认值时回退此值，此值也是规划器等待上限，不是固定总观察窗口", 60, category="私聊观察", min=1, max=3600, step=1),
-            field("ProactiveReply.private.observation.min_wait_seconds", "最少等多久再判断（秒）", "number", "AI 每次选择等待时长的下限，不能超过默认等待时长", 10, category="私聊观察", min=1, max=3600, step=1),
-            field("ProactiveReply.private.observation.max_wait_seconds", "最多等多久再判断（秒）", "number", "主模型等待工具的时长上限，不能小于默认等待时长；规划器另以默认时长为上限，超过则回退默认值；到期不会强制发言", 600, category="私聊观察", min=1, max=3600, step=1),
-            field("ProactiveReply.private.observation.debounce_seconds", "有人接话后合并几秒再判断", "number", "把短时间内的私聊消息合并后再交给 AI 判断，填 0 表示不额外合并等待", 8, category="私聊观察", min=0, max=300, step=1),
-            field("ProactiveReply.private.observation.max_debounce_seconds", "最多合并等待几秒", "number", "从第一条新消息起最多合并等待多久，避免连续消息导致一直不判断；不能小于合并秒数", 20, category="私聊观察", min=0, max=300, step=1),
-            field("ProactiveReply.private.observation.min_continuation_interval_seconds", "续聊最小发言间隔（秒）", "number", "观察续聊的两次主动发言至少相隔多久，最少 1 秒；原有熔断仍生效", 30, category="私聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.group.enabled", "群聊：启用主动回复", "bool", "开启后在群聊空闲时由判断模型决定是否主动发言；同时受「群聊响应」开关约束", False, category="群聊"),
+            field("ProactiveReply.group.trigger_probability", "群聊：触发概率", "number", "0~1，冷场时抽中后才会触发思考是否发言；调高更活跃", 0.25, category="群聊", min=0, max=1, step=0.05),
+            field("ProactiveReply.group.check_interval_seconds", "群聊：检查间隔（秒）", "number", "调度器对同一个群的最短检查间隔", 180, category="群聊", min=10, max=3600),
+            field("ProactiveReply.group.idle_threshold_seconds", "群聊：群空闲阈值（秒）", "number", "群里最后一条消息距今超过该时长才考虑主动发言（默认 30 分钟）", 1800, category="群聊", min=60, max=86400),
+            field("ProactiveReply.group.max_consecutive_bot_messages", "群聊：连发熔断", "number", "AI 连发 N 条没人接话就停止主动，直到有真人发言", 3, category="群聊", min=1, max=10),
+            field("ProactiveReply.group.min_interval_between_proactive_seconds", "群聊：最小主动间隔（秒）", "number", "同一群两次主动发言的最短间隔（默认 1 小时）", 3600, category="群聊", min=300, max=86400),
+            field("ProactiveReply.group.max_contacts_per_day", "群聊：每日最多主动次数", "number", "单个群 24 小时内最多主动发起多少次聊天；填 0 表示不限制（默认 0）", 0, category="群聊", min=0, max=50),
+            field("ProactiveReply.group.whitelist", "群聊：白名单", "list", "一行一个群号；非空时仅对名单内群主动，留空表示不限群（黑名单除外）", category="群聊"),
+            field("ProactiveReply.group.blacklist", "群聊：黑名单", "list", "一行一个群号；名单内群不触发主动回复", category="群聊"),
+            field("ProactiveReply.group.observation.enabled", "群聊：发完后继续观察", "bool", "开启后在发言后短时间留意群里是否顺着话题接话；不是必须发送、无人说话不催发，普通一问一答不等这些计时", True, category="群聊观察"),
+            field("ProactiveReply.group.observation.trigger_probability", "群聊：发言后继续观察概率", "number", "0~1，普通回复或首次主动发言后是否进入观察的概率", 0.35, category="群聊观察", min=0, max=1, step=0.05),
+            field("ProactiveReply.group.observation.default_wait_seconds", "规划器等待默认/上限（秒）", "number", "规划器可选等待时间的上限与兜底默认值", 60, category="群聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.group.observation.min_wait_seconds", "最少等多久再判断（秒）", "number", "规划器可选等待时间的下限", 10, category="群聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.group.observation.max_wait_seconds", "等待工具上限（秒）", "number", "AI 工具单次 wait_for_messages 最长可预约的秒数", 600, category="群聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.group.observation.debounce_seconds", "有人接话后合并几秒再判断", "number", "把短时间内的群消息合并后再判断，0 表示不合并等待", 8, category="群聊观察", min=0, max=300, step=1),
+            field("ProactiveReply.group.observation.max_debounce_seconds", "最多合并等待几秒", "number", "从第一条新消息起最多合并等待多久", 20, category="群聊观察", min=0, max=300, step=1),
+            field("ProactiveReply.group.observation.min_continuation_interval_seconds", "续聊最小发言间隔（秒）", "number", "观察续聊两次主动发言的最短间隔", 30, category="群聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.private.enabled", "私聊：启用主动回复", "bool", "开启后在私聊沉默一段时间时由判断模型决定是否主动开口；同时受「私聊响应」开关约束", False, category="私聊"),
+            field("ProactiveReply.private.trigger_probability", "私聊：触发概率", "number", "0~1，冷场抽中后由判断模型结合状态决定是否开口", 0.2, category="私聊", min=0, max=1, step=0.05),
+            field("ProactiveReply.private.check_interval_seconds", "私聊：检查间隔（秒）", "number", "对同一个用户的最短检查间隔", 180, category="私聊", min=30, max=7200),
+            field("ProactiveReply.private.idle_threshold_seconds", "私聊：用户沉默阈值（秒）", "number", "对方最后一条消息距今超过该时长后才考虑主动开口（默认 2 小时）", 7200, category="私聊", min=300, max=604800),
+            field("ProactiveReply.private.max_unanswered_messages", "私聊：未回复熔断", "number", "连续 N 条主动消息未获回复即停止主动，直到对方再次发言", 3, category="私聊", min=1, max=10),
+            field("ProactiveReply.private.min_interval_between_proactive_seconds", "私聊：最小主动间隔（秒）", "number", "同一用户两次主动发言的最短间隔（默认 3 小时）", 10800, category="私聊", min=300, max=604800),
+            field("ProactiveReply.private.max_contacts_per_day", "私聊：每日最多主动次数", "number", "单个好友 24 小时内最多主动发起多少次聊天；填 0 表示不限制（默认 0）", 0, category="私聊", min=0, max=50),
+            field("ProactiveReply.private.whitelist", "私聊：白名单", "list", "一行一个 QQ 号；非空时仅对名单内用户主动，留空表示不限用户（黑名单除外）", category="私聊"),
+            field("ProactiveReply.private.blacklist", "私聊：黑名单", "list", "一行一个 QQ 号；名单内用户不触发主动回复", category="私聊"),
+            field("ProactiveReply.private.observation.enabled", "私聊：发完后继续观察", "bool", "私聊默认关闭；开启后在发言后短时间留意对方是否继续聊，不是必须发送、无人说话不催发，普通一问一答不等这些计时", False, category="私聊观察"),
+            field("ProactiveReply.private.observation.trigger_probability", "私聊：发言后继续观察概率", "number", "0~1，普通回复或首次主动发言后是否进入观察的概率", 0.35, category="私聊观察", min=0, max=1, step=0.05),
+            field("ProactiveReply.private.observation.default_wait_seconds", "规划器等待默认/上限（秒）", "number", "规划器可选等待时间的上限与兜底默认值", 60, category="私聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.private.observation.min_wait_seconds", "最少等多久再判断（秒）", "number", "规划器可选等待时间的下限", 10, category="私聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.private.observation.max_wait_seconds", "等待工具上限（秒）", "number", "AI 工具单次 wait_for_messages 最长可预约的秒数", 600, category="私聊观察", min=1, max=3600, step=1),
+            field("ProactiveReply.private.observation.debounce_seconds", "有人接话后合并几秒再判断", "number", "把短时间内的私聊消息合并后再判断，0 表示不合并等待", 8, category="私聊观察", min=0, max=300, step=1),
+            field("ProactiveReply.private.observation.max_debounce_seconds", "最多合并等待几秒", "number", "从第一条新消息起最多合并等待多久", 20, category="私聊观察", min=0, max=300, step=1),
+            field("ProactiveReply.private.observation.min_continuation_interval_seconds", "续聊最小发言间隔（秒）", "number", "观察续聊两次主动发言的最短间隔", 30, category="私聊观察", min=1, max=3600, step=1),
         ]},
         {"key": "agent", "title": "Agent", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>', "desc": "配置 AI 自主调用工具的基本设置、执行限制与联网搜索", "fields": [
             field("Agent.enabled", "启用 Agent", "bool", "总开关。关闭时完全不向模型传 tools，与旧版行为一致", category="基本设置"),
-            field("Agent.max_rounds", "最大工具轮数", "number", "越大越能完成多步骤任务（搜索→读网页→再搜→总结），代价是 token 消耗上升", 30, category="基本设置", min=1, max=50),
+            field("Agent.max_rounds", "最大工具轮数", "number", "单次任务最多允许连续调用工具的轮数", 30, category="基本设置", min=1, max=50),
             field("Agent.retry_attempts", "失败后额外重试次数", "number", "当前模型/Key 失败后再试几次；用尽后按轮换顺序切换下一个模型/Key。空回复（模型既没调工具也没给文本）也算失败。默认 3，设置为 0 表示直接轮换", 3, category="执行限制", min=0, max=5),
             field("Agent.clear_workspace_on_reset", "/reset 命令清空工作区", "bool", "开启后 /reset 会同时清空当前会话的 Agent 工作区；关闭后仍清除聊天记忆，但保留工作区文件", category="执行限制"),
             field("Agent.tool_result_max_chars", "工具结果最大字数", "number", "超出部分写入 data/agent_overflow，只回灌预览+路径，AI 可用 file_read 读全文", 8000, category="执行限制", min=500, max=60000),
@@ -2050,7 +2845,7 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("Agent.parallel_tools", "并发执行工具", "bool", "同一轮多个工具并发跑，更快且不增加模型请求次数", category="执行限制"),
             field("Agent.show_time", "显示当前时间", "bool", "开启后每次对话在用户消息末尾附加当前时间，让 AI 知道现在几点", category="基本设置"),
             field("Agent.search.provider", "搜索源", "select", "auto=有 Key 优先付费源，否则回落百度/DuckDuckGo", "auto", ["auto", "tavily", "bocha", "baidu", "duckduckgo"], category="联网搜索"),
-            field("Agent.search.tavily_api_key", "Tavily API Key", "password", "https://tavily.com 有免费额度，留空则不使用", category="联网搜索"),
+            field("Agent.search.tavily_api_key", "Tavily API Key", "password", "留空则不使用", category="联网搜索"),
             field("Agent.search.bocha_api_key", "博查 API Key", "password", "国内搜索源，留空则不使用", category="联网搜索"),
             field("Agent.exec_timeout", "代码执行超时秒数", "number", "execute_shell / execute_python 的执行上限", 60, category="执行限制", min=5, max=600),
         ]},
@@ -2079,7 +2874,7 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("WebUI.theme_preset", "主题色", "select", "选择一套背景主题色", "aurora", ["aurora", "midnight", "sakura", "forest", "sunset", "ocean"], category="界面外观"),
             field("WebUI.background_image", "自定义背景图片", "background_image", "从本机选一张图，点「保存设置」时上传", category="界面外观"),
             field("WebUI.background_blur", "背景模糊度", "range", "0 到 40，数值越大越柔和", 10, category="界面外观", min=0, max=40, step=1),
-            field("WebUI.liquid_glass", "液态玻璃UI", "bool", "⚠️ 低配机可能会出现卡顿，请自行决定是否开启", category="界面外观"),
+            field("WebUI.liquid_glass", "液态玻璃UI", "bool", "开启半透明毛玻璃折射效果；低配设备可保持关闭", category="界面外观"),
             field("WebUI.disable_background_blur", "禁用背景模糊", "bool", "仅在液态玻璃UI开启时生效，开启后将忽略「背景模糊度」选项", True, category="界面外观"),
             field("WebUI.liquid_glass_refraction", "液态玻璃折射强度", "range", "0 到 30，数值越大折射扭曲越明显", 1, category="界面外观", min=0, max=30, step=1),
             field("WebUI.card_background_blur", "卡片背景模糊度", "range", "0 到 10，控制液态玻璃卡片背景的模糊程度", 3, category="界面外观", min=0, max=10, step=1),
@@ -3097,11 +3892,18 @@ def install_latest_update() -> None:
 
                     _set_update_install_status("dependencies", "正在安装依赖", latest_version)
                     python_exe = _resolve_python_executable()
-                    subprocess.run(
+                    result = subprocess.run(
                         [python_exe, "-m", "pip", "install", "-r", str(BASE_DIR / "requirements.txt"), "--disable-pip-version-check"],
                         cwd=str(BASE_DIR),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
                         check=True,
                     )
+                    if result.stdout:
+                        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
                 except Exception:
                     if update_backup_dir and update_backup_dir.exists():
                         _set_update_install_status("rollback", "更新失败，正在回滚", latest_version)
@@ -3117,10 +3919,16 @@ def install_latest_update() -> None:
             _restart_current_process_after_update()
         except Exception as e:
             detail = str(e)
+            if isinstance(e, subprocess.CalledProcessError):
+                output = getattr(e, "stdout", None) or getattr(e, "output", None) or getattr(e, "stderr", None) or ""
+                if isinstance(output, bytes):
+                    output = output.decode("utf-8", errors="replace")
+                if output:
+                    detail += "\n" + str(output).rstrip()
             if rollback_done:
-                detail = "更新失败，已自动回滚。" + detail
+                detail = "更新失败，已自动回滚。\n" + detail
             elif update_backup_dir:
-                detail = f"更新失败，备份保留在 {update_backup_dir}。" + detail
+                detail = f"更新失败，备份保留在 {update_backup_dir}。\n" + detail
             _set_update_install_status("error", "更新失败", detail)
             print(f"自动更新失败: {detail}")
             traceback.print_exc()
@@ -4388,11 +5196,12 @@ class WebUIHandler(BaseHTTPRequestHandler):
             elif parsed.path.startswith("/static/"):
                 fname = parsed.path[len("/static/"):]
                 cached = _STATIC_ASSET_CONTENT.get(fname)
-                fpath = (BASE_DIR / "static" / fname).resolve()
+                static_root = (BASE_DIR / "static").resolve()
+                fpath = (static_root / fname).resolve()
                 if cached is not None:
                     ct = "text/javascript" if fname.endswith(".js") else "text/css"
                     _text_response(self, cached, ct + "; charset=utf-8", cache="public, max-age=31536000, immutable")
-                elif fpath.is_file() and str(fpath).startswith(str((BASE_DIR / "static").resolve())):
+                elif fpath.is_file() and fpath.is_relative_to(static_root):
                     ct = "text/javascript" if fname.endswith(".js") else "text/css"
                     _text_response(self, fpath.read_text(encoding="utf-8"), ct + "; charset=utf-8", cache="public, max-age=31536000, immutable")
                 else:
@@ -4463,6 +5272,38 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"ok": True, "data": {"documents": _knowledge_base.list_documents()}})
             elif parsed.path == "/api/knowledge/capabilities":
                 _json_response(self, {"ok": True, "data": {"upload_path": "/api/knowledge/documents/upload", "version": 1}})
+            elif parsed.path == "/api/role-life":
+                qs = urllib.parse.parse_qs(parsed.query)
+                account = str((qs.get("account") or [""])[0] or "").strip()
+                role_id = str((qs.get("role") or [""])[0] or "").strip()
+                try:
+                    _json_response(self, {"ok": True, "data": collect_role_life_state(account, role_id)})
+                except ValueError as e:
+                    _json_response(self, {"ok": False, "error": str(e)}, 400)
+            elif parsed.path == "/api/role-life/records":
+                qs = urllib.parse.parse_qs(parsed.query)
+                kind = str((qs.get("kind") or ["experiences"])[0] or "").strip()
+                try:
+                    page = max(1, int((qs.get("page") or ["1"])[0] or 1))
+                    page_size = max(1, min(50, int((qs.get("page_size") or ["20"])[0] or 20)))
+                except (TypeError, ValueError):
+                    page, page_size = 1, 20
+                if kind not in ("experiences", "activity", "diary", "dream", "plans", "jobs", "sleep"):
+                    _json_response(self, {"ok": False, "error": "不支持的记录类型"}, 400)
+                    return
+                runtime, _running = _effective_role_life_runtime()
+                try:
+                    from bot.role_life_store import GLOBAL_ACCOUNT, GLOBAL_ROLE
+                    data = _role_life_records_for_route(
+                        runtime, GLOBAL_ACCOUNT, GLOBAL_ROLE, kind, page, page_size)
+                    _json_response(self, {"ok": True, "data": data})
+                except RoleLifeUnavailableError as e:
+                    _json_response(self, {"ok": False, "error": str(e),
+                                          "retryable": True}, 503)
+                except ValueError as e:
+                    _json_response(self, {"ok": False, "error": str(e)}, 400)
+                except Exception as e:
+                    _json_response(self, {"ok": False, "error": str(e)}, 503)
             elif parsed.path == "/api/chat/models":
                 _json_response(self, {"ok": True, "data": _chatroom_models()})
             elif parsed.path == "/api/chat/personas":
@@ -4632,6 +5473,40 @@ class WebUIHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/ui-state":
                 save_ui_state(data or {})
                 _json_response(self, {"ok": True, "message": "设置已保存并已尝试热应用。", "data": collect_ui_state()})
+            elif parsed.path == "/api/role-life/action":
+                try:
+                    _json_response(self, {"ok": True, "data": role_life_action(data or {})})
+                except PermissionError as e:
+                    _json_response(self, {"ok": False, "error": str(e)}, 403)
+                except RoleLifeUnavailableError as e:
+                    _json_response(self, {"ok": False, "error": str(e),
+                                          "retryable": True}, 503)
+                except ValueError as e:
+                    _json_response(self, {"ok": False, "error": str(e)}, 400)
+                except RuntimeError as e:
+                    _json_response(self, {"ok": False, "error": str(e)}, 409)
+                except Exception as e:
+                    _json_response(self, {"ok": False, "error": str(e)}, 503)
+            elif parsed.path == "/api/role-life/config":
+                payload = data or {}
+                account = str(payload.get("account", "") or "").strip()
+                role_id = str(payload.get("role_id", "") or "").strip()
+                cfg = payload.get("config")
+                expected_rev = str(payload.get("expected_config_revision", "") or "").strip()
+                try:
+                    save_role_life_config(
+                        account, role_id, cfg, expected_config_revision=expected_rev,
+                    )
+                    _json_response(self, {"ok": True, "message": "角色生活设置已保存",
+                                          "data": collect_role_life_state(account, role_id)})
+                except PermissionError as e:
+                    _json_response(self, {"ok": False, "error": str(e)}, 403)
+                except ValueError as e:
+                    _json_response(self, {"ok": False, "error": str(e)}, 400)
+                except RuntimeError as e:
+                    _json_response(self, {"ok": False, "error": str(e)}, 409)
+                except Exception as e:
+                    _json_response(self, {"ok": False, "error": str(e)}, 500)
             elif parsed.path == "/api/update/check":
                 _json_response(self, {"ok": True, "message": "已检查更新", "data": fetch_update_info(force=True)})
             elif parsed.path == "/api/providers/detect-models":

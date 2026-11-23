@@ -61,6 +61,8 @@ class SocialContext:
     recall_callback: Callable[[str], Awaitable[bool | str]] | None = None
     wait_bounds: Callable[[], tuple[float, float]] | None = None
     visible_callback: Callable[[dict], bool] | None = None
+    follow_up_callback: Callable[..., str | Awaitable[str]] | None = None
+    follow_up_ready: Callable[[], bool] | None = None
     quote_id: str | None = field(default=None, init=False)
     wait_seconds: float | None = field(default=None, init=False)
     finished: bool = field(default=False, init=False)
@@ -207,6 +209,36 @@ class SocialContext:
             self.quote_id = None
         return result if isinstance(result, str) else "已撤回自己的消息。"
 
+    async def record_follow_up(self, summary: str, source_ids: list[str], *,
+                               follow_up_id: str = "", status: str = "open") -> str:
+        """来源只来自本回合当前会话snapshot；不接受模型指定账号/会话或伪造证据。"""
+        try:
+            ready = (_feature_enabled(self) and callable(self.follow_up_callback)
+                     and callable(self.follow_up_ready) and self.follow_up_ready() is True)
+        except Exception:
+            ready = False
+        if not ready:
+            return "error: 当前会话未注册可用的事项记录回调。"
+        if (not isinstance(summary, str) or not summary.strip() or len(summary) > 500
+                or status not in ("open", "resolved", "cancelled")
+                or not isinstance(follow_up_id, str) or len(follow_up_id) > 64
+                or not isinstance(source_ids, list) or not 1 <= len(source_ids) <= 8
+                or any(not isinstance(value, str) or not value or len(value) > 128 for value in source_ids)
+                or len(set(source_ids)) != len(source_ids)):
+            return "error: 事项必须包含简短摘要、有效状态及1～8个真实来源ID。"
+        sources = []
+        for message_id in source_ids:
+            item = self._snapshot.get(message_id)
+            if item is None or item["is_bot"] or item["recalled"] or not self._visible(item):
+                return "error: 来源ID必须是本回合当前会话可见且未撤回的用户消息。"
+            sources.append(dict(item))
+        try:
+            result = self.follow_up_callback(summary=summary.strip(), sources=sources,
+                                            follow_up_id=follow_up_id, status=status)
+            return await result if inspect.isawaitable(result) else result
+        except Exception:
+            return "error: 事项记录未确认，未安排提醒或发送消息。"
+
     def wait_for_messages(self, seconds: float) -> str:
         if not self.is_proactive or not _feature_enabled(self) or self.finished:
             return "error: 当前请求不能计划主动观察等待。"
@@ -260,6 +292,10 @@ def _available(method: str, *, proactive: bool = False, recall: bool = False):
                 return False
             if recall and (not _feature_enabled(social) or not _recall_registered(social)):
                 return False
+            if method == "record_follow_up" and (not _feature_enabled(social)
+                    or not callable(social.follow_up_callback) or not callable(social.follow_up_ready)
+                    or social.follow_up_ready() is not True):
+                return False
             return True
         except Exception:
             return False
@@ -292,14 +328,22 @@ def register_social_tools(registry: ToolRegistry | None = None) -> None:
          {}, [], "finish_observation"),
         ("recall_own_message", "对应主动回复开关开启时，撤回当前会话机器人自己 120 秒以内且未撤回的消息；不是管理员撤回工具。",
          {"message_id": message_id}, ["message_id"], "recall_own"),
+        ("record_follow_up", "同回合记录或更新当前会话有真实用户消息来源的事项；"
+         "只记录用户明说的内容，不能猜测已完成或编造承诺。提供follow_up_id更新open/resolved/cancelled。"
+         "不是定时提醒，不发送消息，不保证未来联系。",
+         {"summary": {"type": "string", "minLength": 1, "maxLength": 500},
+          "source_ids": {"type": "array", "minItems": 1, "maxItems": 8, "items": message_id},
+          "follow_up_id": {"type": "string", "maxLength": 64},
+          "status": {"type": "string", "enum": ["open", "resolved", "cancelled"]}},
+         ["summary", "source_ids"], "record_follow_up"),
     ]
     for name, description, properties, required, method in definitions:
         registry.register(ToolSpec(
             name=name, description=description,
             parameters={"type": "object", "properties": properties, "required": required},
             handler=_handler(method), level="user",
-            untrusted_output=name == "list_visible_messages",
-            side_effect=name == "recall_own_message",
+            untrusted_output=name in ("list_visible_messages", "record_follow_up"),
+            side_effect=name in ("recall_own_message", "record_follow_up"),
             availability=_available(method, proactive=name in ("wait_for_messages", "finish_observation"),
                                     recall=name == "recall_own_message"),
         ))

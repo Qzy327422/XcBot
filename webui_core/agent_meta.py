@@ -60,6 +60,8 @@ AGENT_TOOL_META = [
     # ---------- 会话社交：请求内候选/意图，由运行时 availability 再收窄 ----------
     {"key": "list_visible_messages", "title": "查看可见消息", "level": "user", "default_enabled": True,
      "hidden": True, "group": "会话社交", "desc": "只列出本次请求当前会话的消息摘要"},
+    {"key": "record_follow_up", "title": "记录后续事项", "level": "user", "default_enabled": True,
+     "hidden": True, "group": "会话社交", "desc": "依据本会话可见用户消息记录或更新未结事项，不创建提醒、不发送消息"},
     {"key": "select_reply", "title": "选择引用消息", "level": "user", "default_enabled": True,
      "hidden": True, "group": "会话社交", "desc": "为下一次发送选择一次性引用，不立即发送"},
     {"key": "wait_for_messages", "title": "计划等待新消息", "level": "user", "default_enabled": True,

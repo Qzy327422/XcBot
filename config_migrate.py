@@ -251,6 +251,104 @@ def sync_personality_prompt_to_presets(config: dict) -> bool:
     return changed
 
 
+_PROACTIVE_V8_UPGRADES: tuple[tuple[tuple[str, ...], Any, Any], ...] = (
+    (("ProactiveReply", "group", "trigger_probability"), 0.3, 0.25),
+    (("ProactiveReply", "group", "check_interval_seconds"), 60, 180),
+    (("ProactiveReply", "group", "idle_threshold_seconds"), 900, 1800),
+    (("ProactiveReply", "group", "min_interval_between_proactive_seconds"), 1800, 3600),
+    (("ProactiveReply", "private", "trigger_probability"), 0.1, 0.2),
+    (("ProactiveReply", "private", "check_interval_seconds"), 120, 180),
+    (("ProactiveReply", "private", "idle_threshold_seconds"), 43200, 7200),
+    (("ProactiveReply", "private", "min_interval_between_proactive_seconds"), 86400, 10800),
+    (("ProactiveReply", "group", "observation", "trigger_probability"), 0.5, 0.35),
+    (("ProactiveReply", "private", "observation", "trigger_probability"), 0.5, 0.35),
+    (("ProactiveReply", "private", "observation", "enabled"), True, False),
+)
+
+_PROACTIVE_V9_UPGRADES: tuple[tuple[tuple[str, ...], tuple[Any, ...], Any], ...] = (
+    (("ProactiveReply", "group", "max_contacts_per_day"), (6,), 0),
+    (("ProactiveReply", "private", "max_contacts_per_day"), (6, 4), 0),
+)
+
+
+def _match_old_default(current: Any, expected: Any) -> bool:
+    if isinstance(expected, bool):
+        return type(current) is bool and current is expected
+    return type(current) in (int, float) and current == expected
+
+
+def _deep_get_opt(root: Any, path: tuple[str, ...]) -> tuple[bool, Any]:
+    cur = root
+    for part in path:
+        if not isinstance(cur, dict) or part not in cur:
+            return False, None
+        cur = cur[part]
+    return True, cur
+
+
+def _apply_default_upgrades(config: dict, template: dict,
+                            upgrades: tuple[tuple[tuple[str, ...], Any, Any], ...]) -> bool:
+    changed = False
+    for path, old_defaults, fallback_new in upgrades:
+        has_cur, cur_val = _deep_get_opt(config, path)
+        expected = old_defaults if isinstance(old_defaults, tuple) else (old_defaults,)
+        if not has_cur or not any(_match_old_default(cur_val, item) for item in expected):
+            continue
+        has_tpl, tpl_val = _deep_get_opt(template, path)
+        target_val = tpl_val if has_tpl else fallback_new
+        if not _match_old_default(cur_val, target_val):
+            parent = config
+            for part in path[:-1]:
+                parent = parent[part]
+            parent[path[-1]] = target_val
+            changed = True
+    return changed
+
+
+def upgrade_proactive_and_role_life_config(config: dict, template: dict, *, from_version: int = 0) -> bool:
+    """清理已废除的主动回复/角色生活字段，并在低于目标版本升级时更新未自定义的旧默认值。"""
+    if not isinstance(config, dict):
+        return False
+    changed = False
+
+    proactive = config.get("ProactiveReply")
+    if isinstance(proactive, dict):
+        for dead in ("max_account_background_calls_per_day", "legacy_account_id"):
+            if dead in proactive:
+                proactive.pop(dead, None)
+                changed = True
+        for kind in ("group", "private"):
+            sec = proactive.get(kind)
+            if isinstance(sec, dict):
+                if "max_background_calls_per_day" in sec:
+                    sec.pop("max_background_calls_per_day", None)
+                    changed = True
+                obs = sec.get("observation")
+                if isinstance(obs, dict):
+                    for dead in ("window_seconds", "max_continuation_rounds"):
+                        if dead in obs:
+                            obs.pop(dead, None)
+                            changed = True
+
+    role_life = config.get("RoleLife")
+    if isinstance(role_life, dict) and isinstance(role_life.get("roles"), dict):
+        for role_map in role_life["roles"].values():
+            if isinstance(role_map, dict):
+                for rcfg in role_map.values():
+                    if isinstance(rcfg, dict):
+                        for dead in ("role_daily_limit", "weather_city"):
+                            if dead in rcfg:
+                                rcfg.pop(dead, None)
+                                changed = True
+
+    if from_version < 8 and _apply_default_upgrades(config, template, _PROACTIVE_V8_UPGRADES):
+        changed = True
+    if from_version < 9 and _apply_default_upgrades(config, template, _PROACTIVE_V9_UPGRADES):
+        changed = True
+
+    return changed
+
+
 def default_template_path_for(config_path: Path) -> Path:
     local_template = config_path.resolve().parent / DEFAULT_TEMPLATE_NAME
     if local_template.exists():
@@ -295,7 +393,10 @@ def ensure_config_up_to_date(config_path: str = "config.json", template_path: st
     provider_migrated = migrate_v14_llm_config(merged)
     personality_migrated = sync_personality_prompt_to_presets(merged)
     welcome_migrated = upgrade_group_join_welcome(merged, template)
-    merged[CONFIG_VERSION_KEY] = max(template_config_version, CURRENT_CONFIG_VERSION)
+    proactive_life_migrated = upgrade_proactive_and_role_life_config(
+        merged, template, from_version=current_config_version
+    )
+    merged[CONFIG_VERSION_KEY] = max(current_config_version, template_config_version, CURRENT_CONFIG_VERSION)
     # deep_merge 会保护 Others.version_name，升级时需显式同步到模板程序版本。
     program_version_changed = False
     if template_program_version:
@@ -321,6 +422,7 @@ def ensure_config_up_to_date(config_path: str = "config.json", template_path: st
         and not provider_migrated
         and not personality_migrated
         and not welcome_migrated
+        and not proactive_life_migrated
         and not legacy_migrated
         and not program_version_changed
     ):
@@ -364,7 +466,13 @@ def migrate(old_path: str, new_path: str, backup_dir: str, *, remove_old: bool =
     merged = deep_merge(new_template, old_config)
     migrate_v14_llm_config(merged)
     sync_personality_prompt_to_presets(merged)
-    merged[CONFIG_VERSION_KEY] = max(get_config_version(new_template) or CURRENT_CONFIG_VERSION, CURRENT_CONFIG_VERSION)
+    old_version = get_config_version(old_config)
+    upgrade_proactive_and_role_life_config(
+        merged, new_template, from_version=old_version
+    )
+    merged[CONFIG_VERSION_KEY] = max(
+        old_version, get_config_version(new_template) or CURRENT_CONFIG_VERSION, CURRENT_CONFIG_VERSION
+    )
     # 与 ensure_config_up_to_date 一致：程序版本号以新模板为准
     template_program_version = get_program_version(new_template)
     if template_program_version:

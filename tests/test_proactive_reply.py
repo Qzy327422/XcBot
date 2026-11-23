@@ -66,10 +66,17 @@ class ProactiveTests(unittest.TestCase):
         self.assertFalse(scheduler.can_send(True, "123", 0))
 
     def test_normalize_defaults_independent_and_canonical_lists(self):
-        cfg = proactive.normalize_config({"group": {"whitelist": [123, " 00123 ", "456"]}})
+        cfg = proactive.normalize_config({
+            "group": {"whitelist": [123, " 00123 ", "456"], "max_background_calls_per_day": 48},
+            "private": {"max_background_calls_per_day": 200},
+        })
         self.assertFalse(cfg["group"]["enabled"])
         self.assertEqual(cfg["group"]["whitelist"], ["123", "456"])
-        self.assertEqual(cfg["private"]["idle_threshold_seconds"], 43200)
+        self.assertEqual(cfg["group"]["max_contacts_per_day"], 0)
+        self.assertEqual(cfg["private"]["max_contacts_per_day"], 0)
+        self.assertNotIn("max_background_calls_per_day", cfg["group"])
+        self.assertNotIn("max_background_calls_per_day", cfg["private"])
+        self.assertEqual(cfg["private"]["idle_threshold_seconds"], 7200)
         cfg["private"]["whitelist"].append("1")
         self.assertEqual(proactive.DEFAULT_PRIVATE_CONFIG["whitelist"], [])
 
@@ -82,6 +89,7 @@ class ProactiveTests(unittest.TestCase):
             "idle_threshold_seconds": [-1, "900"],
             "min_interval_between_proactive_seconds": [False, float("nan")],
             "max_consecutive_bot_messages": [0, -1, True, 1.5, 3.0],
+            "max_contacts_per_day": [-1, True, 1.5, 3.0],
             "whitelist": ["123", None, {}, (123,), [True], [None], [""], ["abc"], [0], [-1]],
             "blacklist": ["123", [False], ["１２３"], [1.5]],
         }.items():
@@ -540,6 +548,69 @@ class ProactiveTests(unittest.TestCase):
         self.assertTrue(proactive.can_send(True, "123", 1))
         proactive.notify_bot_message_sent(True, "123", is_proactive=True, content="hello")
         self.assertEqual(proactive.get_session_state(True, "123")["recent_proactive_messages"][0]["content"], "hello")
+
+    def test_group_split_messages_share_contact_id_and_scale_backoff(self):
+        scheduler = self.scheduler()
+        with mock.patch.object(proactive.time, "time", return_value=100):
+            scheduler.notify_user_message_received(True, "123")
+        self.config["group"].update(idle_threshold_seconds=0, min_interval_between_proactive_seconds=100,
+                                   max_consecutive_bot_messages=3)
+        # 一次正常回复拆成 3 段，传入相同 contact_id，只应计为 1 次连发
+        for _ in range(3):
+            scheduler.notify_bot_message_sent(True, "123", is_proactive=False, contact_id="normal-turn-1")
+        state = scheduler.get_session_state(True, "123")
+        self.assertEqual(state["consecutive_bot_count"], 1)
+        self.assertTrue(scheduler.can_send(True, "123", state["activity_version"]))
+        # 群聊主动退避随 consecutive_bot_count 指数拉长（1 次 -> 2x = 200s）
+        with mock.patch.object(proactive.time, "time", return_value=200):
+            scheduler.notify_bot_message_sent(True, "123", is_proactive=True, contact_id="pro-1")
+        state = scheduler.get_session_state(True, "123")
+        self.assertEqual(state["consecutive_bot_count"], 2)  # 4x = 400s
+        with mock.patch.object(proactive.time, "time", return_value=450):
+            self.assertFalse(scheduler.can_send(True, "123", state["activity_version"]))
+        with mock.patch.object(proactive.time, "time", return_value=601):
+            self.assertTrue(scheduler.can_send(True, "123", state["activity_version"]))
+
+    def test_cold_tick_sends_at_most_once_rotates_lru_and_has_no_role_life_coupling(self):
+        src = (Path(__file__).resolve().parents[1] / "bot" / "proactive_reply.py").read_text(encoding="utf-8")
+        self.assertNotIn("role_life", src)
+        calls = []
+
+        async def planner(cid, cfg):
+            calls.append(cid)
+            return True
+
+        scheduler = self.scheduler(planner)
+        self.config["group"].update(idle_threshold_seconds=0, min_interval_between_proactive_seconds=0,
+                                   check_interval_seconds=5, trigger_probability=1.0)
+        with mock.patch.object(proactive.time, "time", return_value=100):
+            scheduler.notify_user_message_received(True, "101")
+            scheduler.notify_user_message_received(True, "102")
+            scheduler.notify_user_message_received(True, "103")
+        with mock.patch.object(proactive.time, "time", return_value=200):
+            asyncio.run(scheduler._tick_async())
+            self.assertEqual(calls, ["101"])
+            # 101 发送后轮转到队尾，下次轮到 102
+            self.assertEqual(list(scheduler._active_sessions.keys()),
+                             [("group", "102"), ("group", "103"), ("group", "101")])
+        with mock.patch.object(proactive.time, "time", return_value=400):
+            asyncio.run(scheduler._tick_async())
+            self.assertEqual(calls, ["101", "102"])
+
+    def test_zero_max_contacts_per_day_allows_unlimited_daily_sends_until_fused(self):
+        scheduler = self.scheduler()
+        self.config["private"].update(idle_threshold_seconds=0, min_interval_between_proactive_seconds=0,
+                                    max_unanswered_messages=2, max_contacts_per_day=0)
+        with mock.patch.object(proactive.time, "time", return_value=100):
+            scheduler.notify_user_message_received(False, "123")
+            for idx in range(5):
+                scheduler.notify_bot_message_sent(False, "123", is_proactive=True, contact_id=f"c-{idx}")
+                scheduler.notify_user_message_received(False, "123")
+            self.assertTrue(scheduler.can_send(False, "123", scheduler.get_session_state(False, "123")["activity_version"]))
+            # 无人回应达到熔断上限仍会拦住，与每日 0（不限制）互不冲突
+            scheduler.notify_bot_message_sent(False, "123", is_proactive=True, contact_id="u-1")
+            scheduler.notify_bot_message_sent(False, "123", is_proactive=True, contact_id="u-2")
+            self.assertFalse(scheduler.can_send(False, "123", scheduler.get_session_state(False, "123")["activity_version"]))
 
 
 if __name__ == "__main__":

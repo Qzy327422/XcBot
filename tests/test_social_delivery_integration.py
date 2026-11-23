@@ -16,7 +16,7 @@ TREE = ast.parse((Path(__file__).resolve().parents[1] / "main.py").read_text(enc
 
 
 def load(names, env):
-    nodes = [node for node in TREE.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
+    nodes = [node for node in TREE.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in names]
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "main-social-integration", "exec"), env)
     return env
 
@@ -39,7 +39,8 @@ class SocialDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.blacklist = set()
         self.env = load({"is_user_blacklisted", "_hard_blacklisted_author",
-                         "_receipt_succeeded", "_make_social_context", "_generate_proactive_content"}, {
+                         "_receipt_succeeded", "_make_social_context", "_generate_proactive_content",
+                         "ReplyKeywordFailure", "check_final_reply_for_failover"}, {
             "get_all_blacklist": lambda: self.blacklist,
             "_proactive_target_allowed": lambda *args: True,
             "normalize_bool_config": lambda value, default=False: bool(value),
@@ -47,6 +48,8 @@ class SocialDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "_ai_reply_allowed": lambda request, **kwargs: request.decision.check(True, ["222"], 0, **kwargs),
             "asyncio": asyncio, "time": __import__("time"),
             "is_trace_recording": lambda: False,
+            "build_final_send_parts": lambda text: [text],
+            "find_llm_reply_failover_keyword": lambda text: "",
         })
         self.request = RequestState(*self.key, ReplyDecision(*self.key, source="proactive"),
                                     actions=types.SimpleNamespace(del_message=delete))

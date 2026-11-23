@@ -825,6 +825,12 @@ html.liquid-glass body.drawer-transition .sidebar>.glass-lens-layer{display:none
 .page-anim>.plugin-root{animation:glass-card-in .58s .04s cubic-bezier(.22,.82,.2,1) both}
 html.liquid-glass .page-anim>.plugin-root{animation:glass-card-in .82s .05s cubic-bezier(.16,.84,.24,1) both !important;opacity:1 !important}
 @media(prefers-reduced-motion:reduce){.page-anim>.plugin-root,html.liquid-glass .page-anim>.plugin-root{animation:none !important}}
+.proactive-obs-advanced{margin-top:12px;padding:12px 14px;border:1px solid var(--line2);border-radius:14px;background:var(--glass3)}
+.proactive-obs-advanced>summary{cursor:pointer;font-size:13px;font-weight:700;color:var(--muted);list-style:none;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.proactive-obs-advanced>summary::-webkit-details-marker{display:none}
+.proactive-obs-advanced>summary:after{content:'⌄';font-size:14px;transition:transform .18s ease}
+.proactive-obs-advanced[open]>summary:after{transform:rotate(180deg)}
+.proactive-obs-advanced[open]>summary{margin-bottom:12px;color:var(--text)}
 .plugin-panel,.plugin-config-cards{display:grid;grid-template-columns:minmax(0,1fr);gap:14px}
 .mcp-server-fields{display:grid;gap:12px;margin-top:10px;min-width:0}
 .plugin-config-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;cursor:pointer;list-style:none;min-width:0}
@@ -859,6 +865,133 @@ html.liquid-glass .subtab-enter{animation:glass-subtab-content-in .18s ease-out;
 
 .persona-picker{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
 .persona-picker>label{min-width:0}
+
+/* 角色生活：生活内容优先、紧凑顶栏与柔和对比度层级。 */
+.role-life{--life-gap:20px;--life-small-gap:12px;--muted:rgba(232,247,255,.80);grid-column:1/-1;min-width:0;width:100%;display:grid;gap:16px;font-size:14px;line-height:1.6}
+html[data-theme="light"] .role-life{--muted:rgba(20,35,52,.74)}
+.page-anim>.role-life{animation:glass-card-in .58s .04s cubic-bezier(.22,.82,.2,1) both}
+html.liquid-glass .page-anim>.role-life{animation:glass-card-in .82s .05s cubic-bezier(.16,.84,.24,1) both !important;opacity:1 !important}
+@media(prefers-reduced-motion:reduce){.page-anim>.role-life,html.liquid-glass .page-anim>.role-life{animation:none !important}}
+.role-life *{min-width:0}
+.role-life :is(h2,h3,h4,p){margin:0}
+.role-life h2{font-size:22px;font-weight:700;line-height:1.3;letter-spacing:-.025em;overflow-wrap:anywhere}
+.role-life h3{font-size:18px;font-weight:700;line-height:1.45}
+.role-life h4{font-size:14px;font-weight:700;line-height:1.5}
+.role-life :is(button,label,strong){font-weight:600}
+.role-life .card{grid-column:auto;padding:24px;min-width:0}
+.role-life .card:before{opacity:.35}
+.role-life .card>.section-head{align-items:center}
+.role-life .section-head p{margin-top:6px;line-height:1.6;max-width:55ch}
+.role-life .btn{min-height:44px;padding:10px 16px;font-size:13px;font-weight:600;white-space:normal}
+.role-life :is(button,input,select,textarea):disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
+.role-life :is(button,input,select,textarea,summary):focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.role-life svg{width:20px;height:20px;flex:none;vertical-align:middle}
+.role-life .pill{font-size:12px;font-weight:500;white-space:nowrap;padding:4px 10px}
+.role-life .pill.ok{color:var(--ok)!important}.role-life .pill.bad{color:var(--bad)!important}
+.role-life .life-caption,.role-life .life-meta{color:var(--muted);font-size:12px;line-height:1.6;font-weight:400;overflow-wrap:anywhere}
+.role-life .life-meta{display:block}
+.role-life .life-lead{max-width:48ch;color:var(--muted);line-height:1.8;font-size:14px}
+.role-life-bar{display:grid!important;grid-template-columns:minmax(0,1fr);gap:14px;padding:18px 22px !important}
+.life-bar-top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.life-bar-identity{display:flex;align-items:center;gap:14px;min-width:0;flex:1 1 260px}
+.life-bar-heading{min-width:0}
+.life-bar-title{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.life-bar-meta{color:var(--muted);font-size:12px;margin-top:4px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.life-bar-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;flex:none;justify-content:flex-end}
+.life-bar-intro{padding-top:12px;border-top:1px solid var(--line2)}
+.life-intro-text{font-size:13px;line-height:1.7;color:var(--muted);max-width:70ch;margin:0}
+.role-life-mark{display:grid;place-items:center;width:48px;height:48px;flex:none;border:1px solid var(--line);border-radius:16px;background:var(--glass2);color:var(--accent2)}
+.role-life-mark svg{width:24px;height:24px}
+.life-selector-controls{display:flex;align-items:flex-end;gap:10px;flex:1 1 260px;max-width:460px}
+.life-selector-field{flex:1;min-width:120px}
+.life-selector-role{flex:1.15}
+.life-selector-field label{display:block;font-size:11px;color:var(--muted);margin-bottom:4px}
+.life-selector-field select{font-size:13px;min-height:44px}
+.life-refresh-btn{flex:none;min-height:42px}
+.life-eyebrow{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:500;color:var(--muted);letter-spacing:.04em;margin-bottom:8px}
+.life-eyebrow .pill{margin-left:auto}
+/* 深色普通模式全页标签统一用实底，保证对比度一致。 */
+html[data-theme="dark"]:not(.liquid-glass) .role-life .pill{background:var(--bg1) !important}
+.life-main-tabs,.life-subtabs{display:flex;gap:8px;max-width:100%;overflow-x:auto;scrollbar-width:thin;border-bottom:1px solid var(--line2);padding:0 0 4px}
+.life-tab{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;padding:12px 16px;min-height:44px;color:var(--muted);font-size:14px;font-weight:500;white-space:nowrap;cursor:pointer;flex:none;transition:color .15s,border-color .15s}
+.life-tab:hover{color:var(--text)}.life-tab.is-active{color:var(--text);border-bottom-color:var(--accent);font-weight:700}
+.life-subtabs{border-bottom:0;margin-bottom:16px;gap:16px}.life-subtabs .life-tab{padding:8px 4px;font-size:13px}
+.role-life-panel,.life-record-page{min-width:0}
+.life-overview-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:20px;align-items:start}
+.life-hero{min-height:220px;display:flex;flex-direction:column;gap:14px;border-top:3px solid var(--line)}
+.life-hero.is-enabled{border-top-color:var(--accent)}
+.role-life .life-hero h3{font-size:24px;line-height:1.3;font-weight:700;max-width:24ch;overflow-wrap:anywhere}
+.life-hero-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:4px}
+.life-stat{display:grid;gap:4px;padding:12px 14px;border:1px solid var(--line2);border-radius:14px;background:var(--glass3);min-width:0}
+.life-stat strong{font-size:13px;font-weight:600;color:var(--text);overflow-wrap:anywhere}
+.life-guide-list{display:grid;gap:10px;margin-top:4px}
+.life-guide-item{display:grid;gap:3px;padding:12px 14px;border:1px solid var(--line2);border-radius:14px;background:var(--glass3)}
+.life-guide-item strong{font-size:13px;font-weight:600;color:var(--text)}
+.life-guide-item span{font-size:12px;line-height:1.65;color:var(--muted);max-width:56ch}
+.life-hero-footer{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-top:auto;padding-top:16px;border-top:1px solid var(--line2)}
+.life-next{display:grid;gap:4px}.life-next time{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.life-mood{display:inline-flex;align-items:center;gap:8px;align-self:flex-start;padding:5px 12px;border-radius:999px;border:1px solid var(--line2);background:var(--glass3);font-size:12px;color:var(--muted)}
+.life-mood-dot{width:7px;height:7px;border-radius:50%;background:var(--accent2);flex:none}
+.life-today-preview{display:flex;flex-direction:column}
+.life-today-preview .life-text-button{margin-top:auto;padding-top:12px}
+.life-recent-preview,.life-alert-bar{grid-column:1/-1!important}
+.life-recent-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
+.life-recent-grid .life-record{padding:16px;border:1px solid var(--line2);border-radius:16px;background:var(--glass3);display:flex;flex-direction:column}
+.life-recent-grid .life-prose{display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+.life-alert-bar{padding:16px 22px!important;border-left:3px solid var(--bad)}
+.life-row-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.life-row-head>h4{flex:1}.life-row-head>.pill{flex:none}
+.life-timeline{list-style:none;margin:0;padding:0;display:grid;gap:0}.life-timeline-item{display:grid;grid-template-columns:56px 16px minmax(0,1fr);column-gap:12px;position:relative;padding:0 0 24px}
+.life-timeline-item:last-child{padding-bottom:0}.life-timeline-item:not(:last-child):before{content:'';position:absolute;left:75px;top:12px;bottom:0;border-left:1px solid var(--line)}
+.life-timeline-time{display:grid;align-content:start;gap:4px;text-align:right;font-size:12px;font-variant-numeric:tabular-nums}.life-timeline-time span{color:var(--muted)}
+.life-timeline-dot{width:8px;height:8px;border-radius:50%;border:2px solid var(--line);margin-top:6px;margin-left:4px;background:var(--bg1);position:relative;z-index:1}
+.is-current .life-timeline-dot{border-color:var(--accent2);background:var(--accent2)}.life-timeline-content{padding:0 0 4px}.is-current .life-timeline-content{border-left:2px solid var(--accent2);padding-left:12px}
+.life-timeline-content p{color:var(--muted);font-size:13px;line-height:1.7;max-width:55ch;margin-top:8px;overflow-wrap:anywhere}.life-timeline-content .life-meta{margin-top:8px}
+.life-timeline.is-compact .life-timeline-item{grid-template-columns:44px 12px minmax(0,1fr);column-gap:8px;padding-bottom:18px}.life-timeline.is-compact .life-timeline-item:before{left:59px}.life-timeline.is-compact .life-row-head{flex-wrap:wrap;gap:6px}.life-timeline.is-compact .life-row-head>h4{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.life-history-day+.life-history-day{margin-top:24px;padding-top:24px;border-top:1px solid var(--line2)}.life-history-day>h4{margin-bottom:16px}
+.life-record-list{display:grid;gap:20px}.life-record-list .life-record{padding:20px 0;border-bottom:1px solid var(--line2)}.life-record-list .life-record:first-child{padding-top:0}.life-record-list .life-record:last-child{border-bottom:0;padding-bottom:0}
+.life-record-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;color:var(--muted);font-size:12px}.life-record-kind{display:inline-flex;align-items:center;gap:8px}.life-record-head time{font-variant-numeric:tabular-nums;flex:none}
+.role-life .life-prose{white-space:pre-wrap;overflow-wrap:anywhere;max-width:60ch;font-size:14px;line-height:1.85;color:var(--text)}
+.life-reading summary{list-style:none;cursor:pointer}.life-reading summary::-webkit-details-marker{display:none}.life-excerpt{display:block;color:var(--text);font-size:14px;line-height:1.85;max-width:60ch;overflow-wrap:anywhere;white-space:pre-wrap}.life-reading-toggle{display:block;color:var(--accent);font-size:12px;min-height:44px;padding-top:12px}.life-reading[open] .life-excerpt{display:none}.life-reading[open] .life-reading-toggle{font-size:0}.life-reading[open] .life-reading-toggle:after{content:'收起全文';font-size:12px}
+.life-actions{display:flex;flex-wrap:wrap;align-items:center;gap:12px}.life-section-footer{border-top:1px solid var(--line2);padding-top:24px;margin-top:24px}.life-section-footer>.life-caption{max-width:45ch}
+.life-text-button{background:transparent;border:0;color:var(--accent);font-size:13px;padding:8px 0;min-height:44px;text-align:left;cursor:pointer}.life-text-button.is-danger{color:var(--bad)}
+.life-pager{display:flex;justify-content:center;align-items:center;gap:16px;margin-top:24px;padding-top:16px;border-top:1px solid var(--line2);font-size:12px;color:var(--muted)}
+.life-item-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.life-mini-btn{min-height:28px;min-width:44px;padding:4px 10px;border:1px solid var(--line);border-radius:10px;background:var(--glass3);color:var(--text);font-size:12px;font-weight:500;line-height:1.3;cursor:pointer;transition:border-color .15s,background .15s}
+.life-mini-btn:hover{border-color:var(--accent);background:var(--glass2)}.life-mini-btn.is-danger{color:var(--bad)}
+.role-life .btn.life-btn-accent{border-color:var(--accent);background:linear-gradient(135deg,rgba(var(--accent-rgb),.24),rgba(var(--accent2-rgb),.20));color:var(--text)}
+.life-inline-form{display:grid;gap:12px;margin:12px 0 16px;padding:16px;border:1px solid var(--line);border-radius:16px;background:var(--glass3)}
+.life-inline-form h4{font-size:14px}
+.life-inline-form label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+.life-inline-form :is(input,textarea){min-height:40px;font-family:inherit;font-size:13px}
+.life-inline-form textarea{min-height:96px;line-height:1.7}
+.life-inline-grid{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);gap:12px}
+.life-inline-times{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.life-notes-card{margin-top:16px}
+.life-notes-list{list-style:none;margin:0;padding:0;display:grid;gap:10px}
+.life-note-row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 14px;border:1px solid var(--line2);border-radius:14px;background:var(--glass3)}
+.life-note-row>div{display:grid;gap:4px}
+.life-job-list{display:grid;gap:0}.life-job{padding:20px 0;border-bottom:1px solid var(--line2)}.life-job:first-child{padding-top:0}.life-job:last-child{border:0}.life-job .life-actions{margin-top:12px}
+.life-job-error{margin-top:12px;color:var(--muted);font-size:12px}.life-job-error summary{cursor:pointer;min-height:44px;padding-top:8px}.life-job-error pre{margin:0;padding:12px;background:var(--glass3);border-radius:12px;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;max-height:240px;overflow:auto}
+.life-settings-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:20px}.life-settings-main{display:grid;gap:20px}.life-enable-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;flex:none}
+.life-toggle-list{display:grid}.life-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:16px 0;border-top:1px solid var(--line2)}.life-toggle-row:first-child{border-top:0;padding-top:0}.life-toggle-row:last-child{padding-bottom:0}.life-toggle-row label{font-size:14px;display:block;margin-bottom:4px}.life-toggle-row p{max-width:52ch}
+.life-toggle-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.life-toggle-grid .life-toggle-row{border:1px solid var(--line2);border-radius:14px;background:var(--glass3);padding:14px 16px;gap:16px}
+.life-toggle-grid .life-toggle-row:first-child,.life-toggle-grid .life-toggle-row:last-child{padding:14px 16px;border-top:1px solid var(--line2)}
+.role-life .switch{width:58px;height:44px;padding:0;flex:none;position:relative;margin:0;background:transparent;border:0;box-shadow:none}.role-life .switch:before{content:'';position:absolute;inset:6px 0;border:1px solid var(--line);border-radius:999px;background:var(--glass3);box-shadow:inset 0 1px 3px rgba(0,0,0,.2)}.role-life .switch.on:before{background:linear-gradient(135deg,var(--accent),var(--accent2))}.role-life .switch:after{top:11px}.role-life .switch:disabled{opacity:.45}
+.life-form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.life-form-grid-auto{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}.life-setting-field label{display:block;font-size:13px;margin-bottom:8px}.life-setting-field :is(input,select,textarea){min-height:44px;font-family:inherit;font-size:14px}.life-setting-field p{margin-top:8px}.life-setting-field textarea{min-height:120px;line-height:1.7}
+.life-advanced>summary{display:flex;justify-content:space-between;align-items:center;gap:16px;cursor:pointer;list-style:none}.life-advanced>summary::-webkit-details-marker{display:none}.life-advanced>summary p{font-size:12px;color:var(--muted);margin-top:8px}.life-advanced-content{display:grid;gap:20px;margin-top:20px;padding-top:20px;border-top:1px solid var(--line2)}
+.life-danger-zone{display:flex;justify-content:space-between;gap:24px;align-items:center;border:1px solid var(--line2);border-radius:18px;padding:20px 24px}.life-danger-zone h3{font-size:14px}.life-danger-zone p{font-size:12px;color:var(--muted);margin-top:8px;max-width:56ch}.life-danger-zone button{flex:none}
+.life-master-control{display:inline-flex;align-items:center;gap:10px;min-height:42px;padding:0 8px 0 14px;border:1px solid var(--line);border-radius:999px;background:var(--glass3)}
+.life-master-control label{font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;cursor:pointer}
+.life-empty{display:grid;justify-items:center;gap:12px;text-align:center;padding:32px 12px}.life-empty h3{font-size:16px}.life-empty p{max-width:36ch;color:var(--muted);font-size:13px;line-height:1.8}.life-empty-icon{display:grid;place-items:center;width:48px;height:48px;border-radius:16px;background:var(--glass2);color:var(--muted)}
+.life-notice{display:flex;align-items:flex-start;gap:12px;padding:16px;border:1px solid var(--line2);border-radius:16px;background:var(--glass3);font-size:13px;line-height:1.7;margin-bottom:16px}.life-notice p{overflow-wrap:anywhere}.life-notice-icon{flex:none;color:var(--muted)}.life-notice.is-error{border-left:3px solid var(--bad)}.life-notice.is-success{border-left:3px solid var(--ok)}
+.life-page-message{padding:8px 0;font-size:13px}.life-page-message.is-error{color:var(--bad)}.life-page-message.is-success{color:var(--ok)}
+.life-loading-page{display:grid;justify-items:center;gap:16px;padding:64px 16px}.life-loading-page p,.life-loading{color:var(--muted);font-size:13px}.life-loading{display:flex;align-items:center;gap:12px;padding:24px}.life-error-page{padding:24px}.life-loader{display:inline-block;width:20px;height:20px;flex:none;border-radius:50%;border:2px solid var(--line);border-top-color:var(--accent);animation:life-spin .8s linear infinite}
+@keyframes life-spin{to{transform:rotate(360deg)}}
+@media(max-width:980px){.life-overview-grid{grid-template-columns:minmax(0,1fr)}.role-life .life-hero{min-height:200px}}
+@media(max-width:820px){.life-recent-grid,.life-toggle-grid{grid-template-columns:minmax(0,1fr)}.life-bar-actions{width:100%;justify-content:space-between}}
+@media(max-width:600px){.role-life{gap:12px}.role-life .card{padding:16px}.role-life-bar{padding:16px !important;gap:12px}.role-life-mark{display:none}.role-life h2{font-size:20px}.life-hero-stats{grid-template-columns:minmax(0,1fr)}.life-selector-controls{max-width:none;width:100%}.life-selector-field{min-width:0}.role-life .life-hero h3{font-size:22px}.life-tab{padding:10px 12px;font-size:13px}.life-overview-grid,.life-settings-main{gap:16px}.life-hero-footer{align-items:flex-start;gap:16px}.life-form-grid,.life-inline-grid{grid-template-columns:minmax(0,1fr);gap:16px}.life-toggle-row{gap:16px}.life-note-row{flex-direction:column;align-items:flex-start}.life-record-head{align-items:flex-start;flex-wrap:wrap;gap:4px}.life-timeline-item{grid-template-columns:44px 12px minmax(0,1fr);column-gap:8px}.life-timeline-item:not(:last-child):before{left:59px}.life-row-head{flex-wrap:wrap}.life-danger-zone{flex-direction:column;align-items:flex-start;padding:16px;gap:8px}.life-pager{gap:8px}.life-pager .btn{padding:8px 12px}.life-prose{font-size:14px}}
+@media(prefers-reduced-motion:reduce){.role-life *{scroll-behavior:auto!important;transition:none!important}.life-loader{animation:none}}
 
 .donut-layout{display:grid;grid-template-columns:180px minmax(0,1fr);gap:18px;align-items:center}
 .donut-layout>*{min-width:0}

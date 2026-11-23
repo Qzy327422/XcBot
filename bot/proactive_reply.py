@@ -24,7 +24,7 @@ from bot.paths import BASE_DIR
 
 DEFAULT_OBSERVATION_CONFIG: dict[str, Any] = {
     "enabled": True,
-    "trigger_probability": 0.5,
+    "trigger_probability": 0.35,
     "default_wait_seconds": 60,
     "min_wait_seconds": 10,
     "max_wait_seconds": 600,
@@ -46,7 +46,10 @@ _OBSERVATION_BOUNDS = {
 def _normalize_observation(raw: Any, kind: str) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError(f"{kind}.observation must be an object")
-    cfg = {**copy.deepcopy(DEFAULT_OBSERVATION_CONFIG), **copy.deepcopy(raw)}
+    base = copy.deepcopy(DEFAULT_OBSERVATION_CONFIG)
+    if kind == "private":
+        base["enabled"] = False
+    cfg = {**base, **copy.deepcopy(raw)}
     # 已废弃的总窗口/聊天轮数硬停不再参与调度，其余扩展字段仍保留。
     cfg.pop("window_seconds", None)
     cfg.pop("max_continuation_rounds", None)
@@ -69,25 +72,29 @@ def _normalize_observation(raw: Any, kind: str) -> dict[str, Any]:
 
 DEFAULT_GROUP_CONFIG: dict[str, Any] = {
     "enabled": False,
-    "trigger_probability": 0.3,
-    "check_interval_seconds": 60,
-    "idle_threshold_seconds": 900,
+    "trigger_probability": 0.25,
+    "check_interval_seconds": 180,
+    "idle_threshold_seconds": 1800,
     "max_consecutive_bot_messages": 3,
-    "min_interval_between_proactive_seconds": 1800,
+    "min_interval_between_proactive_seconds": 3600,
     "whitelist": [],
     "blacklist": [],
+    "quiet_hours": [],
+    "max_contacts_per_day": 0,
     "observation": copy.deepcopy(DEFAULT_OBSERVATION_CONFIG),
 }
 DEFAULT_PRIVATE_CONFIG: dict[str, Any] = {
     "enabled": False,
-    "trigger_probability": 0.1,
-    "check_interval_seconds": 120,
-    "idle_threshold_seconds": 43200,
+    "trigger_probability": 0.2,
+    "check_interval_seconds": 180,
+    "idle_threshold_seconds": 7200,
     "max_unanswered_messages": 3,
-    "min_interval_between_proactive_seconds": 86400,
+    "min_interval_between_proactive_seconds": 10800,
     "whitelist": [],
     "blacklist": [],
-    "observation": copy.deepcopy(DEFAULT_OBSERVATION_CONFIG),
+    "quiet_hours": [],
+    "max_contacts_per_day": 0,
+    "observation": {**copy.deepcopy(DEFAULT_OBSERVATION_CONFIG), "enabled": False},
 }
 
 
@@ -95,7 +102,7 @@ def normalize_config(raw: Any) -> dict[str, dict[str, Any]]:
     """合并 group/private 默认值；非法值抛 ValueError，绝不把坏名单当作全开。
 
     enabled 只接受 bool；数值不接受 bool/字符串/非有限数；概率为 [0, 1]，
-    冷场检查间隔至少 5 秒，其余冷场时间非负，熔断次数为正整数。
+    冷场检查间隔至少 5 秒，其余冷场时间非负，每日主动次数上限为非负整数（0 表示不限制），熔断次数为正整数。
     observation 单次等待 1~3600 秒，debounce 0~300 秒，续聊间隔 1~3600 秒；
     min/default/max 等待和 debounce/max_debounce 同时校验顺序。
     名单只接受正整数 QQ 号或对应十进制字符串组成的 list。
@@ -108,12 +115,13 @@ def normalize_config(raw: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(section, dict):
             raise ValueError(f"{kind} must be an object")
         cfg = {**copy.deepcopy(defaults), **copy.deepcopy(section)}
+        cfg.pop("max_background_calls_per_day", None)
         cfg["observation"] = _normalize_observation(cfg["observation"], kind)
         if type(cfg["enabled"]) is not bool:
             raise ValueError(f"{kind}.enabled must be bool")
         for name in defaults:
             value = cfg[name]
-            if name in ("enabled", "whitelist", "blacklist", "observation"):
+            if name in ("enabled", "whitelist", "blacklist", "quiet_hours", "observation"):
                 continue
             if type(value) not in (int, float):
                 raise ValueError(f"{kind}.{name} must be a finite number")
@@ -128,7 +136,10 @@ def normalize_config(raw: Any) -> dict[str, dict[str, Any]]:
                 raise ValueError(f"{kind}.{name} must be >= {minimum}")
             if name == "trigger_probability" and value > 1:
                 raise ValueError(f"{kind}.{name} must be in [0, 1]")
-            if name.startswith("max_") and (type(value) is not int or value < 1):
+            if name == "max_contacts_per_day":
+                if type(value) is not int or value < 0:
+                    raise ValueError(f"{kind}.{name} must be a non-negative integer")
+            elif name.startswith("max_") and (type(value) is not int or value < 1):
                 raise ValueError(f"{kind}.{name} must be a positive integer")
         for name in ("whitelist", "blacklist"):
             value = cfg[name]
@@ -143,6 +154,12 @@ def normalize_config(raw: Any) -> dict[str, dict[str, Any]]:
                     raise ValueError(f"{kind}.{name} contains an invalid QQ id")
                 ids.append(text.lstrip("0"))
             cfg[name] = list(dict.fromkeys(ids))
+        quiet = cfg["quiet_hours"]
+        if (not isinstance(quiet, list) or any(
+                not isinstance(window, (list, tuple)) or len(window) != 2
+                or any(type(hour) is not int or not 0 <= hour <= 23 for hour in window)
+                for window in quiet)):
+            raise ValueError(f"{kind}.quiet_hours must be [[start_hour, end_hour], ...]")
         result[kind] = cfg
     return result
 
@@ -152,6 +169,11 @@ MAX_SESSIONS = 1000
 RECENT_PROACTIVE_LIMIT = 10
 RECENT_CONTENT_LIMIT = 1000
 RECENT_INCOMING_LIMIT = 128
+
+
+def reserve_account_call_once(account_id: str, limit: int, now: float) -> bool:
+    """兼容保留的账号后台调用入口（已取消账号级共享调用上限）。"""
+    return True
 
 
 @dataclass(eq=False)
@@ -205,7 +227,29 @@ def _default_state() -> dict[str, Any]:
         "activity_version": 0,
         # 每条成功主动消息：{"sent_at": float, "content": str}，最多 10 条。
         "recent_proactive_messages": [],
+        "next_check_at": 0.0,
+        "last_attempt_at": 0.0,
+        "unknown_until": 0.0,
+        "recent_angles": [],
+        "recent_opportunity_ids": [],
+        "recent_contact_ids": [],
+        "background_calls": [],
+        "contact_times": [],
+        "follow_ups": [],
     }
+
+
+def _valid_follow_up(item: Any) -> bool:
+    return (isinstance(item, dict) and isinstance(item.get("id"), str) and 0 < len(item["id"]) <= 64
+            and isinstance(item.get("summary"), str) and 0 < len(item["summary"]) <= 500
+            and item.get("status") in ("open", "resolved", "cancelled")
+            and isinstance(item.get("sources"), list) and 1 <= len(item["sources"]) <= 8
+            and all(isinstance(source, dict) and isinstance(source.get("id"), str)
+                    and 0 < len(source["id"]) <= 128 and isinstance(source.get("author"), str)
+                    and isinstance(source.get("text"), str) and len(source["text"]) <= 500
+                    and source.get("is_bot") is False for source in item["sources"])
+            and all(type(item.get(field)) in (int, float) and math.isfinite(item[field])
+                    and item[field] >= 0 for field in ("created_at", "updated_at")))
 
 
 class _StateStore:
@@ -215,7 +259,10 @@ class _StateStore:
     这样用户入口无需为淘汰而 fsync，也不会静默丢弃未持久化状态。
     """
 
-    def __init__(self, max_entries: int = MAX_SESSIONS) -> None:
+    def __init__(self, max_entries: int = MAX_SESSIONS, *, account_id: str = "",
+                 allow_legacy: bool = True) -> None:
+        self.account_id = account_id
+        self.allow_legacy = allow_legacy
         self._lock = threading.RLock()
         self._flush_lock = threading.Lock()
         self._cache: dict[tuple[str, str], dict[str, Any]] = {}
@@ -223,11 +270,20 @@ class _StateStore:
         self._revision = 0
         self._max_entries = max_entries
 
+    def _path(self, kind: str, chat_id: str) -> str:
+        path = _state_path(kind, chat_id)
+        return os.path.join(_STATE_DIR, self.account_id, os.path.basename(path)) if self.account_id else path
+
     def _read(self, kind: str, chat_id: str) -> dict[str, Any]:
         state = _default_state()
         try:
-            with open(_state_path(kind, chat_id), "r", encoding="utf-8") as f:
+            path = self._path(kind, chat_id)
+            legacy = self.account_id and not os.path.exists(path) and self.allow_legacy
+            with open(_state_path(kind, chat_id) if legacy else path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            if (self.account_id and (not isinstance(data, dict)
+                    or (data.get("account_id") and str(data.get("account_id")) != self.account_id))):
+                return state
             if isinstance(data, dict):
                 for name, default in state.items():
                     value = data.get(name, default)
@@ -240,6 +296,17 @@ class _StateStore:
                                 and type(item.get("sent_at")) in (int, float)
                                 and math.isfinite(item["sent_at"])
                             ]
+                    elif name == "follow_ups":
+                        if isinstance(value, list):
+                            state[name] = [copy.deepcopy(item) for item in value[-20:]
+                                           if _valid_follow_up(item)]
+                    elif name in ("recent_angles", "recent_opportunity_ids", "recent_contact_ids"):
+                        if isinstance(value, list):
+                            state[name] = [item[:240] for item in value[-20:] if isinstance(item, str)]
+                    elif name in ("background_calls", "contact_times"):
+                        if isinstance(value, list):
+                            state[name] = [item for item in value[-512:] if type(item) in (int, float)
+                                           and math.isfinite(item) and item >= 0]
                     elif type(value) in (int, float) and math.isfinite(value) and value >= 0:
                         if type(default) is not int or type(value) is int:
                             state[name] = value
@@ -297,7 +364,8 @@ class _StateStore:
             errors = []
             for key, revision, state in pending:
                 try:
-                    atomic_write_json(_state_path(*key), state, indent=2)
+                    payload = {**state, "account_id": self.account_id} if self.account_id else state
+                    atomic_write_json(self._path(*key), payload, indent=2)
                 except Exception as exc:
                     errors.append(exc)
                     continue
@@ -349,6 +417,184 @@ class ProactiveReplyScheduler:
         self._thread: threading.Thread | None = None
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task | None = None
+        self._account_id = ""
+        self._history_allowed: set[tuple[str, str]] = set()
+        self._bootstrap_lock = threading.Lock()
+        self._connection_guard: Callable[[], bool] | None = None
+        self._requires_bootstrap = False  # 单例生产入口强制账号就绪；独立离线实例兼容旧API。
+        self._bootstrap_ready = False
+        self._known_histories: set[tuple[str, str]] = set()
+        self._restored_candidates: set[tuple[str, str]] = set()
+
+    def bootstrap(self, account_id: str, get_all_sessions: Callable[[], dict], *,
+                  is_current: Callable[[], bool] = lambda: True) -> bool:
+        """恢复长期候选/防打扰状态（兼容 v4.0 平铺状态与历史会话，无需手工认领）。"""
+        account_id = str(account_id)
+        if not account_id.isascii() or not account_id.isdecimal() or int(account_id) <= 0:
+            return False
+        with self._bootstrap_lock:
+            if not is_current() or self._stop.is_set():
+                return False
+            cfg_all = self._config()
+            histories = get_all_sessions()  # 仅枚举文件名；具体会话由 cmc 懒加载。
+            known = {(kind, str(cid)) for kind in ("group", "private")
+                     for cid in histories.get(kind, []) if str(cid).isascii()
+                     and str(cid).isdecimal() and int(cid) > 0}
+            candidates = set(known)
+            directory = os.path.join(_STATE_DIR, account_id)
+            for folder in (directory, _STATE_DIR):
+                try:
+                    filenames = os.listdir(folder)
+                except OSError:
+                    continue
+                for filename in filenames:
+                    match = re.fullmatch(r"(group|private)_([1-9][0-9]*)\.json", filename)
+                    if match:
+                        candidates.add((match[1], match[2]))
+            for kind, cfg in cfg_all.items():
+                candidates.update((kind, cid) for cid in cfg["whitelist"])
+            allowed = set(candidates)
+            if not is_current():
+                return False
+            with self._lock:
+                if not is_current() or self._stop.is_set():
+                    return False
+                if self._account_id != account_id or not self._store.allow_legacy:
+                    self.cancel_observations("restart")
+                    self._flush()
+                    self._store = _StateStore(account_id=account_id, allow_legacy=True)
+                    self._account_id = account_id
+                self._connection_guard = is_current
+                self._bootstrap_ready = True
+                self._history_allowed = allowed
+                self._restored_candidates = set(allowed)
+                self._known_histories = known
+                for kind, cid in sorted(allowed):
+                    cfg = cfg_all[kind]
+                    if (cfg["enabled"] and self._is_allowed(cfg, cid)
+                            and (cfg["whitelist"] or (kind, cid) in known)):
+                        self._store.load(kind, cid)
+                        # 历史存在本身可授权长期冷场，无需伪造用户发言时刻。
+                        self._register(kind, cid, cfg_all)
+                        self._store.update(kind, cid, lambda s: s.update(
+                            activity_version=s["activity_version"] + 1))
+                self._flush()
+            return True
+
+    def _register_hot_whitelist(self, cfg_all: dict[str, dict[str, Any]]) -> None:
+        """冷场 tick 接纳热更新白名单目标。"""
+        with self._bootstrap_lock, self._lock:
+            if (not self._account_id or not self._bootstrap_ready or self._stop.is_set()
+                    or (self._connection_guard is not None and not self._connection_guard())):
+                return
+            for kind, cfg in cfg_all.items():
+                if not cfg["enabled"]:
+                    continue
+                for cid in cfg["whitelist"]:
+                    key = (kind, cid)
+                    if key in self._history_allowed or not self._is_allowed(cfg, cid):
+                        continue
+                    self._history_allowed.add(key)
+                    self._restored_candidates.add(key)
+
+    def history_allowed(self, is_group: bool, chat_id: str) -> bool:
+        return not self._account_id or ("group" if is_group else "private", str(chat_id)) in self._history_allowed
+
+    def reserve_background_call(self, is_group: bool, chat_id: str, version: int, account_id: str = "") -> bool:
+        """检查当前回合发起后台判断或生成的会话资格与每日联系上限；不限制后台调用总次数。"""
+        key = ("group" if is_group else "private", str(chat_id))
+        cfg = self._config()[key[0]]
+        with self._lock:
+            state = self._store.load(*key)
+            now = time.time()
+            if ((account_id and str(account_id) != self._account_id) or key not in self._active_sessions
+                    or state["activity_version"] != version
+                    or self._daily_contacts_exhausted(cfg, state, now)
+                    or not self._eligible(*key, cfg, state, now, continuation=True)):
+                return False
+            return True
+
+    def record_follow_up(self, is_group: bool, chat_id: str, account_id: str,
+                         summary: str, sources: list[dict], *, follow_up_id: str = "",
+                         status: str = "open", version: int | None = None) -> str:
+        """同回合显式工具记录；只存有来源的事项，不生成承诺/截止时间/提醒任务。"""
+        import uuid
+        key = ("group" if is_group else "private", str(chat_id))
+        cfg = self._config()[key[0]]
+        if (not isinstance(summary, str) or not summary.strip() or len(summary) > 500
+                or status not in ("open", "resolved", "cancelled")
+                or not isinstance(follow_up_id, str) or len(follow_up_id) > 64
+                or not isinstance(sources, list)):
+            return "error: 未结事项参数无效。"
+        now = time.time()
+        evidence = [{field: source.get(field) for field in ("id", "author", "text", "is_bot")}
+                    for source in sources if isinstance(source, dict)]
+        item = {"id": follow_up_id or uuid.uuid4().hex, "summary": summary.strip(),
+                "status": status, "sources": evidence, "created_at": now, "updated_at": now}
+        if len(evidence) != len(sources) or not _valid_follow_up(item):
+            return "error: 必须提供当前会话可验证的用户消息来源。"
+        with self._lock:
+            if (not self._account_id or str(account_id) != self._account_id or not self._bootstrap_ready
+                    or key not in self._history_allowed or not cfg["enabled"] or not self._is_allowed(cfg, key[1])
+                    or self._stop.is_set() or (self._connection_guard is not None and not self._connection_guard())):
+                return "error: 未结事项的账号或会话资格已失效。"
+            state = self._store.load(*key)
+            if version is not None and state["activity_version"] != version:
+                return "error: 原回合已失效，未记录事项。"
+            items = state["follow_ups"]
+            previous = next((value for value in items if value["id"] == follow_up_id), None)
+            if follow_up_id and previous is None:
+                return "error: 事项ID不属于当前会话。"
+            if previous is not None:
+                item["created_at"] = previous["created_at"]
+                current_ids = {source["id"] for source in evidence}
+                item["sources"] = (evidence + [source for source in previous["sources"]
+                                                if source["id"] not in current_ids])[:8]
+            else:
+                duplicate = next((value for value in items if value["summary"] == item["summary"]
+                                  and value["sources"] == evidence and value["status"] == status), None)
+                if duplicate is not None:
+                    return json.dumps(duplicate, ensure_ascii=False)
+                if len(items) >= 20 and all(value["status"] == "open" for value in items):
+                    return "error: 当前会话未结事项已满，请先更新已有事项。"
+            updated = [value for value in items if value["id"] != item["id"]]
+            if len(updated) >= 20:
+                closed = next(value for value in updated if value["status"] != "open")
+                updated.remove(closed)
+            if self._store.update(*key, lambda value: value.update(follow_ups=updated + [item])) is None:
+                return "error: 事项存储容量已满。"
+            try:
+                self._store.flush(*key)
+            except OSError:
+                return "error: 事项持久化未确认，未安排任何提醒。"
+            return json.dumps(item, ensure_ascii=False)
+
+    def record_plan(self, is_group: bool, chat_id: str, version: int, plan: dict,
+                    opportunity_id: str, *, account_id: str = "") -> None:
+        key = ("group" if is_group else "private", str(chat_id))
+        with self._lock:
+            if ((account_id and str(account_id) != self._account_id)
+                    or self._store.load(*key)["activity_version"] != version):
+                return
+            angle = str(plan.get("angle", ""))[:240]
+            def mutate(state):
+                if angle:
+                    state["recent_angles"] = (state["recent_angles"] + [angle])[-20:]
+                state["recent_opportunity_ids"] = (state["recent_opportunity_ids"] + [opportunity_id[:240]])[-20:]
+            self._store.update(*key, mutate)
+
+    def mark_attempt(self, is_group: bool, chat_id: str, version: int, *, unknown: bool = False, account_id: str = "") -> None:
+        key = ("group" if is_group else "private", str(chat_id))
+        cfg = self._config()[key[0]]
+        with self._lock:
+            if ((not account_id or str(account_id) == self._account_id)
+                    and self._store.load(*key)["activity_version"] == version):
+                now = time.time()
+                self._store.update(*key, lambda s: s.update(last_attempt_at=now,
+                    unknown_until=max(s["unknown_until"], now + max(300, cfg["min_interval_between_proactive_seconds"])) if unknown else s["unknown_until"],
+                    next_check_at=max(s["next_check_at"], now + max(
+                        cfg["check_interval_seconds"], cfg["min_interval_between_proactive_seconds"] if unknown else 0))))
+                self._flush()
 
     def _report(self, message: str) -> None:
         if message.startswith("observation "):
@@ -452,12 +698,18 @@ class ProactiveReplyScheduler:
                 self._recent_incoming.pop(victim, None)
                 self._reply_tickets.pop(victim, None)
             self._active_sessions[key] = time.time()
+            if self._account_id and key not in self._history_allowed:
+                self._history_allowed.add(key)
+                self._restored_candidates.add(key)
 
     def touch_session(self, is_group: bool, chat_id: str) -> None:
         kind = "group" if is_group else "private"
         with self._lock:
             cfg_all = self._config()
-            if cfg_all[kind]["enabled"] and self._is_allowed(cfg_all[kind], str(chat_id)):
+            cfg = cfg_all[kind]
+            key = (kind, str(chat_id))
+            if (cfg["enabled"] and self._is_allowed(cfg, str(chat_id))
+                    and (not self._account_id or key in self._known_histories or str(chat_id) in cfg["whitelist"])):
                 self._register(kind, str(chat_id), cfg_all)
 
     def _cancel_episode_locked(self, key: tuple[str, str], reason: str = "policy") -> None:
@@ -481,18 +733,22 @@ class ProactiveReplyScheduler:
             return None
         return self._observations.get(key)
 
-    def notify_user_message_received(self, is_group: bool, chat_id: str, *, message_id: str = "") -> _ReplyObservationTicket | None:
+    def notify_user_message_received(self, is_group: bool, chat_id: str, *,
+                                     message_id: str = "", account_id: str = "") -> _ReplyObservationTicket | None:
         """活动登记同锁签发一次性普通回复观察资格；重复事件不重新签发。"""
-        return self._note_incoming(is_group, chat_id, normal_handled=None, message_id=message_id)
+        return self._note_incoming(is_group, chat_id, normal_handled=None,
+                                   message_id=message_id, account_id=account_id)
 
     def complete_normal_reply(self, is_group: bool, chat_id: str, *, normal_handled: bool,
                               message_id: str = "", ticket: object = None,
-                              reply_sent: bool = False) -> bool:
+                              reply_sent: bool = False, account_id: str = "") -> bool:
         """原子确认入站路由，再消费生成前取得的资格；不得发送后冒领新版本。"""
         if type(normal_handled) is not bool:
             raise ValueError("normal_handled must be bool")
         key = ("group" if is_group else "private", str(chat_id))
         with self._lock:
+            if account_id and self._account_id and str(account_id) != self._account_id:
+                return False
             # 必须先捕获新鲜度：晚到的 route confirmation 不能替旧回复认领新活动。
             valid = (isinstance(ticket, _ReplyObservationTicket) and ticket.key == key
                      and ticket.lifecycle is self._lifecycle
@@ -500,10 +756,15 @@ class ProactiveReplyScheduler:
                      and ticket.activity_version == self._store.load(*key)["activity_version"]
                      and ticket.digest == hashlib.sha256(message_id.encode("utf-8")).digest())
             digest = hashlib.sha256(message_id.encode("utf-8")).digest() if message_id else None
-            # reset/disconnect 已清掉路由记录时，迟到的 finally 不是新的用户活动。
-            if (not isinstance(ticket, _ReplyObservationTicket)
-                    or digest in self._recent_incoming.get(key, {})):
-                self.note_incoming(is_group, chat_id, normal_handled=normal_handled, message_id=message_id)
+            # reset/disconnect/未取到票的旧请求，绝不再当成新用户活动补登记以免误取消新观察。
+            if valid and digest in self._recent_incoming.get(key, {}):
+                self.note_incoming(is_group, chat_id, normal_handled=normal_handled,
+                                   message_id=message_id, account_id=account_id)
+            elif digest is not None:
+                recent = self._recent_incoming.get(key, {})
+                if digest in recent and recent[digest] is None:
+                    # 过期、无票或迟到的旧请求只解除自身路由未决状态，不触发 note_incoming 以免取消后续新观察。
+                    recent[digest] = bool(normal_handled)
             if not isinstance(ticket, _ReplyObservationTicket) or ticket.completed:
                 return False
             ticket.completed = True
@@ -513,6 +774,7 @@ class ProactiveReplyScheduler:
                 return False
             cfg = self._config()[key[0]]
             state = self._store.load(*key)
+            now = time.time()
             reason = ("stale_ticket" if not valid or state["activity_version"] != ticket.activity_version else
                       "not_final_success" if not reply_sent or not normal_handled else
                       "stopped" if self._stop.is_set() else
@@ -520,7 +782,8 @@ class ProactiveReplyScheduler:
                       "not_allowed" if not self._is_allowed(cfg, key[1]) else
                       "observation_disabled" if not cfg["observation"]["enabled"] else
                       "inactive" if key not in self._active_sessions else
-                      "fused" if not self._eligible(*key, cfg, state, time.time(), continuation=True) else "")
+                      "fused" if (not self._eligible(*key, cfg, state, now, continuation=True)
+                                  or self._daily_contacts_exhausted(cfg, state, now)) else "")
             if reason:
                 self._report(f"observation reject session={key[0]}_{key[1]} source=normal version={ticket.activity_version} reason={reason}")
                 return False
@@ -546,21 +809,26 @@ class ProactiveReplyScheduler:
         return True
 
     def note_incoming(self, is_group: bool, chat_id: str, *,
-                      normal_handled: bool, message_id: str = "") -> None:
+                      normal_handled: bool, message_id: str = "", account_id: str = "") -> None:
         """路由确定后调用；普通 AI/命令（即使被 weak 拒绝）优先于观察。"""
         if type(normal_handled) is not bool:
             raise ValueError("normal_handled must be bool")
-        self._note_incoming(is_group, chat_id, normal_handled=normal_handled, message_id=message_id)
+        self._note_incoming(is_group, chat_id, normal_handled=normal_handled,
+                            message_id=message_id, account_id=account_id)
 
     def _note_incoming(self, is_group: bool, chat_id: str, *,
-                       normal_handled: bool | None, message_id: str) -> _ReplyObservationTicket | None:
+                       normal_handled: bool | None, message_id: str,
+                       account_id: str = "") -> _ReplyObservationTicket | None:
         kind, chat_id = ("group" if is_group else "private"), str(chat_id)
         key = (kind, chat_id)
         with self._lock:
+            if account_id and self._account_id and str(account_id) != self._account_id:
+                return None
             cfg_all = self._config()
             cfg = cfg_all[kind]
             # 与 stop/热关闭的标记排序，入口不落盘。
-            if self._stop.is_set():
+            if (self._stop.is_set() or (self._requires_bootstrap and not self._bootstrap_ready)
+                    or (self._connection_guard is not None and not self._connection_guard())):
                 return
             if not cfg["enabled"] or not self._is_allowed(cfg, chat_id):
                 self._cancel_episode_locked(key)
@@ -657,8 +925,10 @@ class ProactiveReplyScheduler:
             if key in self._observations:
                 return
             # 只接受本进程成功发送的资格；重启、finish、用户新活动均不能复活旧消息。
+            now = time.time()
             if (self._begin_eligible.pop(key, None) != state["activity_version"]
-                    or not self._eligible(kind, chat_id, cfg, state, time.time(), continuation=True)):
+                    or not self._eligible(kind, chat_id, cfg, state, now, continuation=True)
+                    or self._daily_contacts_exhausted(cfg, state, now)):
                 self._report(f"observation reject session={kind}_{chat_id} source=proactive version={state['activity_version']} reason=stale_or_fused")
                 return
             self._register(kind, chat_id, cfg_all)
@@ -734,14 +1004,19 @@ class ProactiveReplyScheduler:
             self._cancel_episode_locked(key, reason="finish")
             return True
 
-    def cancel_observations(self, reason: str = "disconnect", *, kind: str | None = None) -> None:
+    def cancel_observations(self, reason: str = "disconnect", *, kind: str | None = None,
+                            guard: Callable[[], bool] | None = None) -> None:
         """撤销全部或指定类型资格；保留防打扰计数，重开不恢复旧任务。"""
         if kind not in (None, "group", "private"):
             raise ValueError("invalid conversation kind")
         with self._lock:
+            if guard is not None and not guard():
+                return
             observation_count = sum(kind is None or key[0] == kind for key in self._observations)
             if kind is None:
                 self._lifecycle = object()
+                if reason in ("disconnect", "stop", "restart"):
+                    self._bootstrap_ready = False
             maps = (self._reply_tickets, self._observations, self._begin_eligible,
                     self._active_sessions, self._last_check_at, self._recent_incoming)
             keys = {key for mapping in maps for key in mapping if kind is None or key[0] == kind}
@@ -755,45 +1030,58 @@ class ProactiveReplyScheduler:
             self._report(f"已取消 {observation_count} 个观察任务：{reason_text}")
 
     def notify_bot_message_sent(self, is_group: bool, chat_id: str, *,
-                                is_proactive: bool, content: str = "") -> bool:
+                                is_proactive: bool, content: str = "", contact_id: str = "", account_id: str = "") -> bool:
         """每条成功发送后调用一次；被动 bot 回复不冒充真实用户清零。
 
         群聊每条 bot 消息计入连发；私聊仅主动消息计入未回复。
         已成功的主动发送即使刚被关闭/stop 也要记账并立即持久化。
         """
         kind, chat_id = ("group" if is_group else "private"), str(chat_id)
+        with self._lock:
+            mismatch = bool(account_id and self._account_id and str(account_id) != self._account_id)
+            if not is_proactive and mismatch:
+                return False
+            store = _StateStore(account_id=str(account_id)) if mismatch else self._store
         if not is_proactive and (self._stop.is_set() or not self._config()[kind]["enabled"]):
             return False
         def mutate(state: dict[str, Any]) -> None:
-            state["consecutive_bot_count"] += 1
+            new_contact = not contact_id or contact_id not in state["recent_contact_ids"]
+            if new_contact:
+                state["consecutive_bot_count"] += 1
             if is_proactive:
                 now = time.time()
                 state["last_proactive_at"] = now
                 state["total_proactive_sent"] += 1
-                if kind == "private":
-                    state["unanswered_count"] += 1
+                if new_contact:
+                    if kind == "private":
+                        state["unanswered_count"] += 1
+                    state["contact_times"] = ([t for t in state["contact_times"] if now - t < 86400] + [now])[-512:]
+                    if contact_id:
+                        state["recent_contact_ids"] = (state["recent_contact_ids"] + [contact_id[:240]])[-20:]
                 state["recent_proactive_messages"] = (state["recent_proactive_messages"] + [
                     {"sent_at": now, "content": str(content)[:RECENT_CONTENT_LIMIT]}
                 ])[-RECENT_PROACTIVE_LIMIT:]
+            elif new_contact and contact_id:
+                state["recent_contact_ids"] = (state["recent_contact_ids"] + [contact_id[:240]])[-20:]
         with self._lock:
             if not is_proactive and self._stop.is_set():
                 return False
-            state = self._store.update(kind, chat_id, mutate)
-            episode = self._observations.get((kind, chat_id))
+            state = store.update(kind, chat_id, mutate)
+            episode = self._observations.get((kind, chat_id)) if store is self._store else None
             if (is_proactive and state is not None and episode is not None and episode.wake is not None
                     and episode.wake.activity_version == state["activity_version"]):
                 episode.wake.sent = True
         if state is None and is_proactive:
             # 成功发送不能丢账：仅发送回调允许在容量满时先 flush 后重试。
-            self._store.flush()
-            state = self._store.update(kind, chat_id, mutate)
+            store.flush()
+            state = store.update(kind, chat_id, mutate)
         if is_proactive:
             if state is None:
                 raise RuntimeError("proactive state capacity exhausted")
-            self._store.flush(kind, chat_id)
+            store.flush(kind, chat_id)
             with self._lock:
                 key = (kind, chat_id)
-                if (not self._stop.is_set() and key in self._active_sessions
+                if (store is self._store and not self._stop.is_set() and key in self._active_sessions
                         and key not in self._observations
                         and self._store.load(kind, chat_id)["activity_version"] == state["activity_version"]):
                     self._begin_eligible[key] = state["activity_version"]
@@ -812,6 +1100,8 @@ class ProactiveReplyScheduler:
             state["activity_version"] = version
         with self._lock:
             self._active_sessions.pop((kind, chat_id), None)
+            self._restored_candidates.discard((kind, chat_id))
+            self._known_histories.discard((kind, chat_id))
             self._last_check_at.pop((kind, chat_id), None)
             episode = self._observations.pop((kind, chat_id), None)
             if episode is not None:
@@ -846,18 +1136,45 @@ class ProactiveReplyScheduler:
             }
             return state
 
+    @staticmethod
+    def _daily_contacts_exhausted(cfg: dict[str, Any], state: dict[str, Any], now: float) -> bool:
+        """检查 24 小时滚动主动联系次数是否已达上限（<= 0 表示不限制）。"""
+        limit = cfg["max_contacts_per_day"]
+        if limit <= 0:
+            return False
+        return len([t for t in state["contact_times"] if now - t < 86400]) >= limit
+
     def _eligible(self, kind: str, chat_id: str, cfg: dict[str, Any],
                   state: dict[str, Any], now: float, continuation: bool = False) -> bool:
-        if self._stop.is_set() or not cfg["enabled"] or not self._is_allowed(cfg, chat_id):
+        if (self._stop.is_set() or (self._requires_bootstrap and not self._bootstrap_ready)
+                or not cfg["enabled"] or not self._is_allowed(cfg, chat_id)
+                or (self._account_id and ((kind, chat_id) not in self._history_allowed
+                    or (state["last_user_message_at"] <= 0
+                        and (kind, chat_id) not in self._known_histories
+                        and chat_id not in cfg["whitelist"])))
+                or (self._connection_guard is not None and not self._connection_guard())
+                or now < state["unknown_until"]):
             return False
+        hour = time.localtime(now).tm_hour
+        for start, end in cfg["quiet_hours"]:
+            if start == end or (start <= hour < end if start < end else hour >= start or hour < end):
+                return False
         counter, limit = _counter_limit(kind, cfg)
         if state[counter] >= limit:
             return False
         if continuation:
             return True
+        if self._daily_contacts_exhausted(cfg, state, now):
+            return False
         last_user, last_sent = state["last_user_message_at"], state["last_proactive_at"]
-        return (last_user > 0 and now - last_user >= cfg["idle_threshold_seconds"]
-                and (last_sent <= 0 or now - last_sent >= cfg["min_interval_between_proactive_seconds"]))
+        known = (kind, chat_id) in self._known_histories and (kind, chat_id) in self._history_allowed
+        explicit = chat_id in cfg["whitelist"]
+        backoff_count = state["consecutive_bot_count"] if kind == "group" else state["unanswered_count"]
+        backoff = cfg["min_interval_between_proactive_seconds"] * (2 ** min(backoff_count, 4))
+        return ((last_user > 0 or known or explicit)
+                and (last_user <= 0 or now - last_user >= cfg["idle_threshold_seconds"])
+                and (last_sent <= 0 or now - last_sent >= backoff)
+                and (state["last_attempt_at"] <= 0 or now - state["last_attempt_at"] >= cfg["check_interval_seconds"]))
 
     def can_send(self, is_group: bool, chat_id: str, activity_version: int,
                  continuation: bool = False, *, observation_generation: int | None = None) -> bool:
@@ -874,6 +1191,8 @@ class ProactiveReplyScheduler:
             if type(activity_version) is not int or state["activity_version"] != activity_version:
                 return False
             now = time.time()
+            if not continuation and self._daily_contacts_exhausted(cfg, state, now):
+                return False
             if observation_generation is None:
                 return self._eligible(kind, chat_id, cfg, state, now, continuation)
             wake = episode.wake if episode is not None else None
@@ -897,7 +1216,8 @@ class ProactiveReplyScheduler:
             if episode is None or episode.wake is not None:
                 return None
             state = self._store.load(*key)
-            if not self._eligible(*key, cfg, state, now, continuation=True):
+            if (not self._eligible(*key, cfg, state, now, continuation=True)
+                    or self._daily_contacts_exhausted(cfg, state, now)):
                 self._cancel_episode_locked(key)
                 return None
             # 路由未定时不得抢答，notify 已令任何旧 runner 的 version 失效。
@@ -1000,6 +1320,18 @@ class ProactiveReplyScheduler:
 
     async def _tick_async(self, *, include_cold: bool = True) -> None:
         try:
+            if include_cold and self._account_id and self._bootstrap_ready:
+                cfg_all = self._config()
+                self._register_hot_whitelist(cfg_all)
+                with self._lock:
+                    for kind, cid in sorted(self._restored_candidates):
+                        if len(self._active_sessions) >= self.MAX_ACTIVE_SESSIONS:
+                            break
+                        cfg = cfg_all[kind]
+                        if ((kind, cid) not in self._active_sessions and cfg["enabled"]
+                                and self._is_allowed(cfg, cid)
+                                and ((kind, cid) in self._known_histories or cid in cfg["whitelist"])):
+                            self._register(kind, cid, cfg_all)
             with self._lock:
                 sessions = list(self._active_sessions)
             observed = set()
@@ -1030,8 +1362,9 @@ class ProactiveReplyScheduler:
                     if wake is not None:
                         self._complete_observation(key, wake)
             if include_cold:
+                sent_cold = False
                 for kind, chat_id in sessions:
-                    if self._stop.is_set():
+                    if self._stop.is_set() or sent_cold:
                         break
                     if (kind, chat_id) in observed:
                         continue
@@ -1041,7 +1374,12 @@ class ProactiveReplyScheduler:
                         if self._should_trigger(kind, chat_id, cfg, time.time()):
                             self._report(f"触发 {kind} {chat_id}")
                             runner = self._run_group if kind == "group" else self._run_private
-                            await runner(chat_id, cfg)
+                            if await runner(chat_id, cfg):
+                                with self._lock:
+                                    if (kind, chat_id) in self._active_sessions:
+                                        del self._active_sessions[(kind, chat_id)]
+                                        self._active_sessions[(kind, chat_id)] = time.time()
+                                sent_cold = True
                     except Exception as exc:
                         self._report(f"planner failure session={kind}_{chat_id} reason=cold_error")
         finally:
@@ -1059,7 +1397,12 @@ class ProactiveReplyScheduler:
             last_check = self._last_check_at.get(key)
             if last_check is not None and now - last_check < cfg["check_interval_seconds"]:
                 return False
+            state = self._store.load(kind, chat_id)
+            if now < state["next_check_at"]:
+                return False
             self._last_check_at[key] = now
+            self._store.update(kind, chat_id, lambda s: s.update(
+                next_check_at=now + cfg["check_interval_seconds"]))
         state = self._store.load(kind, chat_id)
         if not self._eligible(kind, chat_id, cfg, state, now):
             return False
@@ -1085,6 +1428,7 @@ def start_proactive_scheduler(
             if not _scheduler._stop.is_set() or (thread and thread.is_alive()):
                 return _scheduler
         sched = ProactiveReplyScheduler(get_config, run_group_planner, run_private_planner, log)
+        sched._requires_bootstrap = True
         _scheduler = sched
         sched.start()
         return sched
@@ -1121,23 +1465,29 @@ def can_send(is_group: bool, chat_id: str, activity_version: int,
         continuation, observation_generation=observation_generation)
 
 
-def notify_user_message_received(is_group: bool, chat_id: str, *, message_id: str = "") -> _ReplyObservationTicket | None:
+def notify_user_message_received(is_group: bool, chat_id: str, *,
+                                 message_id: str = "", account_id: str = "") -> _ReplyObservationTicket | None:
     sched = _scheduler
-    return sched.notify_user_message_received(is_group, chat_id, message_id=message_id) if sched is not None else None
+    return sched.notify_user_message_received(
+        is_group, chat_id, message_id=message_id, account_id=account_id,
+    ) if sched is not None else None
 
 
 def complete_normal_reply(is_group: bool, chat_id: str, *, normal_handled: bool,
-                          message_id: str = "", ticket: object = None, reply_sent: bool = False) -> bool:
+                          message_id: str = "", ticket: object = None,
+                          reply_sent: bool = False, account_id: str = "") -> bool:
     sched = _scheduler
     return sched is not None and sched.complete_normal_reply(is_group, chat_id,
-        normal_handled=normal_handled, message_id=message_id, ticket=ticket, reply_sent=reply_sent)
+        normal_handled=normal_handled, message_id=message_id, ticket=ticket,
+        reply_sent=reply_sent, account_id=account_id)
 
 
 def note_incoming(is_group: bool, chat_id: str, *,
-                  normal_handled: bool, message_id: str = "") -> None:
+                  normal_handled: bool, message_id: str = "", account_id: str = "") -> None:
     sched = _scheduler
     if sched is not None:
-        sched.note_incoming(is_group, chat_id, normal_handled=normal_handled, message_id=message_id)
+        sched.note_incoming(is_group, chat_id, normal_handled=normal_handled,
+                            message_id=message_id, account_id=account_id)
 
 
 def begin_observation(is_group: bool, chat_id: str, *, wait_seconds: float | None = None) -> None:
@@ -1164,16 +1514,50 @@ def finish_observation(is_group: bool, chat_id: str, *,
         expected_activity_version=expected_activity_version, expected_generation=expected_generation)
 
 
-def cancel_observations(reason: str = "disconnect", *, kind: str | None = None) -> None:
+def cancel_observations(reason: str = "disconnect", *, kind: str | None = None,
+                        guard: Callable[[], bool] | None = None) -> None:
     sched = _scheduler
     if sched is not None:
-        sched.cancel_observations(reason, kind=kind)
+        sched.cancel_observations(reason, kind=kind, guard=guard)
 
 
 def notify_bot_message_sent(is_group: bool, chat_id: str, *,
-                            is_proactive: bool, content: str = "") -> bool:
+                            is_proactive: bool, content: str = "", contact_id: str = "", account_id: str = "") -> bool:
     sched = _scheduler
-    return sched is not None and sched.notify_bot_message_sent(is_group, chat_id, is_proactive=is_proactive, content=content)
+    return sched is not None and sched.notify_bot_message_sent(is_group, chat_id,
+        is_proactive=is_proactive, content=content, contact_id=contact_id, account_id=account_id)
+
+
+def record_follow_up(is_group: bool, chat_id: str, account_id: str, summary: str,
+                     sources: list[dict], *, follow_up_id: str = "", status: str = "open",
+                     version: int | None = None) -> str:
+    sched = _scheduler
+    if sched is None:
+        return "error: 主动会话状态尚未就绪。"
+    return sched.record_follow_up(is_group, chat_id, account_id, summary, sources,
+        follow_up_id=follow_up_id, status=status, version=version)
+
+
+def history_allowed(is_group: bool, chat_id: str) -> bool:
+    sched = _scheduler
+    return sched is None or sched.history_allowed(is_group, chat_id)
+
+
+def reserve_background_call(is_group: bool, chat_id: str, version: int, account_id: str = "") -> bool:
+    sched = _scheduler
+    return sched is None or sched.reserve_background_call(is_group, chat_id, version, account_id)
+
+
+def record_plan(is_group: bool, chat_id: str, version: int, plan: dict, opportunity_id: str, *, account_id: str = "") -> None:
+    sched = _scheduler
+    if sched is not None:
+        sched.record_plan(is_group, chat_id, version, plan, opportunity_id, account_id=account_id)
+
+
+def mark_attempt(is_group: bool, chat_id: str, version: int, *, unknown: bool = False, account_id: str = "") -> None:
+    sched = _scheduler
+    if sched is not None:
+        sched.mark_attempt(is_group, chat_id, version, unknown=unknown, account_id=account_id)
 
 
 def touch_session(is_group: bool, chat_id: str) -> None:

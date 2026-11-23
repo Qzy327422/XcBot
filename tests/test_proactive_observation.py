@@ -22,7 +22,7 @@ class ObservationTests(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         self.config = {kind: {"enabled": True, "trigger_probability": 0,
-            "observation": {"trigger_probability": 1},
+            "observation": {"enabled": True, "trigger_probability": 1},
             "idle_threshold_seconds": 900, "min_interval_between_proactive_seconds": 86400}
             for kind in ("group", "private")}
         self.calls = []
@@ -129,7 +129,9 @@ class ObservationTests(unittest.TestCase):
     def test_defaults_independent_unknown_fields_and_obsolete_limits(self):
         cfg = proactive.normalize_config({"group": {"extra": 9, "observation": {
             "future": {"value": []}, "window_seconds": 1, "max_continuation_rounds": 1}}})
-        self.assertEqual(cfg["private"]["observation"], proactive.DEFAULT_OBSERVATION_CONFIG)
+        self.assertEqual(cfg["private"]["observation"], {**proactive.DEFAULT_OBSERVATION_CONFIG, "enabled": False})
+        self.assertEqual(cfg["group"]["observation"]["future"], {"value": []})
+        self.assertFalse(cfg["private"]["observation"]["enabled"])
         self.assertTrue(cfg["group"]["observation"]["enabled"])
         self.assertFalse(cfg["group"]["enabled"])
         self.assertNotIn("window_seconds", cfg["group"]["observation"])
@@ -403,6 +405,7 @@ class ObservationTests(unittest.TestCase):
             lambda: self.config["group"].update(observation={"enabled": "bad"}),
             lambda: proactive.finish_observation(True, "123")]
         for change in changes:
+            self.scheduler.reset_session(True, "123")
             self.config["group"] = {"enabled": True, "trigger_probability": 0,
                 "observation": {"trigger_probability": 1},
                 "idle_threshold_seconds": 900, "min_interval_between_proactive_seconds": 86400}
@@ -661,7 +664,7 @@ class ObservationTests(unittest.TestCase):
                                                        (0.5, 0.49, True), (0.5, 0.5, False)):
                     with self.subTest(group=group, source=source, probability=probability, sample=sample):
                         self.scheduler.reset_session(group, "123")
-                        self.config[kind]["observation"] = {"trigger_probability": probability}
+                        self.config[kind]["observation"] = {"enabled": True, "trigger_probability": probability}
                         logs = []
                         self.scheduler._log = logs.append
                         ticket = self.scheduler.notify_user_message_received(group, "123", message_id="normal")
@@ -889,6 +892,77 @@ class ObservationTests(unittest.TestCase):
         proactive.cancel_observations()
         self.assertIsNone(proactive.get_session_state(True, "123")["observation"])
         self.assertFalse(proactive.can_send(True, "123", 0, observation_generation=1))
+
+    def test_daily_contact_limit_blocks_observation_start_and_cancels_existing(self):
+        self.config["private"]["max_contacts_per_day"] = 1
+        self.scheduler.notify_user_message_received(False, "123", message_id="m0")
+        self.scheduler.notify_bot_message_sent(False, "123", is_proactive=True, content="first")
+        self.scheduler.begin_observation(False, "123", wait_seconds=30)
+        self.assertIsNone(self.state(False, "123")["observation"])
+
+        ticket = self.scheduler.notify_user_message_received(False, "123", message_id="m1")
+        self.assertFalse(self.scheduler.complete_normal_reply(False, "123", normal_handled=True,
+            message_id="m1", ticket=ticket, reply_sent=True))
+        self.assertIsNone(self.state(False, "123")["observation"])
+
+        self.config["private"]["max_contacts_per_day"] = 2
+        ticket2 = self.scheduler.notify_user_message_received(False, "123", message_id="m2")
+        self.assertTrue(self.scheduler.complete_normal_reply(False, "123", normal_handled=True,
+            message_id="m2", ticket=ticket2, reply_sent=True))
+        self.assertIsNotNone(self.state(False, "123")["observation"])
+        self.scheduler.notify_bot_message_sent(False, "123", is_proactive=True, content="second")
+        self.tick()
+        self.assertFalse(self.calls)
+        self.assertIsNone(self.state(False, "123")["observation"])
+
+    def test_stale_group_ticket_late_callback_resolves_pending_without_cancelling_new_observation(self):
+        old_ticket = self.scheduler.notify_user_message_received(True, "123", message_id="m1")
+        self.assertIsNotNone(old_ticket)
+        new_ticket = self.scheduler.notify_user_message_received(True, "123", message_id="m2")
+        self.assertIsNotNone(new_ticket)
+        self.assertTrue(self.scheduler.complete_normal_reply(
+            True, "123", normal_handled=True, message_id="m2", ticket=new_ticket, reply_sent=True,
+        ))
+        new_obs = dict(self.state(True, "123")["observation"])
+        # 旧请求延迟结束并报告未处理时，不能取消 m2 新建立的观察窗口
+        self.assertFalse(self.scheduler.complete_normal_reply(
+            True, "123", normal_handled=False, message_id="m1", ticket=old_ticket, reply_sent=False,
+        ))
+        self.assertEqual(self.state(True, "123")["observation"], new_obs)
+
+    def test_cancel_observations_respects_guard(self):
+        self.seed(group=False)
+        self.assertIsNotNone(self.state(False, "123")["observation"])
+        proactive.cancel_observations("disconnect", guard=lambda: False)
+        self.assertIsNotNone(self.state(False, "123")["observation"])
+        proactive.cancel_observations("disconnect", guard=lambda: True)
+        self.assertIsNone(self.state(False, "123")["observation"])
+
+    def test_unrecorded_ticket_none_and_wrong_account_cannot_cancel_new_observation(self):
+        self.scheduler.bootstrap("222", lambda: {})
+        self.seed(group=True, cid="123")
+        self.scheduler.notify_bot_message_sent(True, "123", is_proactive=False, account_id="222")
+        before_obs = dict(self.state(True, "123")["observation"])
+        before_ver = self.state(True, "123")["activity_version"]
+        before_bot = self.state(True, "123")["consecutive_bot_count"]
+        # 1. 旧账号 A 在未取票时迟到调用 complete_normal_reply(ticket=None)
+        self.assertFalse(self.scheduler.complete_normal_reply(
+            True, "123", normal_handled=False, message_id="old-from-a",
+            ticket=None, reply_sent=False, account_id="111",
+        ))
+        # 2. ticket=None 对未入站过的消息即使没带 account_id 也不能触发 note_incoming
+        self.assertFalse(self.scheduler.complete_normal_reply(
+            True, "123", normal_handled=False, message_id="unseen-msg",
+            ticket=None, reply_sent=False,
+        ))
+        # 3. 旧账号 A 的入站通知也不能影响新账号 B
+        self.assertIsNone(self.scheduler.notify_user_message_received(
+            True, "123", message_id="old-in-a", account_id="111",
+        ))
+        after = self.state(True, "123")
+        self.assertEqual(after["observation"], before_obs)
+        self.assertEqual(after["activity_version"], before_ver)
+        self.assertEqual(after["consecutive_bot_count"], before_bot)
 
 
 if __name__ == "__main__":

@@ -108,6 +108,7 @@ class GroupContextReservation:
     records: tuple[str, ...]
     generation: int
     max_cnt: int
+    images: tuple[dict, ...] = ()
 
 
 class GroupChatContextManager:
@@ -120,13 +121,16 @@ class GroupChatContextManager:
         self._record_ids: dict[str, deque[str]] = defaultdict(deque)
         self._generations: dict[str, int] = defaultdict(int)
         self._reservations: dict[str, GroupContextReservation] = {}
+        # Independent media slot: ordinary eavesdropping keeps URL metadata only.
+        self._latest_images: dict[str, dict] = {}
+        self._image_sequence = 0
 
     @staticmethod
     def _key(group_id) -> str:
         return str(group_id)
 
     def record(self, group_id, formatted_text: str, max_cnt: int | None = None,
-               *, author_id=None) -> str:
+               *, author_id=None, image_urls=None, self_id=None, message_id=None) -> str:
         """追加一条旁听消息，返回 record_id。"""
         text = str(formatted_text or "").strip()
         if not text:
@@ -142,6 +146,19 @@ class GroupChatContextManager:
             records.append(text)
             record_ids.append(record_id)
             _trim_left(records, limit, record_ids)
+            for url in image_urls or []:
+                if not isinstance(url, str) or not url.startswith(("http://", "https://")) or len(url) > 2048:
+                    continue
+                self._image_sequence += 1
+                self._latest_images[key] = {
+                    "url": url, "record_id": record_id, "record_text": str(text),
+                    "author_id": str(author_id or ""),
+                    "self_id": str(self_id or ""), "is_group": True, "chat_id": str(group_id),
+                    "message_id": str(message_id or ""), "sequence": self._image_sequence,
+                }
+            latest = self._latest_images.get(key)
+            if latest and latest["record_id"] not in record_ids:
+                self._latest_images.pop(key, None)
         return record_id
 
     def reserve_for_inject(self, group_id, record_id: str | None = None,
@@ -177,12 +194,19 @@ class GroupChatContextManager:
 
             generation = self._generations[key] + 1
             self._generations[key] = generation
+            image = self._latest_images.get(key)
+            images = ()
+            if image and image["record_id"] in id_list[:prompt_idx]:
+                if visible is None or visible(GroupContextRecord(image.get("record_text", ""), image["author_id"])):
+                    images = (dict(image),)
+                self._latest_images.pop(key, None)
             reservation = GroupContextReservation(
                 token=uuid.uuid4().hex,
                 key=key,
                 records=to_inject,
                 generation=generation,
                 max_cnt=limit,
+                images=images,
             )
             self._reservations[reservation.token] = reservation
             return reservation
@@ -205,6 +229,11 @@ class GroupChatContextManager:
             if self._generations.get(pending.key, 0) != pending.generation:
                 print(f"[GroupContext] 已有后续触发消费，放弃恢复过期旁听: group={pending.key}")
                 return False
+            if pending.images:
+                latest = self._latest_images.get(pending.key)
+                restored = pending.images[-1]
+                if latest is None or latest["sequence"] < restored["sequence"]:
+                    self._latest_images[pending.key] = dict(restored)
             if not pending.records:
                 return True
             records = self._records[pending.key]
@@ -212,9 +241,14 @@ class GroupChatContextManager:
                 records.appendleft(text)
             # 已恢复的记录不需要再定位为触发条，使用空标识与文本队列保持对齐。
             record_ids = self._record_ids[pending.key]
-            for _ in pending.records:
-                record_ids.appendleft("")
+            restored_image = pending.images[-1] if pending.images else {}
+            for text in reversed(pending.records):
+                record_ids.appendleft(restored_image.get("record_id", "")
+                                      if str(text) == restored_image.get("record_text") else "")
             _trim_left(records, pending.max_cnt, record_ids)
+            latest = self._latest_images.get(pending.key)
+            if latest and latest.get("record_text") not in records:
+                self._latest_images.pop(pending.key, None)
             return True
 
     def consume_for_inject(self, group_id, record_id: str | None = None) -> list[str]:
@@ -255,6 +289,8 @@ class GroupChatContextManager:
             records.extend(new_records)
             record_ids.clear()
             record_ids.extend(new_ids)
+            if self._latest_images.get(key, {}).get("record_id") == record_id:
+                self._latest_images.pop(key, None)
             return True
 
     def clear(self, group_id) -> int:
@@ -263,6 +299,7 @@ class GroupChatContextManager:
             cnt = len(self._records.get(key, ()))
             self._records.pop(key, None)
             self._record_ids.pop(key, None)
+            self._latest_images.pop(key, None)
             self._generations[key] += 1
             for token, reservation in list(self._reservations.items()):
                 if reservation.key == key:
@@ -275,6 +312,7 @@ class GroupChatContextManager:
             keys = set(self._records) | set(self._generations)
             self._records.clear()
             self._record_ids.clear()
+            self._latest_images.clear()
             for key in keys:
                 self._generations[key] += 1
             self._reservations.clear()

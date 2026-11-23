@@ -219,6 +219,40 @@ class WebUIConfigTests(unittest.TestCase):
         webui.save_config_bundle({"config_json": saved})
         self.assertEqual(json.loads(self.config.read_text(encoding="utf-8")), saved)
 
+    def test_legacy_reply_quote_false_survives_unrelated_save_and_modern_takes_priority(self):
+        for legacy_value in (False, "false", 0):
+            with self.subTest(legacy=legacy_value):
+                initial = copy.deepcopy(self.original)
+                initial["split_reply_quote"] = {"default_enabled": legacy_value}
+                self.config.write_text(json.dumps(initial), encoding="utf-8")
+                self.assertFalse(webui.collect_config_bundle()["feature_switches"]["split_reply_quote"])
+                webui.save_config_bundle({"config_json": {"Others": {"bot_name": "离线测试"}}})
+                saved = json.loads(self.config.read_text(encoding="utf-8"))
+                self.assertFalse(saved["FeatureSwitches"]["split_reply_quote"])
+                self.assertNotIn("split_reply_quote", {k: v for k, v in saved.items() if k != "FeatureSwitches"})
+                initial["FeatureSwitches"] = {"split_reply_quote": True}
+                self.config.write_text(json.dumps(initial), encoding="utf-8")
+                self.assertTrue(webui.collect_config_bundle()["feature_switches"]["split_reply_quote"])
+                webui.save_config_bundle({"config_json": {"Others": {"bot_name": "仍保持开启"}}})
+                self.assertTrue(json.loads(self.config.read_text(encoding="utf-8"))["FeatureSwitches"]["split_reply_quote"])
+
+    def test_legacy_proactive_account_id_removed_and_proactive_limits_exposed(self):
+        fields = next(section["fields"] for section in webui.build_ui_schema({})
+                      if section["key"] == "proactive")
+        by_path = {field["path"]: field for field in fields}
+        self.assertNotIn("ProactiveReply.legacy_account_id", by_path)
+        self.assertNotIn("ProactiveReply.max_account_background_calls_per_day", by_path)
+        self.assertEqual(by_path["ProactiveReply.group.max_contacts_per_day"]["default"], 0)
+        self.assertEqual(by_path["ProactiveReply.group.max_contacts_per_day"]["min"], 0)
+        self.assertEqual(by_path["ProactiveReply.private.max_contacts_per_day"]["default"], 0)
+        self.assertEqual(by_path["ProactiveReply.private.max_contacts_per_day"]["min"], 0)
+        webui.save_config_bundle({"config_json": {"ProactiveReply": {
+            "legacy_account_id": "999", "private": {"enabled": False, "max_contacts_per_day": 5}}}})
+        saved = json.loads(self.config.read_text(encoding="utf-8"))
+        self.assertNotIn("legacy_account_id", saved["ProactiveReply"])
+        self.assertEqual(saved["ProactiveReply"]["private"]["max_contacts_per_day"], 5)
+        self.assertFalse(saved["ProactiveReply"]["private"]["enabled"])
+
     def test_memory_schema_migration_and_lowering_roundtrip(self):
         from webui_core.features import compression_trigger_rounds, DEFAULT_FEATURE_SWITCHES
         self.assertEqual(compression_trigger_rounds({"compression_threshold": 60, "auto_compress_after_messages": 44}), 60)
@@ -231,7 +265,8 @@ class WebUIConfigTests(unittest.TestCase):
             self.assertIn(key, DEFAULT_FEATURE_SWITCHES)
         webui.save_config_bundle({"config_json": {"Others": {"compression_threshold": 60, "auto_compress_after_messages": 44}, "FeatureSwitches": {"weather": False}}})
         saved = json.loads(self.config.read_text(encoding="utf-8"))
-        self.assertEqual(saved["Others"]["auto_compress_after_messages"], 60)
+        # 默认最大上下文轮数为 60，触发轮数 >= 最大轮数时会自动压低到最大轮数 - 1（59）以保证先压缩后截断
+        self.assertEqual(saved["Others"]["auto_compress_after_messages"], 59)
         self.assertNotIn("compression_threshold", saved["Others"])
         self.assertFalse(saved["FeatureSwitches"]["weather"])
         # Even an unmigrated file must permit lowering through the UI.
@@ -471,14 +506,48 @@ class MemoryRuntimeTests(unittest.TestCase):
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ContextCompressor")
         gate = next(n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "_compress_locked")
         gate_source = ast.get_source_segment(source, gate)
-        self.assertIn("msg_count < self.compression_threshold", gate_source)
+        self.assertIn("msg_count < self._effective_threshold(context)", gate_source)
         self.assertNotIn('user_cfg.get("compression_threshold"', source)
         # Find the actual scheduling condition rather than importing live main.
         start = source.index("                            self.auto_compress_enabled and")
         condition = source[start - 60:source.index("already_locked=True", start)]
         self.assertNotIn('is_feature_enabled("compression_commands"', condition)
-        self.assertIn("self.get_message_count() >= self.compress_after_rounds", condition)
+        self.assertIn("clamp_compression_trigger_rounds", condition)
         self.assertNotIn("def set_auto_compress(self, enabled: bool, threshold", source)
+
+    def test_group_context_defaults_enabled_without_overriding_explicit_false(self):
+        from webui_core.features import DEFAULT_FEATURE_SWITCHES
+        defaults = json.loads((ROOT / "config.default.json").read_text(encoding="utf-8-sig"))
+        self.assertTrue(DEFAULT_FEATURE_SWITCHES["group_chat_context"])
+        self.assertTrue(defaults["FeatureSwitches"]["group_chat_context"])
+        merged = dict(DEFAULT_FEATURE_SWITCHES)
+        merged.update({"group_chat_context": False})
+        self.assertFalse(merged["group_chat_context"])
+        tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8"))
+        method = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "is_group_chat_context_enabled")
+        calls = []
+        env = {"is_feature_enabled": lambda key, default: calls.append((key, default)) or default}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), "context-default-offline", "exec"), env)
+        self.assertTrue(env["is_group_chat_context_enabled"]())
+        self.assertEqual(calls, [("group_chat_context", True)])
+
+    def test_persona_keeps_custom_content_and_adds_conversation_continuity(self):
+        tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8"))
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                   and node.name == "EnhancedContextManager")
+        method = next(node for node in cls.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "_get_system_prompt")
+        cfg = {"personality_presets": [{"id": "test", "prompt": "{bot_name}用简短语气和{user_name}聊天。"}],
+               "active_personality_preset": "test"}
+        env = {"bot_name": "测试角色", "get_runtime_others": lambda: cfg, "user_cfg": {}}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), "persona-offline", "exec"), env)
+        prompt = env["_get_system_prompt"](object(), "测试用户", "private")
+        self.assertTrue(prompt.startswith("测试角色用简短语气和测试用户聊天。"))
+        self.assertIn("【对话衔接】", prompt)
+        self.assertIn("不必每次以问题", prompt)
+        self.assertIn("不重复追问", prompt)
+        self.assertEqual(cfg["personality_presets"][0]["prompt"], "{bot_name}用简短语气和{user_name}聊天。")
 
     def test_summary_unlimited_preserves_per_group_inflight_slot(self):
         tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8"))
@@ -530,6 +599,125 @@ print("safe import ok")
         result = subprocess.run([sys.executable, "-c", code, str(ROOT)], capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("safe import ok", result.stdout)
+
+    def test_config_migrate_upgrades_untouched_old_proactive_defaults_and_cleans_dead_keys(self):
+        import config_migrate
+        template = json.loads((ROOT / "config.default.json").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            cfg_path = base / "config.json"
+            backup_dir = base / "config_backup"
+            old_cfg = {
+                "config_version": 7,
+                "Others": {"version_name": "4.0.0", "bot_name": "老机器人"},
+                "RoleLife": {
+                    "roles": {
+                        "999": {
+                            "default": {"enabled": True, "role_daily_limit": 24, "weather_city": "上海", "sleep_hours": 7}
+                        }
+                    }
+                },
+                "ProactiveReply": {
+                    "max_account_background_calls_per_day": 192,
+                    "legacy_account_id": "999",
+                    "group": {
+                        "enabled": True,
+                        "trigger_probability": 0.3,          # 旧默认 -> 应升级为 0.25
+                        "check_interval_seconds": 60,        # 旧默认 -> 应升级为 180
+                        "idle_threshold_seconds": 1200,      # 用户自定义 -> 必须保留 1200！
+                        "min_interval_between_proactive_seconds": 1800,  # 旧默认 -> 3600
+                        "max_contacts_per_day": 6,           # 旧默认 -> 0（不限制）
+                        "max_background_calls_per_day": 48,  # 已废除 -> 清理
+                        "observation": {
+                            "enabled": True,
+                            "trigger_probability": 0.5,      # 旧默认 -> 0.35
+                            "window_seconds": 300,
+                            "max_continuation_rounds": 3,
+                        },
+                    },
+                    "private": {
+                        "enabled": False,
+                        "trigger_probability": 0.1,          # 旧默认 -> 0.2
+                        "check_interval_seconds": 120,       # 旧默认 -> 180
+                        "idle_threshold_seconds": 43200,     # 旧默认 -> 7200
+                        "min_interval_between_proactive_seconds": 86400,  # 旧默认 -> 10800
+                        "max_contacts_per_day": 6,           # 旧默认 -> 0（不限制）
+                        "max_background_calls_per_day": 48,  # 已废除 -> 清理
+                        "observation": {"enabled": True, "trigger_probability": 0.5},
+                    },
+                },
+            }
+            cfg_path.write_text(json.dumps(old_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            tpl_path = base / "config.default.json"
+            tpl_path.write_text(json.dumps(template, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.assertTrue(config_migrate.ensure_config_up_to_date(str(cfg_path), str(tpl_path), str(backup_dir)))
+            self.assertTrue(any(backup_dir.iterdir()))
+            migrated = json.loads(cfg_path.read_text(encoding="utf-8"))
+            self.assertGreaterEqual(migrated["config_version"], 9)
+            self.assertEqual(migrated["Others"]["bot_name"], "老机器人")
+            # 清理废字段
+            self.assertNotIn("max_account_background_calls_per_day", migrated["ProactiveReply"])
+            self.assertNotIn("legacy_account_id", migrated["ProactiveReply"])
+            self.assertNotIn("max_background_calls_per_day", migrated["ProactiveReply"]["group"])
+            self.assertNotIn("max_background_calls_per_day", migrated["ProactiveReply"]["private"])
+            self.assertNotIn("window_seconds", migrated["ProactiveReply"]["group"]["observation"])
+            self.assertNotIn("max_continuation_rounds", migrated["ProactiveReply"]["group"]["observation"])
+            role_cfg = migrated["RoleLife"]["roles"]["999"]["default"]
+            self.assertNotIn("role_daily_limit", role_cfg)
+            self.assertNotIn("weather_city", role_cfg)
+            self.assertEqual(role_cfg["sleep_hours"], 7)
+            # 未自定义的旧默认被升级，用户自定义 1200 原封不动保留
+            g = migrated["ProactiveReply"]["group"]
+            self.assertEqual(g["trigger_probability"], 0.25)
+            self.assertEqual(g["check_interval_seconds"], 180)
+            self.assertEqual(g["idle_threshold_seconds"], 1200)
+            self.assertEqual(g["min_interval_between_proactive_seconds"], 3600)
+            self.assertEqual(g["max_contacts_per_day"], 0)
+            self.assertEqual(g["observation"]["trigger_probability"], 0.35)
+            self.assertTrue(g["observation"]["enabled"])
+            p = migrated["ProactiveReply"]["private"]
+            self.assertEqual(p["trigger_probability"], 0.2)
+            self.assertEqual(p["check_interval_seconds"], 180)
+            self.assertEqual(p["idle_threshold_seconds"], 7200)
+            self.assertEqual(p["min_interval_between_proactive_seconds"], 10800)
+            self.assertEqual(p["max_contacts_per_day"], 0)
+            self.assertEqual(p["observation"]["trigger_probability"], 0.35)
+            self.assertFalse(p["observation"]["enabled"])
+            # 升到 v9 后如果用户在 WebUI 手动开启私聊观察与设置上限 10，再次启动迁移不会重置回去
+            migrated["ProactiveReply"]["private"]["observation"]["enabled"] = True
+            migrated["ProactiveReply"]["private"]["max_contacts_per_day"] = 10
+            cfg_path.write_text(json.dumps(migrated, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.assertFalse(config_migrate.ensure_config_up_to_date(str(cfg_path), str(tpl_path), str(backup_dir)))
+            reloaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+            self.assertTrue(reloaded["ProactiveReply"]["private"]["observation"]["enabled"])
+            self.assertEqual(reloaded["ProactiveReply"]["private"]["max_contacts_per_day"], 10)
+            # v8 旧默认 private=4 且用户把 group 改为 10 时：升级到 v9 会保留 10 并把 4 改为 0
+            v8_cfg = copy.deepcopy(migrated)
+            v8_cfg["config_version"] = 8
+            v8_cfg["ProactiveReply"]["group"]["max_contacts_per_day"] = 10
+            v8_cfg["ProactiveReply"]["private"]["max_contacts_per_day"] = 4
+            v8_cfg["ProactiveReply"]["private"]["max_background_calls_per_day"] = 200
+            cfg_path.write_text(json.dumps(v8_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.assertTrue(config_migrate.ensure_config_up_to_date(str(cfg_path), str(tpl_path), str(backup_dir)))
+            upgraded_v9 = json.loads(cfg_path.read_text(encoding="utf-8"))
+            self.assertEqual(upgraded_v9["ProactiveReply"]["group"]["max_contacts_per_day"], 10)
+            self.assertEqual(upgraded_v9["ProactiveReply"]["private"]["max_contacts_per_day"], 0)
+            self.assertNotIn("max_background_calls_per_day", upgraded_v9["ProactiveReply"]["private"])
+            # 高于模板版本（如未来降级回旧代码启动）的 config_version 不能被降级回 9
+            future_cfg = copy.deepcopy(migrated)
+            future_cfg["config_version"] = 99
+            future_cfg["ProactiveReply"]["private"].pop("max_contacts_per_day", None)
+            cfg_path.write_text(json.dumps(future_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.assertTrue(config_migrate.ensure_config_up_to_date(str(cfg_path), str(tpl_path), str(backup_dir)))
+            reloaded_future = json.loads(cfg_path.read_text(encoding="utf-8"))
+            self.assertEqual(reloaded_future["config_version"], 99)
+            old_future = base / "config-old-future.json"
+            new_future = base / "config-new-future.json"
+            old_future.write_text(json.dumps(future_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            new_future.write_text(json.dumps(template, ensure_ascii=False, indent=2), encoding="utf-8")
+            config_migrate.migrate(str(old_future), str(new_future), str(backup_dir))
+            direct_cfg = json.loads(new_future.read_text(encoding="utf-8"))
+            self.assertEqual(direct_cfg["config_version"], 99)
 
 
 if __name__ == "__main__":

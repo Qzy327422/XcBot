@@ -24,6 +24,24 @@ from typing import Iterator
 from urllib.parse import urlsplit
 
 SessionKey = tuple[str, bool, str]
+# 与入站协议解析的 100 段安全上限一致；总驻留字节仍由索引预算约束。
+MAX_MEDIA_ITEMS = 100
+
+
+@dataclass(frozen=True, slots=True)
+class ImageSource:
+    """入队时冻结图片来源，不依赖消费时仍能命中消息索引。"""
+
+    url: str
+    self_id: str
+    is_group: bool
+    chat_id: str
+    author_id: str
+    message_id: str
+
+    def metadata(self):
+        return {name: getattr(self, name) for name in
+                ("self_id", "is_group", "chat_id", "author_id", "message_id")}
 
 
 def session_key(self_id, is_group, chat_id) -> SessionKey:
@@ -45,6 +63,134 @@ def _message_id(value) -> str | None:
     return "-" + digits if value.startswith("-") and digits != "0" else digits
 
 
+def quote_id(value) -> str | None:
+    """引用协议 ID：数字正规化且限制长度，不接受 bool/浮点或任意对象。"""
+    if isinstance(value, str) and len(value) > 128:
+        return None
+    result = _message_id(value)
+    return result if result is not None and len(result) <= 128 else None
+
+
+def quote_mapping(value) -> dict | None:
+    """读取字典、ObjectedJson.raw 或 SDK 字段；不 stringify 私密传输对象。"""
+    fields = ("status", "retcode", "ret_code", "data", "message_id", "self_id",
+              "group_id", "message_type", "sender", "user_id", "target_id", "peer_id",
+              "message", "raw_message", "time", "nickname", "card", "messages")
+    seen = set()
+    for _ in range(4):
+        if isinstance(value, dict):
+            return value
+        if value is None or isinstance(value, (str, bytes, bool, int, float, list, tuple)):
+            return None
+        if id(value) in seen:
+            return None
+        seen.add(id(value))
+        raw = getattr(value, "raw", None)
+        if raw is not None:
+            value = raw
+            continue
+        result = {name: item for name in fields
+                  if (item := getattr(value, name, None)) is not None}
+        return result or None
+    return None
+
+
+def quote_receipt_data(ret) -> tuple[dict | None, str | None]:
+    receipt = quote_mapping(ret)
+    if receipt is None:
+        return None, "receipt_shape"
+    code = receipt.get("retcode", receipt.get("ret_code"))
+    if (receipt.get("status") != "ok" or isinstance(code, bool)
+            or not isinstance(code, (int, str)) or code not in (0, "0")):
+        return None, "receipt_not_success"
+    data = quote_mapping(receipt.get("data"))
+    return (data, None) if data is not None else (None, "data_shape")
+
+
+def quote_scope(data, self_id, is_group, chat_id, *, author=None, trusted=False,
+                envelope=False) -> tuple[bool, str | None]:
+    """先拒绝显式冲突，再判断会话证据；消息类型本身绝不证明群归属。
+
+    trusted 只能来自本账号本会话的发送 scope 或定向 history 的匹配项。
+    history envelope 与消息项分别校验，不能用 envelope 掩盖项内冲突。
+    """
+    own, peer = quote_id(self_id), quote_id(chat_id)
+    if own is None or peer is None:
+        return False, "session_id"
+    returned_self = data.get("self_id")
+    if returned_self is not None and quote_id(returned_self) != own:
+        return False, "self_id_conflict"
+    kind = data.get("message_type")
+    if kind is not None and kind != ("group" if is_group else "private"):
+        return False, "message_type_conflict"
+    group = data.get("group_id")
+    has_group = group not in (None, 0, "0", "")
+    if is_group:
+        if has_group and quote_id(group) != peer:
+            return False, "group_id_conflict"
+        return has_group or trusted, None
+    if has_group:
+        return False, "group_id_conflict"
+    if envelope:
+        for name in ("user_id", "target_id", "peer_id"):
+            if data.get(name) is not None and quote_id(data[name]) != peer:
+                return False, name + "_conflict"
+        return trusted, None
+    author = quote_id(author)
+    if author not in (own, peer):
+        return False, "author_id_conflict"
+    # peer_id 总是会话对象；target_id 是消息接收者（入站应为自己）。
+    if data.get("peer_id") is not None and quote_id(data["peer_id"]) != peer:
+        return False, "peer_id_conflict"
+    target = data.get("target_id")
+    expected = peer if author == own else own
+    if target is not None and quote_id(target) != expected:
+        return False, "target_id_conflict"
+    return author == peer or target is not None or data.get("peer_id") is not None or trusted, None
+
+
+async def find_quote_in_history(actions, state, anchor) -> tuple[dict | None, str | None]:
+    """仅查询当前会话的小页；匹配真实 message_id 才能补足缺失 scope。"""
+    fetch = getattr(actions, "get_quote_history_with_receipt", None)
+    if callable(fetch):
+        ret = await fetch(state.is_group, state.chat_id, anchor)
+    else:
+        name = "get_group_msg_history" if state.is_group else "get_friend_msg_history"
+        fetch = getattr(actions, name, None)
+        if not callable(fetch):
+            return None, "history_unsupported"
+        # OneBot message_id 不是 NapCat message_seq；不传 seq，使用接口最近页默认值。
+        params = ({"group_id": int(state.chat_id), "count": 20}
+                  if state.is_group else {"user_id": int(state.chat_id), "count": 20})
+        ret = await fetch(**params)
+    data, reason = quote_receipt_data(ret)
+    if reason:
+        return None, "history_" + reason
+    _, reason = quote_scope(data, *state.key, trusted=True, envelope=True)
+    if reason:
+        return None, "history_" + reason
+    messages = data.get("messages")
+    if not isinstance(messages, (list, tuple)):
+        return None, "history_messages_shape"
+    found = None
+    for item in messages[:20]:
+        item = quote_mapping(item)
+        if item is None:
+            return None, "history_item_shape"
+        sender = quote_mapping(item.get("sender")) or {}
+        author = sender.get("user_id", item.get("user_id"))
+        _, reason = quote_scope(item, *state.key, author=author, trusted=True)
+        if reason:
+            return None, "history_" + reason
+        if quote_id(item.get("message_id")) == anchor:
+            if quote_id(author) is None:
+                return None, "history_author_missing"
+            if found is not None:
+                return None, "history_duplicate_message_id"
+            found = item
+    return (found, None) if found is not None else (None, "history_message_id_not_found")
+
+
 def _finite_number(value) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -61,13 +207,13 @@ def _text(value, limit: int) -> str:
 
 
 def _media_metadata(media) -> list[dict]:
-    """最多保留五条小型公开描述信息，不保留原始传输数据。"""
+    """保留协议安全上限内的全部媒体描述，不保留原始传输数据。"""
     if isinstance(media, dict):
         media = [media]
     if not isinstance(media, (list, tuple)):
         return []
     result = []
-    for item in media[:5]:
+    for item in media[:MAX_MEDIA_ITEMS]:
         if not isinstance(item, dict):
             continue
         cleaned = {}
@@ -131,7 +277,7 @@ class MessageIndex:
     """线程安全的会话 LRU 索引，会话内优先淘汰最早记录的消息。
 
     记录采用字符串 ID，包含 self_id/is_group/chat_id、message_id、author_id、
-    text（最多 256 字）、nickname、timestamp、sent_at、media、reply_to、
+    text（最多 256 字）、full_text（最多 3000 字）、nickname、timestamp、sent_at、media、reply_to、
     is_bot、known 和 recalled。``known`` 表示作者通过自身身份校验，且显式提供了
     可信出站时间；仅观察到自身回流不能建立此标记。
     所有返回记录均为独立副本，包括嵌套的媒体字典。
@@ -194,7 +340,8 @@ class MessageIndex:
         record = {
             "self_id": key[0], "is_group": key[1], "chat_id": key[2],
             "message_id": mid, "author_id": author,
-            "text": _text(text, 256), "nickname": _text(nickname, 128),
+            "text": _text(text, 256), "full_text": _text(text, 3000),
+            "nickname": _text(nickname, 128),
             "timestamp": _finite_number(timestamp), "sent_at": trusted_time,
             "media": _media_metadata(media), "reply_to": _message_id(reply_to),
             "is_bot": own, "known": trusted_time is not None, "recalled": False,
@@ -208,9 +355,13 @@ class MessageIndex:
                 if previous["author_id"] and previous["author_id"] != author:
                     self._sessions.move_to_end(key)
                     return copy.deepcopy(previous)
-                for name in ("text", "nickname", "media", "reply_to", "timestamp"):
+                for name in ("text", "full_text", "nickname", "media", "reply_to", "timestamp"):
                     if record[name] is None or record[name] == "" or record[name] == []:
                         record[name] = previous[name]
+                # 出站摘要/回流不能把已经取得的长原文降级为其短前缀。
+                if (len(previous["full_text"]) > 256
+                        and previous["full_text"].startswith(record["full_text"])):
+                    record["full_text"] = previous["full_text"]
                 record["is_bot"] = previous["is_bot"] or own
                 if previous["sent_at"] is not None:
                     record["sent_at"] = previous["sent_at"]

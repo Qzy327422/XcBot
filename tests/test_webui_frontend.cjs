@@ -46,6 +46,16 @@ function node(value='') { return {value, innerHTML:'', textContent:'', style:{},
 const tests=[];
 function test(name,fn) {tests.push([name,fn]);}
 
+test('debug update details prefer dependency diagnostics and fall back to status text', () => {
+  const h=harness();
+  vm.runInContext(section('function dbgKV(', 'function renderDebug()'),h.context);
+  vm.runInContext(section('function renderDebug()', 'async function debugRestart('),h.context);
+  h.run(`let dbgSelfResult=null;state.bundle.status={debug:{update_install:{state:'error',text:'更新失败',detail:'ERROR: simulated pip failure'}}};`);
+  assert.ok(h.run('renderDebug()').includes('ERROR: simulated pip failure'));
+  h.run(`state.bundle.status.debug.update_install.detail='';`);
+  assert.ok(h.run('renderDebug()').includes('更新失败'));
+});
+
 test('feature cards stay hidden through fallback without deleting saved values; QQ gates explain WebUI recovery', () => {
   const h=harness();
   vm.runInContext(section('function renderFeatures()', 'function toggleFeature('),h.context);
@@ -92,6 +102,10 @@ test('AI split group retains unknown schema fields and both switches independent
   assert.ok(!html.includes('ai-filter-fields'));assert.ok(!html.includes('ai-split-options'));
   assert.match(css,/repeat\(auto-fill,minmax\(280px,1fr\)\)/);
   assert.equal((html.match(/toggleFeature\('split_reply_quote'/g)||[]).length,1);
+  assert.ok(html.includes('回复时引用'));
+  assert.ok(!html.includes('分段首段引用'));
+  assert.ok(html.indexOf("toggleFeature('split_reply_quote'")<html.indexOf('id="section_ai_split"'));
+  assert.ok(!split.includes("toggleFeature('split_reply_quote'"));
   for(const f of fields)assert.equal((html.match(new RegExp('id="f_'+f.path.replace(/[^a-zA-Z0-9]/g,'_')+'"','g'))||[]).length,f.type==='bool'?0:1,f.path);
   for(const f of fields.filter(f=>f.path.startsWith('Others.llm_split.')||f.category==='分段回复'))assert.ok(split.includes(f.path),f.path);
   assert.ok(!html.includes('ai_chat'));
@@ -105,6 +119,21 @@ test('AI split group retains unknown schema fields and both switches independent
   h.run(`toggleFeature('split_reply_quote',quoteSwitch)`);
   assert.equal(h.run('state.bundle.feature_switches.split_reply_quote'),false);
   assert.equal(h.run(`state.bundle.form_values['Others.llm_split.enabled']`),true);
+});
+
+test('proactive page removes legacy_account_id and max_account_background_calls_per_day completely', () => {
+  const h=harness();
+  vm.runInContext(section('function settingsTabs(', 'function switchSettingsTab('),h.context);
+  h.run(`renderField=(f,v)=>'<input data-path="'+f.path+'" value="'+(v||'')+'">';pages=()=>state.bundle.ui_schema;state.bundle.ui_schema=[{key:'proactive',fields:[{path:'ProactiveReply.group.enabled'},{path:'ProactiveReply.group.observation.enabled'},{path:'ProactiveReply.group.observation.trigger_probability'},{path:'ProactiveReply.group.observation.default_wait_seconds'},{path:'ProactiveReply.group.observation.min_wait_seconds'},{path:'ProactiveReply.group.observation.max_wait_seconds'},{path:'ProactiveReply.group.observation.debounce_seconds'},{path:'ProactiveReply.group.observation.max_debounce_seconds'},{path:'ProactiveReply.group.observation.min_continuation_interval_seconds'},{path:'ProactiveReply.private.enabled'}]}];state.bundle.form_values={'ProactiveReply.legacy_account_id':'999','ProactiveReply.group.observation.enabled':true};`);
+  const html=h.run(`renderOrganizedSettings({key:'proactive',title:'主动回复',fields:state.bundle.ui_schema[0].fields})`);
+  assert.equal((html.match(/data-path="ProactiveReply\.legacy_account_id"/g)||[]).length,0);
+  assert.doesNotMatch(html,/proactive-legacy-box|旧会话所属机器人/);
+  assert.equal((html.match(/data-path="ProactiveReply\.max_account_background_calls_per_day"/g)||[]).length,0);
+  const advIdx=html.indexOf('<details class="proactive-obs-advanced">');
+  assert.ok(advIdx>0);
+  assert.ok(html.indexOf('ProactiveReply.group.observation.enabled')<advIdx);
+  assert.ok(html.indexOf('ProactiveReply.group.observation.trigger_probability')<advIdx);
+  assert.ok(html.indexOf('ProactiveReply.group.observation.default_wait_seconds')>advIdx);
 });
 
 test('plugin entry animates its actual root without restarting cards on panel replacement', () => {
@@ -466,6 +495,584 @@ test('超视口父卡片保留玻璃区域，并沿用祖先裁剪而非把卡�
   const opened=JSON.parse(vm.runInContext('JSON.stringify(gpuRegions(390,844))',context));
   assert.deepEqual(opened[0].clipBox,[10,10,380,834]);
   assert.deepEqual(opened[0].rect,regions[0].rect);
+});
+
+function roleLifeHarness({setInterval}={}){
+  const h=harness();
+  if(setInterval)h.context.setInterval=setInterval;
+  vm.runInContext(section('// ==================== 角色生活 ====================', "\nconst AGENT_LEVEL_LABEL="),h.context);
+  return h;
+}
+function roleLifeSample(overrides={}){
+  return Object.assign({
+    connected:true,current_account:'10001',known_accounts:['10001','20002'],
+    roles:{'10001':['p1','p2'],'20002':['p9']},account:'10001',role_id:'p1',
+    editable:true,read_only_reason:'',
+    presets:[{id:'p1',name:'甲'},{id:'p2',name:'乙'}],
+    models:[{provider_id:'x',model:'m',label:'x/m'}],
+    default_config:{enabled:false,plan_enabled:true,activity_enabled:true,sleep_enabled:true,
+      diary_enabled:true,dream_enabled:true,maintenance_enabled:false,timezone:'Asia/Shanghai',
+      sleep_start:'00:30',sleep_hours:8,diary_time:'23:50',activities_per_day:5,
+      role_daily_limit:24,retention_days:90,maintenance_interval_seconds:1800,
+      model_override:'',preference:''},
+    config:null,config_revision:'abc',
+    status:{enabled:true,available:true,corrupt:false,account:'10001',role_id:'p1',
+      revision:'rev-1',epoch:2,state_version:7,last_advance:0,date:'2026-03-10',
+      sleeping:false,sleep:null,current_activity:null,
+      plan:{plan_id:'p',serial:1,items:[
+        {id:'x-p1-1',title:'晨间阅读',purpose:'看书',start:1,end:2,status:'completed',experience_id:'exp-1'},
+        {id:'x-p1-2',title:'散步',purpose:'吹风',start:3,end:4,status:'planned',experience_id:''},
+      ]},
+      mood:{mood:'平静'},recent:[{id:'exp-1',kind:'activity',text:'看完一章',date:'2026-03-10',dream:false},
+        {id:'dream-1',kind:'dream',text:'一条走廊',date:'2026-03-10',dream:true}],
+      usage:{role_24h:3,role_limit:24,account_limit:192,account_id:'10001'},
+      queue:0,jobs:[{id:'j1',kind:'plan',status:'failed',created_at:10,finished_at:11,
+        error:'timeout',attempts:1,request_id:'r1',retry_of:''}],
+      metrics:{last_error:'timeout',last_error_at:11,last_success_at:9},
+      config:overrides.config||{enabled:true},next_node:{at:5,label:'写日记'}},
+  },overrides)
+}
+function withRoleLife(h,setup){
+  h.run(`roleLifeState={data:${JSON.stringify(setup)},loading:false,error:'',account:'10001',
+    role:'p1',tab:'overview',subTab:'activity',page:{activity:1,diary:1,dream:1,plans:1,jobs:1},
+    records:{activity:null,diary:null,dream:null,plans:null,jobs:null},
+    pending:Object.create(null),draft:null,message:'',requests:Object.create(null)};`);
+}
+
+test('角色生活页展示概览、顶栏总开关、日常内容与损坏只读，不把计划当经历', () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  const html=h.run('renderRoleLife()');
+  assert.match(html,/角色生活/);assert.doesNotMatch(html,/后台用量/);assert.doesNotMatch(html,/不额外保存模型 Key/);
+  assert.match(html,/今天的安排/);assert.match(html,/最近留下的片段/);
+  assert.match(html,/id="life-master-switch"/);assert.match(html,/当前人设：甲/);assert.match(html,/写日记/);
+  assert.doesNotMatch(html,/id="life-account"|id="life-role"/);
+  // “今天”页区分完成与未开始：只有 experience_id 的条目显示“经历已保存”
+  h.run(`roleLifeState.tab='today'`);
+  const today=h.run('renderRoleLife()');
+  assert.match(today,/晨间阅读/);assert.match(today,/经历已保存/);assert.match(today,/散步/);
+  assert.ok(today.indexOf('已完成')<today.indexOf('未开始'));
+  // 损坏状态：只读，显示错误和清空，绝不能显示“用量 0”
+  const bad=roleLifeSample();bad.status=Object.assign({},bad.status,{corrupt:true,available:false,jobs:[],metrics:{},error:'state identity mismatch'});
+  bad.editable=false;withRoleLife(h,bad);
+  const broken=h.run('renderRoleLife()');
+  assert.match(broken,/状态不可读/);assert.match(broken,/state identity mismatch/);
+  assert.match(today,/<span class="pill ok">已完成<\/span>/);
+  assert.doesNotMatch(today,/&lt;span class=/);
+  assert.doesNotMatch(broken,/用量[\s\S]{0,200}0 \/ 0/);
+});
+
+test('角色生活页顶部显示唯一总开关，统一走右上角保存且不重复开关', async () => {
+  const h=roleLifeHarness();const sample=roleLifeSample({runtime_running:false,active_persona_name:'温柔猫娘'});
+  withRoleLife(h,sample);
+  h.run(`state.current='role-life';`);
+  const html=h.run('renderRoleLife()');
+  assert.match(html,/id="life-master-switch"/);assert.match(html,/角色生活总开关/);
+  assert.match(html,/当前人设：温柔猫娘/);assert.match(html,/仅 WebUI/);
+  assert.doesNotMatch(html,/待连接 · 只读|未连接 QQ/);
+  // 设置页不再重复「启用此角色生活」，也不再出现底部保存栏
+  h.run(`roleLifeState.tab='settings'`);
+  const settings=h.run('renderRoleLife()');
+  assert.doesNotMatch(settings,/life-savebar|roleLifeSaveConfig\(\)|启用此角色生活/);
+  assert.doesNotMatch(settings,/roleLifeToggle\('enabled'/);
+  // 拨动顶栏总开关会标记 state.dirty，点统一 saveAll() 直接保存角色生活配置
+  const posted=[];
+  h.context.fetch=async(url,opt)=>{
+    posted.push({url,body:JSON.parse(opt.body)});
+    return {status:200,ok:true,json:async()=>({ok:true,data:roleLifeSample({config:{enabled:true}})})};
+  };
+  h.context.toast=()=>{};h.context.render=()=>{};
+  h.run("roleLifeSetDraft('enabled',true)");
+  assert.equal(h.run('state.dirty'),true);
+  await h.run('saveAll()');
+  assert.equal(posted.length,1);
+  assert.ok(posted[0].url.includes('/api/role-life/config'));
+  assert.equal(posted[0].body.config.enabled,true);
+  assert.equal(h.run('state.dirty'),false);
+});
+
+test('角色生活写操作携带 revision/epoch/state_version 与复用的 request_id', async () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  const posts=[];let fail=true;
+  h.context.api=async(url,opt)=>{posts.push(JSON.parse(opt.body));if(fail)throw Error('network');return {ok:true}};
+  h.context.toast=()=>{};
+  h.context.loadRoleLife=async()=>{};
+  h.context.render=()=>{};
+  await h.run(`roleLifeAction('enqueue',{kind:'plan'})`);
+  await h.run(`roleLifeAction('enqueue',{kind:'plan'})`);
+  assert.equal(posts.length,2);
+  for(const body of posts){
+    assert.equal(body.expected_revision,'rev-1');assert.equal(body.expected_epoch,2);
+    assert.equal(body.expected_state_version,7);
+  }
+  assert.equal(posts[0].request_id,posts[1].request_id); // 失败重试复用幂等 ID
+  assert.equal(posts[0].action,'enqueue');assert.equal(posts[0].kind,'plan');
+  fail=false;
+  await h.run(`roleLifeAction('clear')`);
+  assert.equal(posts[2].action,'clear');assert.equal(posts[2].expected_state_version,7);
+  // 成功的清空丢弃自己的 request_id；失败过的入队保留它，供下一次网络重试复用
+  const pendingIds=h.json('roleLifeState.requests');
+  assert.equal(pendingIds['clear:'],undefined);
+  assert.equal(pendingIds['enqueue:plan'],posts[0].request_id);
+});
+
+test('角色生活清空必须输入“清空”，损坏时传 allow_corrupt', async () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  const posts=[];
+  h.context.api=async(url,opt)=>{posts.push(JSON.parse(opt.body));return {ok:true}};
+  h.context.render=()=>{};h.context.toast=()=>{};h.context.loadRoleLife=async()=>{};
+  h.context.prompt=()=>'取消';await h.run('roleLifeClear()');
+  assert.equal(posts.length,0);
+  h.context.prompt=()=>'清空';await h.run('roleLifeClear()');
+  assert.equal(posts.length,1);assert.equal(posts[0].allow_corrupt,undefined);
+  const bad=roleLifeSample();bad.status=Object.assign({},bad.status,{corrupt:true});
+  withRoleLife(h,bad);h.context.prompt=()=>'清空';await h.run('roleLifeClear()');
+  assert.equal(posts[1].allow_corrupt,true);
+});
+
+test('角色生活设置只保存草稿各键，模型无效时保留原值并显示暂停提示', () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  h.run(`roleLifeState.tab='settings';roleLifeState.draft=null;`);
+  const html=h.run('renderRoleLife()');
+  for(const key of ['plan_enabled','activity_enabled','sleep_enabled','diary_enabled','dream_enabled','mood_tone_enabled','env_awareness_enabled','maintenance_enabled'])assert.ok(html.includes("roleLifeToggle('"+key+"'"),key);
+  assert.ok(!html.includes("roleLifeToggle('enabled'"));
+  assert.ok(!html.includes("roleLifeToggle('chat_feedback_enabled'"));
+  assert.doesNotMatch(html,/role_daily_limit/);assert.match(html,/retention_days/);
+  assert.match(html,/maintenance_interval_seconds/);assert.match(html,/timezone/);
+  assert.match(html,/指定模型不可用时暂不生成/);assert.match(html,/角色生活总开关/);
+  assert.doesNotMatch(html,/gotoPage\('proactive'\)/);
+  assert.doesNotMatch(html,/生活不等于群发/);
+  // select 里已经保存但不在现有模型列表的 override 仍然显示
+  h.run(`roleLifeState.draft={model_override:'gone/model'}`);
+  assert.match(h.run('renderRoleLife()'),/gone\/model（当前保存值不可用，将暂停）/);
+});
+
+test('角色生活记录按 kind 分页并转义生成文本', () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  const hostile='<img src=x onerror=alert(1)>';
+  h.run(`roleLifeState.tab='experiences';roleLifeState.subTab='diary';roleLifeState.records.diary={items:[{id:'d1',kind:'diary',text:${JSON.stringify(hostile)},date:'2026-03-10',dream:false}],page:1,page_size:20,total:1,pages:1};`);
+  const html=h.run('renderRoleLife()');
+  assert.ok(html.includes('&lt;img src=x onerror=alert(1)&gt;'));
+  assert.ok(!html.includes('<img src=x'));
+  h.run(`roleLifeState.records.dream={items:[{id:'m1',kind:'dream',dream:true,text:'梦',date:'2026-03-10'}],page:1,page_size:20,total:1,pages:1};roleLifeState.subTab='dream';`);
+  const dreamHtml=h.run('renderRoleLife()');
+  assert.match(dreamHtml,/梦境/);assert.doesNotMatch(dreamHtml,/不是现实经历/);
+});
+
+test('新增人格预设不复用已删除的数量 ID', () => {
+  const h=harness();
+  vm.runInContext(section('function personaNewId(', 'function addPersonaPreset('),h.context);
+  vm.runInContext(section('function addPersonaPreset(', 'function selectPersonaPreset('),h.context);
+  vm.runInContext(`
+    state.bundle={form_values:{'Others.personality_presets':[{id:'default',name:'默认',prompt:''},{id:'p2',name:'乙',prompt:''}],'Others.active_personality_preset':'default'}};
+    render=()=>{};setPersonaPresets=ps=>{state.bundle.form_values['Others.personality_presets']=ps};
+  `,h.context);
+  const removed=h.run(`JSON.parse(JSON.stringify(state.bundle.form_values['Others.personality_presets'].filter(p=>p.id!=='p2')))`);
+  h.run(`state.bundle.form_values['Others.personality_presets']=${JSON.stringify(removed)};state.personaEditId=''`);
+  h.run('addPersonaPreset()');
+  const ids=h.json(`state.bundle.form_values['Others.personality_presets'].map(p=>p.id)`);
+  assert.equal(ids.length,2);assert.ok(ids.includes('default'));
+  assert.ok(!ids.includes('preset2'),'must not reuse the removed numeric id');
+  h.run('addPersonaPreset()');
+  assert.equal(h.run('new Set(state.bundle.form_values["Others.personality_presets"].map(p=>p.id)).size'),3);
+});
+
+test('角色生活损坏/未知用量不显示 0，清空文案简洁明确', async () => {
+  const h=roleLifeHarness();const sample=roleLifeSample();
+  sample.status=Object.assign({},sample.status,{corrupt:true,available:false,jobs:[],metrics:{},
+    error:'state unreadable'});
+  delete sample.status.revision;delete sample.status.epoch;delete sample.status.state_version;
+  sample.status.budget_unknown=true;sample.status.budget_unknown_until=1893456000;
+  withRoleLife(h,sample);
+  const html=h.run('renderRoleLife()');
+  assert.match(html,/保护性暂停/);assert.doesNotMatch(html,/0 \/ 0 次/);
+  let promptText='';
+  h.context.prompt=t=>{promptText=t;return '取消'};
+  await h.run('roleLifeClear()');
+  assert.match(promptText,/状态文件不可读/);assert.match(promptText,/不影响聊天记录/);
+  assert.doesNotMatch(promptText,/完整保留原用量/);
+  // 正常清空：不影响聊天记录，且不宣称清零预算
+  withRoleLife(h,roleLifeSample());
+  h.run('roleLifeState.tab="overview"');
+  h.context.prompt=t=>{promptText=t;return '取消'};
+  await h.run('roleLifeClear()');
+  assert.match(promptText,/不影响聊天记录/);assert.doesNotMatch(promptText,/重置模型调用预算/);
+});
+
+test('角色生活恢复后显示备份文件名，未知用量时显示保护性暂停', () => {
+  const h=roleLifeHarness();
+  const sample=roleLifeSample();
+  sample.status=Object.assign({},sample.status,{budget_unknown:false,budget_unknown_until:0,
+    recovered_from_corrupt:true,corrupt_backup:'state.corrupt-1760000000000.json.bak'});
+  withRoleLife(h,sample);
+  const html=h.run('renderRoleLife()');
+  assert.match(html,/state\.corrupt-1760000000000\.json\.bak/);
+  assert.doesNotMatch(html,/已保护性暂停生成/);
+  // usage 只在 usage 子对象里给 budget_unknown 时也要认
+  const alt=roleLifeSample();
+  alt.status=Object.assign({},alt.status,{usage:{role_24h:null,role_limit:24,account_limit:192,
+    account_id:'10001',budget_unknown:true,budget_unknown_until:1893456000}});
+  withRoleLife(h,alt);
+  assert.match(h.run('renderRoleLife()'),/角色用量未知，已保护性暂停生成/);
+  assert.doesNotMatch(h.run('renderRoleLife()'),/<progress/);
+});
+
+test('生活页切角色后晚到的旧概览与记录均不能覆盖新角色', async () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  const old=deferred(),fresh=deferred();let reads=0;
+  h.context.api=()=>++reads===1?old.promise:fresh.promise;
+  const first=h.run('loadRoleLife(true)'),second=h.run("roleLifeSelect('10001','p2')");
+  fresh.resolve(roleLifeSample({role_id:'p2'}));await second;
+  old.resolve(roleLifeSample({role_id:'p1'}));await first;
+  assert.equal(h.run('roleLifeState.role'),'p2');assert.equal(h.run('roleLifeState.loading'),false);
+  const pending=deferred();h.context.api=url=>url.includes('/records')?pending.promise:Promise.resolve(roleLifeSample({role_id:'p1'}));
+  const record=h.run("roleLifeLoadRecords('diary')");
+  await h.run("roleLifeSelect('10001','p1')");
+  pending.resolve({items:[{text:'旧角色私密日记'}],page:1,pages:1});await record;
+  assert.equal(h.run('roleLifeState.records.diary'),null);
+});
+
+test('生活页同角色翻页只接受最后请求，旧finally不取消新loading', async () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());const one=deferred(),two=deferred();let n=0;
+  h.context.api=()=>++n===1?one.promise:two.promise;
+  const a=h.run("roleLifeLoadRecords('diary')");h.run('roleLifeState.page.diary=2');
+  const b=h.run("roleLifeLoadRecords('diary')");one.resolve({items:[{text:'第一页'}],page:1,pages:2});await a;
+  assert.equal(h.run('roleLifeState.records.diary.loading'),true);
+  two.resolve({items:[{text:'第二页'}],page:2,pages:2});await b;
+  assert.equal(h.run('roleLifeState.records.diary.items[0].text'),'第二页');
+});
+
+test('生活页首次加载失败结束loading，已有数据刷新失败可见且禁写', async () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  h.run('roleLifeState.data=null');h.context.api=async()=>{throw Error('离线读取失败')};
+  await h.run('loadRoleLife(true)');assert.equal(h.run('roleLifeState.loading'),false);
+  assert.match(h.run('renderRoleLife()'),/离线读取失败/);assert.doesNotMatch(h.run('renderRoleLife()'),/正在读取角色生活/);
+  withRoleLife(h,roleLifeSample());await h.run('loadRoleLife(true)');
+  assert.match(h.run('renderRoleLife()'),/保留上次读取的内容/);assert.equal(h.run('roleLifeEditable()'),false);
+});
+
+test('生活页任务错误不是空记录，历史日程入口与时间线可达', () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  h.run("roleLifeState.tab='jobs';roleLifeState.records.jobs={error:'任务接口暂不可用',items:[]}");
+  const html=h.run('renderRoleLife()');assert.match(html,/任务接口暂不可用/);assert.doesNotMatch(html,/后台还很安静/);
+  h.run("roleLifeState.tab='today';roleLifeState.todayTab='plans';roleLifeState.records.plans={items:[{date:'2026-03-09',title:'旧日散步',status:'completed',start:1,end:2},{date:'2026-03-09',title:'晚间记录',status:'completed',start:3,end:4}],page:1,pages:1}");
+  const plans=h.run('renderRoleLife()');assert.match(plans,/历史日程/);assert.match(plans,/旧日散步/);assert.doesNotMatch(plans,/上一页/);
+});
+
+test('生活设置保存锁住重复操作、晚回包不能写回另一角色', async () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());const wait=deferred();let calls=0;
+  h.context.api=()=>{calls++;return wait.promise};h.run("roleLifeState.draft={preference:'已提交'}");
+  const saving=h.run('roleLifeSaveConfig()');await h.run('roleLifeSaveConfig()');
+  h.run("roleLifeSetDraft('preference','保存中不允许修改')");assert.equal(calls,1);
+  assert.equal(h.run('roleLifeState.draft.preference'),'已提交');assert.equal(h.run('roleLifeState.saving'),true);
+  wait.resolve(roleLifeSample({config:{preference:'已提交'}}));await saving;
+  assert.equal(h.run('roleLifeState.saving'),false);assert.equal(h.run('roleLifeState.draft'),null);
+  const late=deferred();h.context.api=()=>late.promise;h.run("roleLifeState.draft={preference:'旧角色'}");
+  const old=h.run('roleLifeSaveConfig()');h.run("roleLifeState.generation=2;roleLifeState.role='p2';roleLifeState.data={role_id:'p2'};roleLifeState.draft={preference:'新角色'};roleLifeState.saving=false");
+  late.resolve(roleLifeSample());await old;
+  assert.equal(h.run('roleLifeState.data.role_id'),'p2');assert.equal(h.run('roleLifeState.draft.preference'),'新角色');
+});
+
+test('生活页状态版本更新刷新当前记录，时间按角色时区而非浏览器', async () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  h.run("roleLifeState.tab='experiences';roleLifeState.subTab='diary';roleLifeState.records.diary={items:[{text:'旧日记'}],page:1,pages:1}");
+  const sample=roleLifeSample();sample.status.state_version=8;let recordCalls=0;
+  h.context.api=async url=>url.includes('/records')?(recordCalls++,{items:[{text:'新日记'}],page:1,pages:1}):sample;
+  await h.run('loadRoleLife(true)');await Promise.resolve();
+  assert.equal(recordCalls,1);assert.equal(h.run('roleLifeState.records.diary.items[0].text'),'新日记');
+  const stamp=Date.parse('2026-11-15T00:00:00Z')/1000;
+  h.run("roleLifeState.data.config={timezone:'Asia/Shanghai'}");assert.equal(h.run(`roleLifeFmtTime(${stamp},true)`),'08:00');
+  h.run("roleLifeState.data.config={timezone:'America/New_York'}");assert.equal(h.run(`roleLifeFmtTime(${stamp},true)`),'19:00');
+});
+
+test('生活页开关是可访问按钮且主操作唯一，危险操作不抢主位', () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  h.run("roleLifeState.tab='settings';roleLifeState.draft={preference:'草稿'}");const settings=h.run('renderRoleLife()');
+  assert.match(settings,/id="life-master-switch"[^>]+role="switch"[^>]+aria-checked=/);
+  assert.match(settings,/label for="life-field-sleep_start"/);assert.match(settings,/type="time"/);
+  assert.equal((settings.match(/class="btn primary"/g)||[]).length,0);
+  assert.doesNotMatch(settings,/life-savebar/);
+  assert.match(settings,/life-danger-zone/);assert.match(settings,/aria-controls="life-panel-settings"/);
+  h.run("roleLifeState.tab='overview'");const overview=h.run('renderRoleLife()');
+  assert.equal((overview.match(/class="btn primary"/g)||[]).length,1);
+  assert.doesNotMatch(overview,/后台用量|账号共享上限/);
+});
+
+test('生活页辅助文字具备可读对比度，顶栏总开关具备清晰样式', () => {
+  const root=css.match(/\.role-life\{([^}]*)\}/)?.[1]||'';
+  assert.match(root,/--muted:\s*rgba\(232,247,255,\.80\)/);
+  assert.match(css,/html\[data-theme="light"\] \.role-life\{--muted:\s*rgba\(20,35,52,\.74\)\}/);
+  const master=css.match(/\.life-master-control\{([^}]*)\}/)?.[1]||'';
+  assert.match(master,/display:inline-flex/);
+  assert.match(css,/\.role-life \.life-caption,\.role-life \.life-meta\{color:var\(--muted\)/);
+  assert.match(css,/html\[data-theme="dark"\]:not\(\.liquid-glass\) \.role-life \.pill\{background:var\(--bg1\) !important\}/);
+});
+
+test('生活页保留换行、无数据不显示分页，临时读取错误没有清空操作', () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  h.run("roleLifeState.tab='experiences';roleLifeState.subTab='diary';roleLifeState.records.diary={items:[{text:'第一段\\n第二段',kind:'diary'}],page:1,pages:1}");
+  assert.match(h.run('renderRoleLife()'),/class="life-prose">第一段\n第二段/);assert.match(css,/white-space:pre-wrap/);
+  const sample=roleLifeSample();sample.status={read_error:true,error:'暂时读取失败'};withRoleLife(h,sample);
+  const html=h.run('renderRoleLife()');assert.match(html,/暂时读不到状态/);assert.doesNotMatch(html,/清空并重建/);
+  assert.equal(h.run('roleLifeEditable()'),false);
+});
+
+test('生活页保存错误转义且保留草稿，显式刷新不抹未保存设置', async () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  h.run("roleLifeState.tab='settings';roleLifeState.draft={preference:'我的草稿'}");
+  h.context.api=async()=>{throw Error('<img src=x onerror=alert(1)>')};
+  await h.run('roleLifeSaveConfig()');
+  const error=h.run('renderRoleLife()');assert.match(error,/保存失败/);assert.ok(!error.includes('<img src=x'));
+  assert.equal(h.run('roleLifeState.draft.preference'),'我的草稿');
+  h.context.api=async()=>roleLifeSample({config:{preference:'服务端新值'}});
+  await h.run('loadRoleLife(true)');assert.equal(h.run('roleLifeDraftValues().preference'),'我的草稿');
+});
+
+test('生活页离开保护与独立 WebUI 状态不阻断查看与编辑', () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());h.run("roleLifeState.draft={enabled:true}");
+  h.context.confirm=()=>false;assert.equal(h.run('roleLifeLeave()'),false);assert.equal(h.run('roleLifeState.draft.enabled'),true);
+  h.context.confirm=()=>true;assert.equal(h.run('roleLifeLeave()'),true);assert.equal(h.run('roleLifeState.draft'),null);
+  const standalone=roleLifeSample({runtime_running:false,editable:true});
+  withRoleLife(h,standalone);const html=h.run('renderRoleLife()');
+  assert.match(html,/仅 WebUI/);assert.match(html,/看完一章/);assert.doesNotMatch(html,/连接 QQ 后，可以查看它的一天/);
+});
+
+test('生活页操作进行中禁止重复与切角色，错误后保留同一请求ID', async () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());const pending=deferred();let calls=0;
+  h.context.api=()=>{calls++;return pending.promise};
+  const first=h.run("roleLifeAction('regenerate_plan')");
+  await h.run("roleLifeAction('regenerate_plan')");assert.equal(calls,1);
+  assert.equal(h.run('roleLifeLeave()'),false);
+  pending.reject(Error('连接中断'));await first;
+  assert.equal(h.run('roleLifeBusy()'),false);assert.match(h.run('roleLifeState.message'),/连接中断/);
+  const id=h.run("roleLifeState.requests['regenerate_plan:']");assert.ok(id);
+  h.context.api=async(url,opt)=>{assert.equal(JSON.parse(opt.body).request_id,id);throw Error('仍未确认')};
+  await h.run("roleLifeAction('regenerate_plan')");assert.equal(h.run("roleLifeState.requests['regenerate_plan:']"),id);
+});
+
+test('生活页服务端回退角色时清理旧记录，空页无伪造进度', async () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  h.run("roleLifeState.records.diary={items:[{text:'旧角色'}],page:1,pages:1};roleLifeState.draft={preference:'旧草稿'}");
+  const newData=roleLifeSample({role_id:'p2'});newData.status.usage={role_24h:null,role_limit:24,account_limit:99};
+  h.context.api=async()=>newData;await h.run('loadRoleLife(true)');
+  assert.equal(h.run('roleLifeState.role'),'p2');assert.equal(h.run('roleLifeState.records.diary'),null);
+  assert.equal(h.run('roleLifeState.draft'),null);assert.doesNotMatch(h.run('renderRoleLife()'),/<progress/);
+});
+
+test('生活页无需连接 QQ 即可查看全部内容标签与设置', () => {
+  const h=roleLifeHarness();
+  withRoleLife(h,roleLifeSample({runtime_running:false,editable:true}));
+  for(const tab of ['overview','today','experiences','jobs','settings']){
+    h.context.targetTab=tab;h.run('roleLifeState.tab=targetTab');
+    const html=h.run('renderRoleLife()');
+    assert.doesNotMatch(html,/还没有可读取的生活状态|待连接 · 只读/);
+    assert.match(html,/id="life-master-switch"/);
+  }
+});
+
+test('生活页自动刷新不被标签按钮焦点阻止，编辑输入和草稿仍暂停', () => {
+  const intervals=[];
+  const h=roleLifeHarness({setInterval:(callback,delay)=>intervals.push({callback,delay})});
+  withRoleLife(h,roleLifeSample());h.run("state.current='role-life'");
+  assert.equal(intervals.length,1);assert.equal(intervals[0].delay,15000);
+  const refresh=intervals[0].callback,calls=[];
+  h.context.loadRoleLife=(...args)=>calls.push(args);
+  h.nodes.set('section_role_life',{contains:target=>!!target?.inside});
+  const blocked=()=>{const before=calls.length;refresh();assert.equal(calls.length,before)};
+  const allowed=()=>{const before=calls.length;refresh();assert.equal(calls.length,before+1);assert.deepEqual(calls.at(-1),[false,true])};
+  h.context.document.activeElement={tagName:'BUTTON',inside:true};allowed();
+  for(const tagName of ['INPUT','TEXTAREA','SELECT']){h.context.document.activeElement={tagName,inside:true};blocked()}
+  h.context.document.activeElement={tagName:'INPUT',inside:false};allowed();
+  h.context.document.activeElement=null;allowed();
+  h.run("roleLifeState.tab='settings'");blocked();h.run("roleLifeState.tab='overview'");
+  h.run("roleLifeState.draft={preference:'未保存'}");blocked();h.run('roleLifeState.draft=null');
+  h.run('roleLifeState.loading=true');blocked();h.run('roleLifeState.loading=false');
+  h.run('roleLifeState.saving=true');blocked();h.run('roleLifeState.saving=false');
+  h.run('roleLifeState.pending.test=true');blocked();h.run('delete roleLifeState.pending.test');
+  h.context.document.hidden=true;blocked();h.context.document.hidden=false;
+  h.run("state.current='welcome'");blocked();
+});
+
+test('生活页离线时损坏和读取错误优先于待连接空态', () => {
+  const h=roleLifeHarness();
+  for(const status of [
+    {available:false,corrupt:true,error:'离线文件损坏'},
+    {available:false,read_error:true,error:'离线暂时读取失败'},
+  ]){
+    withRoleLife(h,roleLifeSample({connected:false,editable:false,status}));
+    const html=h.run('renderRoleLife()');
+    assert.match(html,status.corrupt?/状态不可读/:/暂时读不到状态/);
+    assert.ok(html.includes(status.error));assert.doesNotMatch(html,/还没有可读取的生活状态/);
+    if(status.read_error)assert.doesNotMatch(html,/清空并重建/);
+  }
+});
+
+test('生活页标签键盘导航使用当前组并恢复焦点', () => {
+  const h=roleLifeHarness();let clicked=-1,focused=-1,prevented=0;
+  const tabs=[0,1,2].map(i=>({id:'tab'+i,click(){clicked=i}}));
+  tabs.forEach((tab,i)=>h.nodes.set(tab.id,{focus(){focused=i}}));
+  h.context.tabEvent={key:'ArrowRight',target:tabs[2],currentTarget:{querySelectorAll:()=>tabs},preventDefault(){prevented++}};
+  h.run('roleLifeTabKey(tabEvent)');assert.equal(clicked,0);assert.equal(focused,0);assert.equal(prevented,1);
+  h.context.tabEvent.key='End';h.context.tabEvent.target=tabs[0];h.run('roleLifeTabKey(tabEvent)');assert.equal(clicked,2);
+  h.context.tabEvent.key='Home';h.run('roleLifeTabKey(tabEvent)');assert.equal(clicked,0);
+});
+
+test('生活页移除计费卡片与账号/人设下拉选择器', () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  const ov=h.run('renderRoleLife()');
+  assert.match(ov,/今天的安排/);assert.match(ov,/最近留下的片段/);
+  assert.doesNotMatch(ov,/后台用量|不额外保存模型 Key|失败与重试也计入/);
+  assert.equal(h.run('roleLifeSelector()'),'');
+  assert.doesNotMatch(ov,/id="life-account"|id="life-role"/);
+});
+
+test('生活页支持日程增删改触发、记录编辑删除、手动备注管理及联动开关', () => {
+  const h=roleLifeHarness();
+  const sample=roleLifeSample();
+  sample.status.life_notes=[{id:'n1',date:'2026-03-10',text:'周末去公园看书',source:'manual'}];
+  withRoleLife(h,sample);
+  // 设置页保留情绪与节令开关，移除聊天小事反哺日常、重复总开关与底部保存栏
+  h.run("roleLifeState.tab='settings'");
+  const settingsHtml=h.run('renderRoleLife()');
+  for(const k of ['mood_tone_enabled','env_awareness_enabled'])assert.ok(settingsHtml.includes("roleLifeToggle('"+k+"'"),k);
+  assert.doesNotMatch(settingsHtml,/chat_feedback_enabled|weather_city|role_daily_limit|life-savebar/);
+  assert.doesNotMatch(settingsHtml,/模型、额度与高级设置|每角色 24 小时调用上限/);
+  assert.match(settingsHtml,/高级设置/);
+  assert.equal((settingsHtml.match(/class="btn primary"/g)||[]).length,0);
+  // 概览页卡片（即使多条 recent）不显示编辑/删除按钮
+  h.run("roleLifeState.tab='overview'");
+  const ovHtml=h.run('renderRoleLife()');
+  assert.doesNotMatch(ovHtml,/roleLifeOpenExpEditor|roleLifeDeleteExperience/);
+  // 今天日程支持添加/编辑/删除/生成经历与手动备注
+  h.run("roleLifeState.tab='today';roleLifeState.planEditor={item_id:'',title:'',purpose:'',start:'15:00',end:'16:00'}");
+  const todayHtml=h.run('renderRoleLife()');
+  assert.match(todayHtml,/roleLifeOpenPlanEditor/);
+  assert.match(todayHtml,/roleLifeDeletePlanItem/);
+  assert.match(todayHtml,/roleLifeTriggerActivity/);
+  assert.match(todayHtml,/保存安排/);
+  assert.match(todayHtml,/周末去公园看书/);
+  assert.equal((todayHtml.match(/class="btn primary"/g)||[]).length,1);
+  // 生活记录页支持编辑与删除按钮，且概览页不渲染编辑按钮
+  h.run("roleLifeState.tab='experiences';roleLifeState.subTab='diary';roleLifeState.records.diary={items:[{id:'d1',kind:'diary',text:'今天很安静',date:'2026-03-10'}],page:1,pages:1}");
+  const recHtml=h.run('renderRoleLife()');
+  assert.match(recHtml,/roleLifeOpenExpEditor/);
+  assert.match(recHtml,/roleLifeDeleteExperience/);
+});
+
+test('角色生活页入场与子标签切换保留根节点并触发动画', () => {
+  assert.match(css,/\.page-anim>\.role-life\{animation:glass-card-in \.58s \.04s/);
+  assert.match(css,/html\.liquid-glass \.page-anim>\.role-life\{animation:glass-card-in \.82s \.05s/);
+  assert.match(css,/@media\(prefers-reduced-motion:reduce\)\{\.page-anim>\.role-life[^}]*animation:none !important/);
+  for(const bounds of [['  function onMotion(','  const motionEvents='],['  function update(){','  function imageFailed(']])assert.match(section(...bounds),/\.plugin-panel,\.plugin-config-cards,\.role-life/);
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  h.run(`state.current='role-life';roleLifeState.records={activity:{items:[]},diary:{items:[]},dream:{items:[]},plans:{items:[]}};`);
+  const root={innerHTML:'',closest:()=>null,contains:()=>false,querySelectorAll:()=>[],querySelector:()=>null};
+  Object.defineProperty(root,'outerHTML',{set(){throw new Error('must not replace outerHTML');}});
+  h.nodes.set('section_role_life',root);
+  h.run('roleLifeRender()');
+  assert.ok(root.innerHTML.includes('role-life-bar'));
+  assert.ok(!root.innerHTML.startsWith('<section class="role-life"'));
+  const animated=[];
+  h.context.animateSubtab=p=>animated.push(p.id);
+  for(const id of ['life-panel-today','life-panel-experiences','life-record-panel','life-day-panel']){
+    const n=node();n.id=id;h.nodes.set(id,n);
+  }
+  h.run("roleLifeSetTab('today')");
+  h.run("roleLifeSetToday('plans')");
+  h.run("roleLifeSetSubTab('diary')");
+  h.run("roleLifeSetSubTab('dream')");
+  assert.deepEqual(animated,['life-panel-today','life-day-panel','life-panel-experiences','life-record-panel']);
+});
+
+test('roleLifeAction 遇 409 冲突时清除幂等键并自动刷新', async () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+  const calls=[];
+  let refreshed=0;
+  h.context.fetch=async(url,opt)=>{
+    calls.push({url,opt});
+    if(url.includes('/api/role-life/action')){
+      return {status:409,ok:false,json:async()=>({ok:false,error:'状态版本已变化'})};
+    }
+    refreshed++;
+    return {status:200,ok:true,json:async()=>({ok:true,data:roleLifeSample({status:Object.assign({},roleLifeSample().status,{state_version:9})})})};
+  };
+  h.context.toast=()=>{};
+  h.context.render=()=>{};
+  await h.run("roleLifeAction('enqueue',{kind:'plan'})");
+  assert.equal(calls.length>=2,true);
+  assert.ok(calls.some(c=>c.url.includes('/api/role-life/action')));
+  assert.equal(refreshed,1);
+  assert.equal(h.run("roleLifeState.requests['enqueue:plan']"),undefined);
+  assert.equal(h.run('roleLifeState.data.status.state_version'),9);
+});
+
+test('日程、记录与备注保存遇 400 或 409 失败时保留新编辑内容不丢失', async () => {
+  for(const code of [400,409]){
+    const h=roleLifeHarness();withRoleLife(h,roleLifeSample());
+    const inputs={lifePlanTitle:node('新标题-'+code),lifePlanStart:node('11:00'),lifePlanEnd:node('12:00'),
+      lifePlanPurpose:node('新说明'),lifeExpText:node('新经历正文-'+code),lifeNoteText:node('新备注内容-'+code)};
+    const origGet=h.context.document.getElementById;
+    h.context.document.getElementById=id=>inputs[id]||origGet(id);
+    h.context.toast=()=>{};h.context.render=()=>{};
+    h.context.fetch=async(url)=>{
+      if(url.includes('/api/role-life/action')){
+        return {status:code,ok:false,json:async()=>({ok:false,error:'模拟失败-'+code})};
+      }
+      return {status:200,ok:true,json:async()=>({ok:true,data:roleLifeSample()})};
+    };
+    h.run("roleLifeOpenPlanEditor('x-p1-2')");
+    await h.run('roleLifeSavePlanEditor()');
+    assert.equal(h.run('roleLifeState.planEditor.title'),'新标题-'+code);
+    assert.match(h.run('roleLifePlanEditorHtml()'),new RegExp('新标题-'+code));
+    h.run("roleLifeOpenExpEditor('exp-1','')");
+    await h.run('roleLifeSaveExpEditor()');
+    assert.equal(h.run('roleLifeState.expEditor.text'),'新经历正文-'+code);
+    assert.match(h.run('roleLifeExpEditorHtml()'),new RegExp('新经历正文-'+code));
+    h.run('roleLifeOpenNoteEditor()');
+    await h.run('roleLifeSaveNote()');
+    assert.equal(h.run('roleLifeState.noteEditor'),true);
+    assert.equal(h.run('roleLifeState.noteDraft'),'新备注内容-'+code);
+    assert.match(h.run('roleLifeNotesCard(true)'),new RegExp('新备注内容-'+code));
+  }
+});
+
+test('角色生活设置保存携带 expected_config_revision，遇 409 刷新后端配置并保留草稿', async () => {
+  const h=roleLifeHarness();withRoleLife(h,roleLifeSample({config:{sleep_hours:8,preference:''}}));
+  const posted=[];
+  h.context.fetch=async(url,opt)=>{
+    if(url.includes('/api/role-life/config')){
+      posted.push(JSON.parse(opt.body));
+      return {status:409,ok:false,json:async()=>({ok:false,error:'已被其他页面修改'})};
+    }
+    return {status:200,ok:true,json:async()=>({ok:true,data:roleLifeSample({config_revision:'rev-new',config:{sleep_hours:7,preference:''}})})};
+  };
+  h.context.toast=()=>{};h.context.render=()=>{};
+  h.run("roleLifeSetDraft('preference','喜欢晒太阳')");
+  await h.run('roleLifeSaveConfig()');
+  assert.equal(posted.length,1);
+  assert.equal(posted[0].expected_config_revision,'abc');
+  assert.deepEqual(posted[0].config,{preference:'喜欢晒太阳'});
+  assert.equal(h.run('roleLifeState.data.config.sleep_hours'),7);
+  assert.equal(h.run('roleLifeState.draft.preference'),'喜欢晒太阳');
+});
+
+test('角色生活页顶部说明功能作用，开启态展示速览指标、关闭态展示三步引导', () => {
+  const h=roleLifeHarness();
+  withRoleLife(h,roleLifeSample({config:{enabled:true,sleep_enabled:true,sleep_start:'00:30',sleep_hours:8}}));
+  const onHtml=h.run('renderRoleLife()');
+  assert.match(onHtml,/让机器人在后台按作息自己过日子/);
+  assert.doesNotMatch(onHtml,/life-intro-chips|全站唯一档案|不依赖 QQ 连接|关掉零消耗/);
+  assert.match(onHtml,/life-hero-stats/);
+  assert.match(onHtml,/已完成 1 \/ 2 项/);
+  const offSample=roleLifeSample({config:{enabled:false}});
+  offSample.status=Object.assign({},offSample.status,{enabled:false});
+  withRoleLife(h,offSample);
+  const offHtml=h.run('renderRoleLife()');
+  assert.match(offHtml,/life-guide-list/);
+  assert.match(offHtml,/1\. 自己过日子/);
+  assert.match(offHtml,/2\. 聊天更有活人感/);
+  assert.match(offHtml,/3\. 随时可控/);
+  h.run("roleLifeState.tab='settings'");
+  assert.match(h.run('renderRoleLife()'),/life-toggle-grid/);
 });
 
 (async()=>{

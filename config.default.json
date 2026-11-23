@@ -1,5 +1,5 @@
 {
-  "config_version": 7,
+  "config_version": 9,
   "_comment": "XcBot 主配置文件",
   "owner": [],
   "_comment_owner": "机器人拥有者 QQ 号列表，通常保留 1 个即可。",
@@ -30,7 +30,7 @@
   "_comment_protocol": "协议类型，固定 OneBot。Hyper 框架启动时硬索引此字段，改成其他值会启动失败。",
   "Others": {
     "project_name": "XcBot",
-    "version_name": "v4.0",
+    "version_name": "v4.1",
     "slogan": "✨ 忻城 ✨",
     "robot_name_triggers": [
       "忻城"
@@ -281,21 +281,27 @@
     "liquid_glass_refraction": 1,
     "card_background_blur": 3
   },
+  "RoleLife": {
+    "_comment": "角色生活：每个机器人账号与人格预设一份独立生活（日程、经历、睡眠、日记、梦），默认关闭。",
+    "roles": {},
+    "_comment_roles": "结构：{\"账号QQ\": {\"人格预设ID\": {启用与作息等设置}}}。在 WebUI「角色生活」页保存后生效。"
+  },
   "ProactiveReply": {
-    "_comment": "主动回复：AI 在群里或私聊里沉默一段时间后主动开口。完全由 AI 判断要不要发，桥接只做闸门（黑白名单/空闲阈值/概率/熔断）。两边主动回复都默认关闭。黑白名单都为空仅表示不限制对象，不会开启主动回复。主动发言后可由 AI 每次自行选择等待多久再判断，无人说话不催发，普通一问一答不等这些计时。",
+    "_comment": "主动回复：AI 在群里或私聊里沉默一段时间后主动开口。完全由 AI 判断要不要发，桥接只做闸门（黑白名单/空闲阈值/概率/熔断）。两边主动回复都默认关闭。黑白名单都为空仅表示不限制对象，不会开启主动回复。若启用了「角色生活」，AI 会结合当前空闲/心情/近期经历自然找话题（睡觉时段暂不主动打扰）。",
     "group": {
       "enabled": false,
-      "trigger_probability": 0.3,
-      "check_interval_seconds": 60,
-      "idle_threshold_seconds": 900,
+      "trigger_probability": 0.25,
+      "check_interval_seconds": 180,
+      "idle_threshold_seconds": 1800,
       "max_consecutive_bot_messages": 3,
-      "min_interval_between_proactive_seconds": 1800,
+      "min_interval_between_proactive_seconds": 3600,
+      "max_contacts_per_day": 0,
       "whitelist": [],
       "blacklist": [],
-      "_comment_observation": "普通回复或首次主动发言成功后，按 observation.trigger_probability（默认 0.5）决定是否开启观察；一轮观察只抽一次，与冷场概率独立。AI 自行选择等多久再判断；等待到期不代表必须发送，无人说话不催发，仍受原连发熔断限制。普通一问一答不等待这些计时。",
+      "_comment_observation": "普通回复或首次主动发言成功后，按 observation.trigger_probability（默认 0.35）决定是否开启观察；一轮观察只抽一次，与冷场概率独立。AI 自行选择等多久再判断；等待到期不代表必须发送，无人说话不催发，仍受原连发熔断限制。普通一问一答不等待这些计时。",
       "observation": {
         "enabled": true,
-        "trigger_probability": 0.5,
+        "trigger_probability": 0.35,
         "default_wait_seconds": 60,
         "min_wait_seconds": 10,
         "max_wait_seconds": 600,
@@ -306,17 +312,18 @@
     },
     "private": {
       "enabled": false,
-      "trigger_probability": 0.1,
-      "check_interval_seconds": 120,
-      "idle_threshold_seconds": 43200,
+      "trigger_probability": 0.2,
+      "check_interval_seconds": 180,
+      "idle_threshold_seconds": 7200,
       "max_unanswered_messages": 3,
-      "min_interval_between_proactive_seconds": 86400,
+      "min_interval_between_proactive_seconds": 10800,
+      "max_contacts_per_day": 0,
       "whitelist": [],
       "blacklist": [],
-      "_comment_observation": "普通回复或首次主动发言成功后，按 observation.trigger_probability（默认 0.5）决定是否开启观察；一轮观察只抽一次，与冷场概率独立。AI 自行选择等多久再判断；等待到期不代表必须发送，无人说话不催发，仍受原未回复熔断限制。普通一问一答不等待这些计时。",
+      "_comment_observation": "普通回复或首次主动发言成功后，按 observation.trigger_probability（默认 0.35）决定是否开启观察；私聊默认关闭。开启后一轮观察只抽一次，与冷场概率独立。AI 自行选择直接结束或等多久再判断；无人说话不催发，仍受原未回复熔断限制。普通一问一答不等待这些计时。",
       "observation": {
-        "enabled": true,
-        "trigger_probability": 0.5,
+        "enabled": false,
+        "trigger_probability": 0.35,
         "default_wait_seconds": 60,
         "min_wait_seconds": 10,
         "max_wait_seconds": 600,

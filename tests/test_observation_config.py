@@ -18,7 +18,7 @@ from bot import proactive_reply as proactive
 
 OBSERVATION_DEFAULTS = {
     "enabled": True,
-    "trigger_probability": 0.5,
+    "trigger_probability": 0.35,
     "default_wait_seconds": 60,
     "min_wait_seconds": 10,
     "max_wait_seconds": 600,
@@ -26,6 +26,10 @@ OBSERVATION_DEFAULTS = {
     "max_debounce_seconds": 20,
     "min_continuation_interval_seconds": 30,
 }
+
+
+def expected_obs(kind):
+    return {**OBSERVATION_DEFAULTS, "enabled": kind == "group"}
 OBSERVATION_BOUNDS = {
     "trigger_probability": (0, 1),
     "default_wait_seconds": (1, 3600),
@@ -73,12 +77,12 @@ class ObservationSchemaTests(unittest.TestCase):
                 self.assertFalse(template["ProactiveReply"][kind]["enabled"])
                 self.assertFalse(normalized[kind]["enabled"])
                 self.assertIs(fields[f"ProactiveReply.{kind}.enabled"]["default"], False)
-                self.assertEqual(template["ProactiveReply"][kind]["observation"], OBSERVATION_DEFAULTS)
-                self.assertEqual(normalized[kind]["observation"], OBSERVATION_DEFAULTS)
+                self.assertEqual(template["ProactiveReply"][kind]["observation"], expected_obs(kind))
+                self.assertEqual(normalized[kind]["observation"], expected_obs(kind))
                 prefix = f"ProactiveReply.{kind}.observation."
                 self.assertEqual({p.removeprefix(prefix) for p in fields if p.startswith(prefix)},
                                  set(OBSERVATION_DEFAULTS))
-                for name, default in OBSERVATION_DEFAULTS.items():
+                for name, default in expected_obs(kind).items():
                     spec = fields[prefix + name]
                     self.assertEqual(spec["category"], category)
                     self.assertEqual(spec["default"], default)
@@ -114,12 +118,13 @@ class ObservationSchemaTests(unittest.TestCase):
         cfg = proactive.normalize_config(raw)
         self.assertEqual(raw, before)
         self.assertEqual(cfg["group"]["observation"],
-                         {**OBSERVATION_DEFAULTS, "enabled": False, "debounce_seconds": 0})
+                         {**expected_obs("group"), "enabled": False, "debounce_seconds": 0})
         self.assertEqual(cfg["private"]["observation"],
-                         {**OBSERVATION_DEFAULTS, "default_wait_seconds": 90})
+                         {**expected_obs("private"), "default_wait_seconds": 90})
         cfg["group"]["observation"]["max_wait_seconds"] = 999
         self.assertEqual(cfg["private"]["observation"]["max_wait_seconds"], 600)
-        self.assertEqual(proactive.normalize_config({})["group"]["observation"], OBSERVATION_DEFAULTS)
+        self.assertEqual(proactive.normalize_config({})["group"]["observation"], expected_obs("group"))
+        self.assertEqual(proactive.normalize_config({})["private"]["observation"], expected_obs("private"))
 
     def test_real_normalizer_rejects_invalid_nested_types_ranges_and_relations(self):
         for kind in ("group", "private"):
@@ -133,7 +138,7 @@ class ObservationSchemaTests(unittest.TestCase):
             for kind in ("group", "private")})
         fields = schema_fields()
         for kind in ("group", "private"):
-            self.assertEqual(cfg[kind]["observation"], OBSERVATION_DEFAULTS)
+            self.assertEqual(cfg[kind]["observation"], expected_obs(kind))
             for name in ("window_seconds", "max_continuation_rounds"):
                 self.assertNotIn(f"ProactiveReply.{kind}.observation.{name}", fields)
 
@@ -207,7 +212,7 @@ class ObservationSaveTests(unittest.TestCase):
         saved = self.saved()
         self.assert_preserved(saved)
         for kind in ("group", "private"):
-            self.assertEqual(saved["ProactiveReply"][kind]["observation"], OBSERVATION_DEFAULTS)
+            self.assertEqual(saved["ProactiveReply"][kind]["observation"], expected_obs(kind))
         webui.save_config_bundle({"config_json": saved})
         self.assertEqual(self.saved(), saved)
 
@@ -218,7 +223,7 @@ class ObservationSaveTests(unittest.TestCase):
         saved = self.saved()
         self.assert_preserved(saved)
         for kind in ("group", "private"):
-            self.assertEqual(saved["ProactiveReply"][kind]["observation"], OBSERVATION_DEFAULTS)
+            self.assertEqual(saved["ProactiveReply"][kind]["observation"], expected_obs(kind))
         bundle = webui.collect_config_bundle()
         for path, value in values.items():
             self.assertEqual(webui.get_ui_value(bundle, path), value)
@@ -246,8 +251,8 @@ class ObservationSaveTests(unittest.TestCase):
         saved = self.saved()
         self.assertEqual(saved["ProactiveReply"]["group"]["observation"]["trigger_probability"], 0)
         self.assertEqual(saved["ProactiveReply"]["private"]["observation"]["trigger_probability"], 1)
-        self.assertEqual(saved["ProactiveReply"]["group"]["trigger_probability"], 0.3)
-        self.assertEqual(saved["ProactiveReply"]["private"]["trigger_probability"], 0.1)
+        self.assertEqual(saved["ProactiveReply"]["group"]["trigger_probability"], 0.25)
+        self.assertEqual(saved["ProactiveReply"]["private"]["trigger_probability"], 0.2)
 
     def test_schema_accepts_missing_fields_but_validates_four_level_values(self):
         webui._validate_proactive_config({})

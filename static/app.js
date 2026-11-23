@@ -15,11 +15,11 @@ function saveDraft(){try{if(state.bundle?.form_values)localStorage.setItem(DRAFT
 function clearDraft(){try{localStorage.removeItem(DRAFT_KEY)}catch(e){}}
 function sameDraftValues(a,b){try{return JSON.stringify(a)===JSON.stringify(b)}catch(e){return false}}
 function applyDraft(bundle){const draft=loadDraft();if(!draft||!bundle?.form_values)return;if(!draft.fingerprint||!bundle.config_fingerprint||draft.fingerprint!==bundle.config_fingerprint){clearDraft();return}if(sameDraftValues(draft.values||{},bundle.form_values||{})){clearDraft();state.dirty=false;state.lastInputAt=0;return}const changed=Object.keys(draft.values||{}).some(k=>JSON.stringify(draft.values[k])!==JSON.stringify(bundle.form_values[k]));if(!changed){clearDraft();state.dirty=false;state.lastInputAt=0;return}bundle.form_values=Object.assign({},bundle.form_values,draft.values||{});state.dirty=true;state.lastInputAt=Date.now();const save=el('saveState');if(save)save.textContent='有未保存草稿'}
-async function api(path,opt={}){opt.headers=Object.assign({'Content-Type':'application/json','X-WebUI-Token':token()},opt.headers||{});const r=await fetch(path,opt),j=await r.json().catch(()=>({ok:false,error:'请求失败'}));if(r.status===401){localStorage.removeItem('webuiToken');location.href='/auth/login';throw new Error('请先登录')}if(!j.ok)throw new Error(j.error||'请求失败');return j.data??j}
+async function api(path,opt={}){opt.headers=Object.assign({'Content-Type':'application/json','X-WebUI-Token':token()},opt.headers||{});const r=await fetch(path,opt),j=await r.json().catch(()=>({ok:false,error:'请求失败'}));if(r.status===401){localStorage.removeItem('webuiToken');location.href='/auth/login';const err=new Error('请先登录');err.status=401;throw err}if(!j.ok){const err=new Error(j.error||'请求失败');err.status=r.status;throw err}return j.data??j}
 function toast(msg,ok=true){const t=el('toast'),save=el('saveState');if(t){t.textContent=msg;t.className='toast show '+(ok?'ok':'bad');clearTimeout(t._timer);t._timer=setTimeout(()=>t.classList.remove('show'),2600)}if(save)save.textContent=msg}
 const NAV_GROUPS=[
   {key:'daily',title:'日常使用',pages:['welcome','stats']},
-  {key:'bot',title:'机器人与 AI',pages:['bot','providers','persona','ai','features','proactive','agent','knowledge','store']},
+  {key:'bot',title:'机器人与 AI',pages:['bot','providers','persona','role-life','ai','features','proactive','agent','knowledge','store']},
   {key:'system',title:'系统与运行',pages:['security','connection','webui','trace','logs']},
 ];
 const pages=()=>state.bundle?.ui_schema||[];
@@ -530,7 +530,7 @@ const liquidGlassLensController=(()=>{
   function onScroll(){movingUntil=performance.now()+220;schedule()}
   function onVisible(){if(document.visibilityState==='visible'){targetsDirty=true;schedule()}}
   function onMotion(event){
-    if(event.target instanceof Element&&event.target.matches(selector+',.page-anim,.chatroom,.subtab-panel,.subtab-enter,.plugin-root,.plugin-panel,.plugin-config-cards')){
+    if(event.target instanceof Element&&event.target.matches(selector+',.page-anim,.chatroom,.subtab-panel,.subtab-enter,.plugin-root,.plugin-panel,.plugin-config-cards,.role-life')){
       // 翻页动画持续 0.82s，延迟最长 0.61s，总共约 1.43s。
       // 动画期间必须持续更新玻璃位置，否则模糊区域会停留在初始位置。
       movingUntil=performance.now()+(event.type==='animationstart'?1500:220);
@@ -709,7 +709,7 @@ const liquidGlassLensController=(()=>{
     if(!enabled||status!=='ready'||!image)return;
     const started=performance.now();
     const wasTracking=animationTracking;
-    const running=!!document.getAnimations?.().some(a=>(a.playState==='running'||a.pending)&&a.effect?.target?.matches?.(selector+',.page-anim,.chatroom,.sidebar,.main,.app,.subtab-panel,.subtab-enter,.plugin-root,.plugin-panel,.plugin-config-cards'));
+    const running=!!document.getAnimations?.().some(a=>(a.playState==='running'||a.pending)&&a.effect?.target?.matches?.(selector+',.page-anim,.chatroom,.sidebar,.main,.app,.subtab-panel,.subtab-enter,.plugin-root,.plugin-panel,.plugin-config-cards,.role-life'));
     animationTracking=running||started<movingUntil;
     if(targetsDirty){
       // 抽屉态的侧栏不进 targets：三条渲染路径（GPU / SVG 克隆 / CSS）
@@ -1038,9 +1038,9 @@ function setMobileNav(open){
 }
 function toggleMobileNav(){setMobileNav(!document.body.classList.contains('nav-open'))}
 function closeMobileNav(){setMobileNav(false)}
-function gotoPage(k,section='',opts={}){closeMobileNav();if(state.dirty){const m=el('leaveModal');if(m){m.style.display='flex';m._pending={k,section};return}}if(state.bundle&&!isValidPage(k))k='welcome';if(!opts.discard)syncCurrentPageFieldsFromDom();if(k==='chatroom'){chatState._enterBottom=true}window.__pageSwitched=true;state._navigating=true;state.dirty=false;state.lastInputAt=0;clearDraft();updateRoute(k,section);render();const live=['welcome','logs','stats','debug','chatroom','store'].includes(k);/* 确认放弃改动时也要强制回读服务端，否则非 live 页面会继续显示未保存的编辑值 */Promise.resolve((live||opts.discard)?refreshAll(true):null).finally(()=>{state._navigating=false});if(k==='knowledge')loadKnowledge();if(k==='trace'&&!traceState.openId)traceLoad()}
+function gotoPage(k,section='',opts={}){closeMobileNav();if(state.dirty){const m=el('leaveModal');if(m){m.style.display='flex';m._pending={k,section};return}}if(state.bundle&&!isValidPage(k))k='welcome';if(!opts.discard)syncCurrentPageFieldsFromDom();if(k==='chatroom'){chatState._enterBottom=true}window.__pageSwitched=true;state._navigating=true;state.dirty=false;state.lastInputAt=0;clearDraft();updateRoute(k,section);render();const live=['welcome','logs','stats','debug','chatroom','store'].includes(k);/* 确认放弃改动时也要强制回读服务端，否则非 live 页面会继续显示未保存的编辑值 */Promise.resolve((live||opts.discard)?refreshAll(true):null).finally(()=>{state._navigating=false});if(k==='knowledge')loadKnowledge();if(k==='role-life')loadRoleLife();if(k==='trace'&&!traceState.openId)traceLoad()}
 function leaveCancel(){const m=el('leaveModal');if(m){m.style.display='none';m._pending=null}}
-function leaveConfirm(){const m=el('leaveModal');if(!m)return;const p=m._pending;m.style.display='none';m._pending=null;state.dirty=false;traceDiscardPending();/* 确认离开=丢弃未保存改动：不同步 DOM，并强制从服务端重载 */if(p)gotoPage(p.k||p.page,p.section||'',{discard:true})}
+function leaveConfirm(){const m=el('leaveModal');if(!m)return;const p=m._pending;m.style.display='none';m._pending=null;state.dirty=false;if(typeof roleLifeState!=='undefined'&&roleLifeState&&roleLifeState.draft){roleLifeState.draft=null;roleLifeState.message='';roleLifeState.messageKind=''}traceDiscardPending();/* 确认离开=丢弃未保存改动：不同步 DOM，并强制从服务端重载 */if(p)gotoPage(p.k||p.page,p.section||'',{discard:true})}
 function renderNav(){
   const nav=el('nav');if(!nav)return;
   const groups=navigationGroups(),signature=JSON.stringify(groups.map(g=>[g.key,navGroupCollapsed(g.key),g.items.map(p=>[p.key,p.title,p.icon])]));
@@ -1064,7 +1064,7 @@ function render(){if(!state.bundle)return;snapshotPluginConfigOpen();applyWebuiA
   const animating=contentEl.classList.contains('page-anim');
   // 真正切页：整页替换并只播一次动画
   if(playAnim){
-    contentEl.innerHTML=isChat?renderChatroom():isDebug?renderDebug():state.current==='welcome'?renderWelcome():state.current==='stats'?renderStats():state.current==='providers'?renderProviders():state.current==='knowledge'?renderKnowledge():state.current==='persona'?renderPersona():state.current==='features'?renderFeatures():state.current==='agent'?renderAgent():state.current==='logs'?renderLogs():state.current==='store'?renderStore():state.current==='trace'?renderTrace():renderForm(m);
+    contentEl.innerHTML=isChat?renderChatroom():isDebug?renderDebug():state.current==='welcome'?renderWelcome():state.current==='stats'?renderStats():state.current==='providers'?renderProviders():state.current==='knowledge'?renderKnowledge():state.current==='persona'?renderPersona():state.current==='role-life'?renderRoleLife():state.current==='features'?renderFeatures():state.current==='agent'?renderAgent():state.current==='logs'?renderLogs():state.current==='store'?renderStore():state.current==='trace'?renderTrace():renderForm(m);
     contentEl.dataset.currentPage=state.current;
     contentEl.classList.remove('page-anim');
     void contentEl.offsetWidth;
@@ -1083,6 +1083,8 @@ function render(){if(!state.bundle)return;snapshotPluginConfigOpen();applyWebuiA
          if(state.bundle)render();
        },1550);
      }
+  }else if(state.current==='role-life'&&contentEl.dataset.currentPage==='role-life'){
+    // 生活页只由自己的数据请求与操作更新，避免全局5秒刷新打断输入/展开/滚动。
   }else if(state.current==='logs'){
     const pre=el('log_full');
     if(pre){
@@ -1117,7 +1119,7 @@ function render(){if(!state.bundle)return;snapshotPluginConfigOpen();applyWebuiA
     const focusId=isInput?focused.id:null;
     const selStart=isInput?focused.selectionStart:null;
     const selEnd=isInput?focused.selectionEnd:null;
-    contentEl.innerHTML=isChat?renderChatroom():isDebug?renderDebug():state.current==='welcome'?renderWelcome():state.current==='stats'?renderStats():state.current==='providers'?renderProviders():state.current==='knowledge'?renderKnowledge():state.current==='persona'?renderPersona():state.current==='features'?renderFeatures():state.current==='agent'?renderAgent():state.current==='logs'?renderLogs():state.current==='store'?renderStore():state.current==='trace'?renderTrace():renderForm(m);
+    contentEl.innerHTML=isChat?renderChatroom():isDebug?renderDebug():state.current==='welcome'?renderWelcome():state.current==='stats'?renderStats():state.current==='providers'?renderProviders():state.current==='knowledge'?renderKnowledge():state.current==='persona'?renderPersona():state.current==='role-life'?renderRoleLife():state.current==='features'?renderFeatures():state.current==='agent'?renderAgent():state.current==='logs'?renderLogs():state.current==='store'?renderStore():state.current==='trace'?renderTrace():renderForm(m);
     contentEl.dataset.currentPage=state.current;
     if(focusId){
       const newFocused=document.getElementById(focusId);
@@ -1127,7 +1129,7 @@ function render(){if(!state.bundle)return;snapshotPluginConfigOpen();applyWebuiA
       }
     }
   }
-}if(isChat)afterChatroomRender();if(state.section)requestAnimationFrame(()=>scrollToRouteSection(state.section));if(state.current==='welcome'||state.current==='logs'){if(isSwitch)requestAnimationFrame(()=>{document.querySelectorAll('pre.log').forEach(x=>{x.scrollTop=x.scrollHeight})});else scheduleLogScrollAfterRender(logScroll)}}
+}if(isChat)afterChatroomRender();if(state.current==='role-life'&&!roleLifeState.data&&!roleLifeState.loading&&!roleLifeState.error)requestAnimationFrame(()=>loadRoleLife());if(state.section)requestAnimationFrame(()=>scrollToRouteSection(state.section));if(state.current==='welcome'||state.current==='logs'){if(isSwitch)requestAnimationFrame(()=>{document.querySelectorAll('pre.log').forEach(x=>{x.scrollTop=x.scrollHeight})});else scheduleLogScrollAfterRender(logScroll)}}
 function renderWelcome(){const s=state.bundle.status||{},u=s.update||{},ui=s.update_install||{},cs=s.connection_status||{},cc=s.connection||{},ru=s.resource_usage||{},updateBusy=['downloading','extracting','installing','migrating','dependencies','restarting'].includes(ui.state),updatePillClass=u.status==='latest'?'ok':(u.status==='outdated'||u.status==='error'||ui.state==='error')?'bad':'';return `<div class="card"><div class="section-head"><div><h3>运行概览</h3></div><span class="pill ${cs.state==='connected'?'ok':(cs.state==='failed'||cs.state==='disconnected'||cs.state==='stopped')?'bad':''}">${esc(cs.text||'未知状态')}</span></div><div class="mini-stats"><div class="stat"><b>${esc(s.uptime_text||Math.floor((s.uptime_seconds||0)/60)+'分钟')}</b><span>运行时间</span></div><div class="stat"><b>${esc((ru.cpu_percent_normalized??ru.cpu_percent??0)+'% / '+(ru.memory_mb??0)+' MB')}</b><span>CPU/内存占用</span></div><div class="field" style="grid-column:span 2;min-height:auto;display:flex;flex-direction:column;justify-content:center"><div class="label" style="margin-bottom:6px"><span>获取更新</span><span class="pill ${updatePillClass}">${esc(ui.state&&ui.state!=='idle'?ui.text:(u.message||'暂未检查更新'))}</span></div><div class="desc" style="margin-top:0">当前 ${esc(s.version||'--')} / 最新 ${esc(u.latest_version||'--')}</div><div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px"><button class="btn" ${updateBusy?'disabled':''} onclick="checkUpdate()">检查更新</button><button class="btn primary" ${(updateBusy||!u.has_update)?'disabled':''} onclick="installUpdate()">安装更新</button></div><div class="desc">${esc(ui.detail||u.detail||u.release_name||'安装更新会自动下载、覆盖程序、迁移配置并重启。安装后需手动刷新页面。')}</div></div></div></div><div class="card half"><div class="section-head"><div><h3>详细信息</h3><p>环境与启动参数</p></div></div><div class="kv">${[['版本号',(s.project||'')+' '+(s.version||'')],['机器人名',s.bot_name],['运行目录',s.cwd],['Python',s.python],['平台',s.platform],['启动参数',JSON.stringify(s.argv||[])]].map(r=>`<div>${esc(r[0])}</div><div>${esc(r[1])}</div>`).join('')}</div></div><div class="card half"><div class="section-head"><div><h3>连接状态</h3><p>OneBot / Hyper 实时状态</p></div></div><div class="kv">${[['当前状态',cs.text||'未知状态'],['状态详情',cs.detail||'暂无'],['连接地址',(cc.host&&cc.port)?`${cc.host}:${cc.port}`:''],['监听地址',(cc.listener_host&&cc.listener_port)?`${cc.listener_host}:${cc.listener_port}`:''],['连接模式',cc.mode||'']].map(r=>`<div>${esc(r[0])}</div><div>${esc(r[1])}</div>`).join('')}</div></div><div class="card"><div class="section-head"><div><h3>最近日志</h3></div><div style="display:flex;gap:8px;flex-wrap:wrap">${renderAutoScrollToggle()}<button class="btn" onclick="gotoPage('logs')">查看全部</button></div></div>${renderLogPre(160,'recent')}</div>`}
 function chartBars(items,max=0,unit='',color='linear-gradient(135deg,var(--accent),var(--accent2))'){const arr=Array.isArray(items)?items:[];const peak=max||Math.max(1,...arr.map(x=>Number(x.value)||0));return `<div style="display:grid;gap:10px">${arr.length?arr.map(x=>`<div><div style="display:flex;justify-content:space-between;gap:12px;margin-bottom:6px"><span style="font-weight:800">${esc(x.label||x.model||x.session||'-')}</span><span class="pill">${esc((x.value??x.tokens??0)+unit)}</span></div><div style="height:12px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden"><div style="height:100%;width:${Math.max(4,Math.round(((Number(x.value??x.tokens)||0)/peak)*100))}%;background:${color};border-radius:999px"></div></div></div>`).join(''):`<div class="desc">暂无数据</div>`}</div>`}
 function chartLine(items,unit=''){const arr=Array.isArray(items)?items:[];if(!arr.length)return '<div class="desc">暂无数据</div>';const values=arr.map(x=>Number(x.value)||0),peak=Math.max(1,...values),width=640,height=170,padX=16,padTop=16,padBottom=28,innerW=width-padX*2,innerH=height-padTop-padBottom;const points=arr.map((x,i)=>{const px=padX+(arr.length===1?innerW/2:(i/(arr.length-1))*innerW);const py=padTop+innerH-(Math.min(Number(x.value)||0,peak)/peak)*innerH;return {x:px,y:py,label:String(x.label||''),value:Number(x.value)||0}});const line=points.map((p,i)=>`${i?'L':'M'}${p.x.toFixed(2)} ${p.y.toFixed(2)}`).join(' ');const area=`M${points[0].x.toFixed(2)} ${height-padBottom} `+points.map((p,i)=>`${i?'L':'M'}${p.x.toFixed(2)} ${p.y.toFixed(2)}`).join(' ')+` L${points[points.length-1].x.toFixed(2)} ${height-padBottom} Z`;const guides=[0,.25,.5,.75,1].map(r=>{const y=(padTop+innerH-(innerH*r)).toFixed(2);return `<line x1="${padX}" y1="${y}" x2="${width-padX}" y2="${y}" stroke="rgba(255,255,255,.08)" stroke-width="1"/>`}).join('');const markers=points.map(p=>`<circle cx="${p.x.toFixed(2)}" cy="${p.y.toFixed(2)}" r="3.5" fill="var(--accent)" stroke="rgba(255,255,255,.9)" stroke-width="1.2"><title>${esc(p.label)}：${esc(p.value+unit)}</title></circle>`).join('');const labels=points.filter((_,i)=>arr.length<=8||i===0||i===arr.length-1||i%Math.ceil(arr.length/6)===0).map(p=>`<div style="font-size:11px;color:var(--muted);min-width:0;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.label)}</div>`).join('');return `<div style="display:grid;gap:10px"><div style="border:1px solid var(--line2);border-radius:18px;padding:12px;background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.025))"><svg viewBox="0 0 ${width} ${height}" width="100%" height="170" preserveAspectRatio="none" role="img" aria-label="趋势图">${guides}<path d="${area}" fill="rgba(56,213,255,.12)"></path><path d="${line}" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></path>${markers}</svg><div style="display:grid;grid-template-columns:repeat(${Math.max(2,Math.min(points.filter((_,i)=>arr.length<=8||i===0||i===arr.length-1||i%Math.ceil(arr.length/6)===0).length,6))},minmax(0,1fr));gap:8px;margin-top:8px">${labels}</div></div><div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">${[arr[0],arr[arr.length-1],arr.reduce((a,b)=>Number(a.value)>=Number(b.value)?a:b)].map((x,i)=>`<span class="pill">${esc((i===0?'起点':i===1?'终点':'峰值')+'：'+(x.label||'-')+' '+(x.value||0)+unit)}</span>`).join('')}</div></div>`}
@@ -1146,7 +1148,7 @@ function renderDebug(){
   if(!hasBot){html+=`<div class="card"><div class="desc">⚠️ 未检测到运行中的 Bot 主进程（或 WebUI 以独立模式启动）。以下仅显示 WebUI 自身可见的数据，启动 Bot 后将展示功能开关、API/Key、插件、权限、上下文等完整运行时统计。</div>${d.runtime_error?`<pre class="log" style="margin-top:12px">${esc(d.runtime_error)}</pre>`:''}</div>`}
   const rows=[['PID',proc.pid??state.bundle.status?.pid],['进程状态',proc.status],['进程创建',fmtTs(proc.create_time)],['进程CPU(整机)',`${normCpu}%`],['进程CPU(单核)',`${procCpu}%`],['系统总CPU',`${sysCpu}%`],['CPU逻辑核心',ru.cpu_count??'--'],['RSS 内存',`${ru.rss_mb??ru.memory_mb??0} MB`],['虚拟内存',`${ru.vms_mb??0} MB`],['线程数',ru.threads??'--'],['打开文件',ru.open_files??'--'],['网络连接',ru.connections??'--'],['句柄数',proc.num_handles??'--'],['日志缓冲',web.log_buffer??0],['GC 对象',gc.tracked_objects??'--'],['GC 计数',(gc.counts||[]).join(' / ')],['GC 阈值',(gc.thresholds||[]).join(' / ')]];
   html+=`<div class="card half"><div class="section-head"><div><h3>运行快照</h3><p>${esc(fmtTs(d.generated_at))}</p></div></div>${dbgKV(rows)}</div>`;
-  const sysRows=[['系统内存',sys.memory_used_mb!=null?`${sys.memory_used_mb} / ${sys.memory_total_mb} MB (${sys.memory_percent}%)`:undefined],['可用内存',sys.memory_available_mb!=null?`${sys.memory_available_mb} MB`:undefined],['磁盘',sys.disk_used_gb!=null?`${sys.disk_used_gb} / ${sys.disk_total_gb} GB (${sys.disk_percent}%)`:undefined],['磁盘剩余',sys.disk_free_gb!=null?`${sys.disk_free_gb} GB`:undefined],['系统启动',fmtTs(sys.boot_time)],['WebUI 监听',web.host&&web.port?`${web.host}:${web.port}`:undefined],['访问 Token',web.has_access_token!=null?(web.has_access_token?'已设置':'未设置'):undefined],['更新缓存',web.update_cache!=null?(web.update_cache?`有 (约 ${web.update_cache_age_seconds??'?'}s)`:'无'):undefined],['更新安装状态',ui.state||'idle'],['更新详情',ui.text||ui.detail||'']];
+  const sysRows=[['系统内存',sys.memory_used_mb!=null?`${sys.memory_used_mb} / ${sys.memory_total_mb} MB (${sys.memory_percent}%)`:undefined],['可用内存',sys.memory_available_mb!=null?`${sys.memory_available_mb} MB`:undefined],['磁盘',sys.disk_used_gb!=null?`${sys.disk_used_gb} / ${sys.disk_total_gb} GB (${sys.disk_percent}%)`:undefined],['磁盘剩余',sys.disk_free_gb!=null?`${sys.disk_free_gb} GB`:undefined],['系统启动',fmtTs(sys.boot_time)],['WebUI 监听',web.host&&web.port?`${web.host}:${web.port}`:undefined],['访问 Token',web.has_access_token!=null?(web.has_access_token?'已设置':'未设置'):undefined],['更新缓存',web.update_cache!=null?(web.update_cache?`有 (约 ${web.update_cache_age_seconds??'?'}s)`:'无'):undefined],['更新安装状态',ui.state||'idle'],['更新详情',ui.detail||ui.text||'']];
   html+=`<div class="card half"><div class="section-head"><div><h3>系统 / WebUI</h3><p>主机与服务侧信息</p></div></div>${dbgKV(sysRows)}</div>`;
   const pathRows=[['运行目录',paths.base_dir||state.bundle.status?.cwd],['config.json',paths.config_exists!=null?`${paths.config_exists?'存在':'缺失'} (${paths.config_size_kb??0} KB)`:undefined],['temps',paths.temps?`${paths.temps.files} 文件 / ${paths.temps.size_mb} MB${paths.temps.truncated?' (截断)':''}`:undefined],['data',paths.data?`${paths.data.files} 文件 / ${paths.data.size_mb} MB${paths.data.truncated?' (截断)':''}`:undefined],['plugins',paths.plugins?`${paths.plugins.files} 文件 / ${paths.plugins.size_mb} MB`:undefined],['WebUI 聊天室',rt.webui_chat?`${rt.webui_chat.sessions} 会话 / ${rt.webui_chat.size_mb} MB`:undefined]];
   html+=`<div class="card half"><div class="section-head"><div><h3>目录体量</h3><p>定位磁盘膨胀</p></div></div>${dbgKV(pathRows)}</div>`;
@@ -1658,7 +1660,19 @@ function setPersonaActive(path,id){setValue(path,id);if(path==='Others.active_pe
 // 只写预设列表本身，不动「默认人格」。改内容 / 重命名 / 切换编辑目标都不应该
 // 顺手改变哪个预设在生效——那正是之前点左侧列表会偷偷换掉默认人格的原因。
 function setPersonaPresets(presets){setValue('Others.personality_presets',presets);const active=state.bundle.form_values['Others.active_personality_preset'];const cur=presets.find(x=>x.id===active);if(cur)setValue('Others.personality_prompt',cur.prompt||'')}
-function addPersonaPreset(){const presets=[...(state.bundle.form_values['Others.personality_presets']||[])],id='preset'+(presets.length+1);presets.push({id,name:'预设 '+(presets.length+1),prompt:''});state.personaEditId=id;setPersonaPresets(presets);forceRender()}
+// 新预设 ID 不能按“当前数量+1”生成：删掉中间某个预设后再新增，会复用
+// 刚被删除的 id，等于把旧角色的生活直接转交给新的人设。这里用随机标识，
+// 只保证在现有列表内唯一；已有合法 id 永远不改。
+function personaNewId(presets){
+  const used=new Set((presets||[]).map(p=>String(p&&p.id||'')));
+  let seed='';
+  try{seed=String((globalThis.crypto&&globalThis.crypto.randomUUID)?globalThis.crypto.randomUUID():'')}catch(e){seed=''}
+  if(!seed)seed=Date.now().toString(36)+Math.random().toString(36).slice(2,10);
+  let id='preset_'+seed.replace(/[^A-Za-z0-9]/g,'').slice(0,24);
+  let n=2;while(used.has(id)){id='preset_'+seed.replace(/[^A-Za-z0-9]/g,'').slice(0,20)+'_'+n;n++}
+  return id
+}
+function addPersonaPreset(){const presets=[...(state.bundle.form_values['Others.personality_presets']||[])],id=personaNewId(presets);presets.push({id,name:'预设 '+(presets.length+1),prompt:''});state.personaEditId=id;setPersonaPresets(presets);forceRender()}
 function selectPersonaPreset(id){state.personaEditId=id;forceRender()}
 function updatePersonaPrompt(id,prompt){const presets=[...(state.bundle.form_values['Others.personality_presets']||[])].map(p=>p.id===id?Object.assign({},p,{prompt}):p);setPersonaPresets(presets)}
 function renamePersonaPreset(id){const presets=[...(state.bundle.form_values['Others.personality_presets']||[])];const p=presets.find(x=>x.id===id);if(!p)return;const name=prompt('预设名称',p.name||p.id);if(name==null)return;p.name=name.trim()||p.id;state.personaEditId=id;setPersonaPresets(presets);forceRender()}
@@ -1678,7 +1692,7 @@ function renderAiSettings(m){
   const enabled=split.find(f=>f.path==='Others.llm_split.enabled')||{path:'Others.llm_split.enabled',label:'启用 LLM 分段回复',type:'bool',desc:'仅对大模型生成结果生效。'};
   const options=split.filter(f=>f!==enabled);
   const quote=!!state.bundle.feature_switches?.split_reply_quote;
-  return `<div class="card ai-settings-card" id="section_ai"><div class="section-head"><div><h3>对话设置</h3><p>配置回复过滤与分段回复。</p></div></div><div class="form-grid compact-form ai-conversation-fields">${conversation.map(f=>renderField(f,values[f.path],true)).join('')}<div class="field ai-split-toggles" id="section_ai_split">${renderField(enabled,values[enabled.path],true,true)}<div class="setting-row"><div class="label"><span>分段首段引用</span><div class="switch ${quote?'on':''}" onclick="toggleFeature('split_reply_quote',this)"></div></div><div class="desc">分段发送时仅首段引用原消息；与 LLM 分段开关独立。</div></div></div>${options.map(f=>renderField(f,values[f.path],true)).join('')}</div></div><div class="card ai-settings-card" id="section_ai_memory"><div class="section-head"><div><h3>上下文与记忆</h3><p>按完整对话轮次管理上下文；压缩复用对话模型及其轮换，不需要独立模型。</p></div></div><div class="form-grid compact-form ai-conversation-fields">${memory.map(f=>renderField(f,values[f.path],true)).join('')}</div></div>`;
+  return `<div class="card ai-settings-card" id="section_ai"><div class="section-head"><div><h3>对话设置</h3><p>配置回复过滤与分段回复。</p></div></div><div class="form-grid compact-form ai-conversation-fields">${conversation.map(f=>renderField(f,values[f.path],true)).join('')}<div class="field setting-row"><div class="label"><span>回复时引用</span><div class="switch ${quote?'on':''}" onclick="toggleFeature('split_reply_quote',this)"></div></div><div class="desc">普通 AI 回复自动引用触发消息，多段仅首段引用；主动发言仍可自主选择引用。</div></div><div class="field ai-split-toggles" id="section_ai_split">${renderField(enabled,values[enabled.path],true,true)}</div>${options.map(f=>renderField(f,values[f.path],true)).join('')}</div></div><div class="card ai-settings-card" id="section_ai_memory"><div class="section-head"><div><h3>上下文与记忆</h3><p>按完整对话轮次管理上下文；压缩复用对话模型及其轮换，不需要独立模型。</p></div></div><div class="form-grid compact-form ai-conversation-fields">${memory.map(f=>renderField(f,values[f.path],true)).join('')}</div></div>`;
 }
 function renderForm(m){if(m.key==='ai')return renderAiSettings(m);if(m.key==='proactive'||m.key==='webui')return renderOrganizedSettings(m);const v=state.bundle.form_values||{};const fields=m.fields||[];const byCat={},order=[];fields.forEach(f=>{const cat=f.category||'基础';if(!byCat[cat]){byCat[cat]=[];order.push(cat)}byCat[cat].push(f)});if(order.length<=1){return `<div class="card" id="section_${esc(m.key||'config')}"><div class="section-head"><div><h3>${esc(m.title)}</h3><p>${esc(m.desc)}</p></div></div><div class="form-grid">${fields.map(f=>renderField(f,v[f.path])).join('')}</div></div>`}return order.map((cat,i)=>{const sid=i===0?(m.key||'config'):('cfg_'+cat).replace(/[^a-zA-Z0-9_-]/g,'_');return `<div class="card" id="section_${esc(sid)}"><div class="section-head"><div><h3>${esc(i===0?m.title:cat)}</h3><p>${esc(i===0?m.desc:cat+'相关设置')}</p></div></div><div class="form-grid">${byCat[cat].map(f=>renderField(f,v[f.path])).join('')}</div></div>`}).join('')}
 function settingsTabs(key){
@@ -1703,12 +1717,15 @@ function renderSettingsTab(key,tab){
   const fields=settingsTabFields(key,tab),values=state.bundle.form_values||{};
   if(key==='proactive'){
     const prefix=`ProactiveReply.${tab}.`,enabled=!!values[prefix+'enabled'];
+    const obsAll=fields.filter(f=>f.path.includes('.observation.'));
+    const obsMain=obsAll.filter(f=>/\.(enabled|trigger_probability)$/.test(f.path));
+    const obsAdv=obsAll.filter(f=>!obsMain.includes(f));
     const groups=[
-      {title:'启用与频率',desc:'先开启此场景，再调整冷场主动说话的时机。',fields:fields.filter(f=>!f.path.includes('.observation.')&&!/\.(whitelist|blacklist)$/.test(f.path))},
-      {title:'允许与禁止对象',desc:'名单均空仅表示不限对象；黑名单优先，全局禁止规则仍然生效。',fields:fields.filter(f=>/\.(whitelist|blacklist)$/.test(f.path))},
-      {title:'发言后继续观察',desc:'AI 自己决定每次等多久；正常提问照常回应，不受这里的等待计时影响。',fields:fields.filter(f=>f.path.includes('.observation.'))},
+      {title:'启用与频率',desc:'开启当前场景后，可按需要调整冷场搭话时机。',fields:fields.filter(f=>!f.path.includes('.observation.')&&!/\.(whitelist|blacklist)$/.test(f.path))},
+      {title:'允许与禁止对象',desc:'名单都留空则不限对象；黑名单优先。',fields:fields.filter(f=>/\.(whitelist|blacklist)$/.test(f.path))},
+      {title:'发言后继续观察',desc:'发言后短时间留意对方是否接着聊，不需要会直接结束；不影响正常回复。',fields:obsMain,extra:obsAdv},
     ];
-    return `<div class="settings-status"><span class="pill ${enabled?'ok':''}">${tab==='group'?'群聊':'私聊'}主动回复 · ${enabled?'已开启':'未开启'}</span><span class="desc">判断模型决定是否发言，对话模型生成正文。<button class="inline-link" onclick="gotoPage('providers')">配置模型</button></span></div>`+groups.map(g=>`<section class="settings-block"><div class="section-head"><div><h3>${g.title}</h3><p>${g.desc}</p></div></div><div class="form-grid">${g.fields.map(f=>renderField(f,values[f.path])).join('')}</div></section>`).join('');
+    return `<div class="settings-status"><span class="pill ${enabled?'ok':''}">${tab==='group'?'群聊':'私聊'}主动回复 · ${enabled?'已开启':'未开启'}</span><span class="desc">判断模型决定是否发言，对话模型生成正文。<button class="inline-link" onclick="gotoPage('providers')">配置模型</button></span></div>`+groups.map(g=>`<section class="settings-block"><div class="section-head"><div><h3>${g.title}</h3><p>${g.desc}</p></div></div><div class="form-grid">${g.fields.map(f=>renderField(f,values[f.path])).join('')}</div>${g.extra?.length?`<details class="proactive-obs-advanced"><summary>高级等待与合并秒数（通常无需调整）</summary><div class="form-grid">${g.extra.map(f=>renderField(f,values[f.path])).join('')}</div></details>`:''}</section>`).join('');
   }
   if(key==='webui'&&tab==='appearance'){
     const glassFields=fields.filter(f=>['WebUI.liquid_glass','WebUI.disable_background_blur','WebUI.liquid_glass_refraction','WebUI.card_background_blur'].includes(f.path));
@@ -1894,6 +1911,11 @@ function updateEndpoint(index,key,value){const arr=Array.isArray(state.bundle.fo
 function addEndpoint(){const arr=Array.isArray(state.bundle.form_values['Others.llm_endpoints'])?[...state.bundle.form_values['Others.llm_endpoints']]:[];arr.push({base_url:'',model:'',keys:[],supports_multimodal:false});setValue('Others.llm_endpoints',arr);forceRender()}
 function removeEndpoint(index){const arr=Array.isArray(state.bundle.form_values['Others.llm_endpoints'])?[...state.bundle.form_values['Others.llm_endpoints']]:[];arr.splice(index,1);setValue('Others.llm_endpoints',arr);forceRender()}
 async function saveAll(silent=false){
+  if(state.current==='role-life'&&typeof roleLifeSaveConfig==='function'){
+    if(!roleLifeHasDraft()){if(!silent)toast('设置已同步',true);return}
+    await roleLifeSaveConfig();
+    return;
+  }
   if(!state.bundle||state.saving)return;
   state.saving=true;
   const save=el('saveState');if(save)save.textContent='正在保存...';
@@ -2140,7 +2162,607 @@ async function storeUninstall(name){const btn=el('storeBtn_'+name);if(btn){btn.d
 async function storeReload(name){const btn=el('storeReload_'+name);if(btn){btn.disabled=true;btn.textContent='重载中…'}try{const r=await api('/api/plugins/reload',{method:'POST',body:JSON.stringify({name})});toast(r.message||'重载成功')}catch(e){toast(e.message,false)}finally{if(btn){btn.disabled=false;btn.textContent='重载'}}}
 function storeSubmit(){const name=(el('submitName')||{}).value?.trim();const author=(el('submitAuthor')||{}).value?.trim();const desc=(el('submitDesc')||{}).value?.trim();if(!name||!author||!desc){toast('请填写插件名、作者和描述',false);return}const body=`## 插件提交\n\n**插件名**：${name}\n**作者**：${author}\n\n**功能描述**：\n${desc}\n\n**插件压缩包**：（请将 zip 文件拖拽到下方评论框上传）`;const params=new URLSearchParams({title:`[插件提交] ${name}`,body,labels:'plugin-submission'});window.open(`https://github.com/Qzy327422/XcBot-Plugins/issues/new?${params}`,'_blank')}
 async function storeUploadFile(input){const file=input.files[0];if(!file)return;if(file.size>12*1024*1024){toast('插件包过大（上限 12MB）',false);input.value='';return}const name=file.name.replace(/\.zip$/i,'');const buf=await file.arrayBuffer();const bytes=new Uint8Array(buf);let bin='';const chunk=0x8000;for(let i=0;i<bytes.length;i+=chunk){bin+=String.fromCharCode.apply(null,bytes.subarray(i,i+chunk))}const b64=btoa(bin);input.value='';try{const r=await api('/api/plugins/upload',{method:'POST',body:JSON.stringify({name,zip_b64:b64})});toast(r.message||'安装成功');await loadStore()}catch(e){toast(e.message,false)}}
-setTheme(localStorage.webuiTheme||'light');window.addEventListener('hashchange',()=>{if(state._navigating)return;if(state.dirty){const m=el('leaveModal');if(m){m.style.display='flex';const r=splitHashRoute();m._pending={k:normalizeRoutePage(r.page),section:r.section||''};history.replaceState(null,'',routeForPage(state.current,state.section));return}}applyRoute();render()});window.addEventListener('beforeunload',e=>{if(state.dirty){e.preventDefault();e.returnValue=''}});applyRoute();if(state.current==='chatroom')chatState._enterBottom=true;if(!location.hash)updateRoute(state.current,'',true);applyCachedAppearance();refreshAll(true).then(checkAuthState);setInterval(()=>refreshAll(false),5000);setInterval(()=>{if(state.current==='trace'&&!traceState.openId&&!traceState.loading&&!traceTogglePending())traceLoad(true)},5000);setInterval(()=>{if(state.current==='welcome'||state.current==='logs')scrollLogsToBottom()},500);
+setTheme(localStorage.webuiTheme||'light');window.addEventListener('hashchange',()=>{if(state._navigating)return;if(state.dirty){const m=el('leaveModal');if(m){m.style.display='flex';const r=splitHashRoute();m._pending={k:normalizeRoutePage(r.page),section:r.section||''};history.replaceState(null,'',routeForPage(state.current,state.section));return}}applyRoute();render()});window.addEventListener('beforeunload',e=>{if(state.dirty||(state.current==='role-life'&&(roleLifeHasDraft()||roleLifeState.saving))){e.preventDefault();e.returnValue=''}});applyRoute();if(state.current==='chatroom')chatState._enterBottom=true;if(!location.hash)updateRoute(state.current,'',true);applyCachedAppearance();refreshAll(true).then(checkAuthState);setInterval(()=>refreshAll(false),5000);setInterval(()=>{if(state.current==='trace'&&!traceState.openId&&!traceState.loading&&!traceTogglePending())traceLoad(true)},5000);setInterval(()=>{if(state.current==='welcome'||state.current==='logs')scrollLogsToBottom()},500);
+
+// ==================== 角色生活 ====================
+// 设计约束（§2.1/§2.8/§3.6）：当前生活 > 日程与经历 > 用量与任务；每个视图仅一个主操作。
+// 沿用主题 text/muted/accent/glass/line/radius；局部间距 8/12/16/24、字号 12/14/18/24。
+// 先分层与留白，再用主题色提示状态；模型文本只经 esc() 展示，动态 ID 不拼进脚本。
+let roleLifeState={data:null,selectorData:null,loading:false,error:'',account:'',role:'',tab:'overview',
+  subTab:'activity',todayTab:'today',generation:0,sequence:0,updatedAt:0,saving:false,
+  page:{activity:1,diary:1,dream:1,plans:1,jobs:1},
+  records:{activity:null,diary:null,dream:null,plans:null,jobs:null},recordSequence:{},
+  pending:Object.create(null),requests:Object.create(null),draft:null,
+  planEditor:null,expEditor:null,noteEditor:false,noteDraft:'',message:'',messageKind:''};
+const ROLE_LIFE_TABS=[['overview','概览'],['today','日程'],['experiences','生活记录'],['settings','设置'],['jobs','任务']];
+function roleLifeHasDraft(){return !!(roleLifeState.draft&&Object.keys(roleLifeState.draft).length)}
+function roleLifeIdentity(){return JSON.stringify([roleLifeState.account||'',roleLifeState.role||''])}
+function roleLifeCurrent(generation,identity){return (roleLifeState.generation||0)===generation&&roleLifeIdentity()===identity}
+function roleLifeLeave(){
+  if(roleLifeBusy()){toast('操作进行中，完成后再切换',false);return false}
+  if(roleLifeHasDraft()&&!confirm('角色生活设置尚未保存，离开会放弃这些修改，继续？'))return false;
+  roleLifeState.draft=null;roleLifeState.message='';return true
+}
+function roleLifeRender(){
+  if(state.current!=='role-life')return;
+  const root=el('section_role_life');
+  if(!root){render();return}
+  const main=root.closest('.main'),scroll=main?.scrollTop;
+  const focus=document.activeElement,focusId=root.contains(focus)?focus.id:'';
+  let selection=null;try{if(focusId)selection=[focus.selectionStart,focus.selectionEnd]}catch(e){}
+  const expanded=[...root.querySelectorAll('details[open][data-life-detail]')].map(n=>n.dataset.lifeDetail);
+  const enteringId=root.querySelector?.('.subtab-enter')?.id||'';
+  if('innerHTML'in root)root.innerHTML=renderRoleLifeInner();
+  else if('outerHTML'in root)root.outerHTML=renderRoleLife();
+  const replacement=el('section_role_life');
+  replacement?.querySelectorAll('details[data-life-detail]').forEach(n=>{if(expanded.includes(n.dataset.lifeDetail))n.open=true});
+  if(enteringId&&typeof animateSubtab==='function'){const panel=el(enteringId);if(panel)animateSubtab(panel)}
+  if(focusId){const target=el(focusId);if(target){target.focus({preventScroll:true});if(selection&&selection[0]!=null)try{target.setSelectionRange(...selection)}catch(e){}}}
+  if(main&&scroll!=null)main.scrollTop=scroll;
+  if(typeof liquidGlassLensController!=='undefined')liquidGlassLensController.refresh();
+}
+function roleLifeTabKey(event){
+  if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
+  const tabs=[...event.currentTarget.querySelectorAll('[role="tab"]')],index=tabs.indexOf(event.target);
+  if(index<0)return;event.preventDefault();
+  const next=event.key==='Home'?0:event.key==='End'?tabs.length-1:(index+(event.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length;
+  const id=tabs[next].id;tabs[next].click();el(id)?.focus({preventScroll:true})
+}
+
+function roleLifeRequestId(){
+  try{if(globalThis.crypto&&globalThis.crypto.randomUUID)return String(globalThis.crypto.randomUUID())}catch(e){}
+  return 'rl-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10)
+}
+function roleLifeUrl(path,extra={}){
+  const d=roleLifeState.data||{},params=new URLSearchParams(Object.assign({
+    account:roleLifeState.account||d.account||'',role:roleLifeState.role||d.role_id||''},extra));
+  return path+'?'+params.toString()
+}
+const ROLE_LIFE_RECORD_TABS={activity:'activity',diary:'diary',dream:'dream',plans:'plans',jobs:'jobs'};
+function roleLifeKindForTab(tab){return ROLE_LIFE_RECORD_TABS[tab]||null}
+function roleLifeVersionPayload(extra={}){
+  const s=(roleLifeState.data||{}).status||{};
+  return Object.assign({
+    account:roleLifeState.account||(roleLifeState.data||{}).account||'',
+    role_id:roleLifeState.role||(roleLifeState.data||{}).role_id||'',
+    expected_revision:String(s.revision||''),
+    expected_epoch:Number(s.epoch??0),
+    expected_state_version:Number(s.state_version??0),
+    request_id:roleLifeRequestId()},extra)
+}
+function roleLifeEditable(){const d=roleLifeState.data;return !!(d&&d.editable&&!d.status?.corrupt&&!d.status?.read_error&&!roleLifeState.error&&!roleLifeState.loading&&!roleLifeBusy())}
+function roleLifeVisibleRecord(){return roleLifeState.tab==='jobs'?'jobs':roleLifeState.tab==='experiences'?(roleLifeState.subTab||'activity'):roleLifeState.tab==='today'&&roleLifeState.todayTab==='plans'?'plans':null}
+async function loadRoleLife(force=false,silent=false){
+  if((roleLifeState.loading&&!force)||roleLifeState.saving)return;
+  const generation=roleLifeState.generation||0,identity=roleLifeIdentity();
+  const sequence=roleLifeState.sequence=(roleLifeState.sequence||0)+1;
+  roleLifeState.loading=true;roleLifeState.error='';
+  if(!silent)roleLifeRender();
+  let accepted=false,changed=false;
+  try{
+    const q=new URLSearchParams();
+    if(roleLifeState.account)q.set('account',roleLifeState.account);
+    if(roleLifeState.role)q.set('role',roleLifeState.role);
+    const data=await api('/api/role-life'+(q.toString()?'?'+q:''),{cache:'no-store'});
+    if(!roleLifeCurrent(generation,identity)||roleLifeState.sequence!==sequence)return;
+    changed=roleLifeState.data?.status?.state_version!==data.status?.state_version;
+    if(roleLifeState.data&&(data.account!==roleLifeState.data.account||data.role_id!==roleLifeState.data.role_id)){
+      roleLifeState.generation=(roleLifeState.generation||0)+1;
+      roleLifeState.draft=null;roleLifeState.requests=Object.create(null);roleLifeState.pending=Object.create(null);
+      roleLifeState.records={activity:null,diary:null,dream:null,plans:null,jobs:null};roleLifeState.page={activity:1,diary:1,dream:1,plans:1,jobs:1};
+      changed=true;
+    }
+    roleLifeState.data=data;roleLifeState.selectorData=data;
+    roleLifeState.account=data.account||'';roleLifeState.role=data.role_id||'';
+    roleLifeState.updatedAt=Date.now();accepted=true;
+    if(changed||force){
+      for(const kind of Object.keys(ROLE_LIFE_RECORD_TABS)){
+        (roleLifeState.recordSequence||(roleLifeState.recordSequence={}))[kind]=(roleLifeState.recordSequence[kind]||0)+1;
+        if(roleLifeState.records[kind])roleLifeState.records[kind]={...roleLifeState.records[kind],stale:true,loading:false};
+      }
+    }
+  }catch(e){if(roleLifeCurrent(generation,identity)&&roleLifeState.sequence===sequence)roleLifeState.error=String(e.message||e)}
+  finally{
+    if((accepted||(roleLifeCurrent(generation,identity)))&&roleLifeState.sequence===sequence){
+      roleLifeState.loading=false;roleLifeRender();
+      const kind=roleLifeVisibleRecord();
+      if(accepted&&kind&&(force||changed||!roleLifeState.records[kind]))roleLifeLoadRecords(kind);
+    }
+  }
+}
+async function roleLifeSelect(account,role){
+  if(!roleLifeLeave()){roleLifeRender();return}
+  roleLifeState.selectorData=roleLifeState.data||roleLifeState.selectorData;
+  roleLifeState.generation=(roleLifeState.generation||0)+1;
+  roleLifeState.account=account;roleLifeState.role=role;roleLifeState.data=null;roleLifeState.error='';
+  roleLifeState.requests=Object.create(null);roleLifeState.pending=Object.create(null);roleLifeState.message='';
+  roleLifeState.planEditor=null;roleLifeState.expEditor=null;roleLifeState.noteEditor=false;roleLifeState.noteDraft='';
+  roleLifeState.page={activity:1,diary:1,dream:1,plans:1,jobs:1};
+  roleLifeState.records={activity:null,diary:null,dream:null,plans:null,jobs:null};roleLifeState.recordSequence={};
+  await loadRoleLife(true)
+}
+function roleLifeSetTab(tab){
+  if(!ROLE_LIFE_TABS.some(([key])=>key===tab))return;
+  const changed=roleLifeState.tab!==tab;
+  roleLifeState.tab=tab;roleLifeRender();
+  const kind=roleLifeVisibleRecord();if(kind&&(!roleLifeState.records[kind]||roleLifeState.records[kind].stale))roleLifeLoadRecords(kind);
+  if(changed){
+    const panel=el('life-panel-'+tab);
+    if(panel&&typeof animateSubtab==='function')animateSubtab(panel);
+    el('section_role_life')?.querySelector('.life-main-tabs')?.scrollIntoView({block:'nearest'});
+  }
+}
+function roleLifeSetSubTab(tab){
+  if(!['activity','diary','dream'].includes(tab))return;
+  const tabChanged=roleLifeState.tab!=='experiences',subChanged=roleLifeState.subTab!==tab;
+  roleLifeState.tab='experiences';roleLifeState.subTab=tab;roleLifeRender();
+  if(!roleLifeState.records[tab]||roleLifeState.records[tab].stale)roleLifeLoadRecords(tab);
+  if(tabChanged||subChanged){
+    const target=tabChanged?el('life-panel-experiences'):el('life-record-panel');
+    if(target&&typeof animateSubtab==='function')animateSubtab(target);
+  }
+}
+function roleLifeSetToday(tab){
+  if(roleLifeState.tab!=='today'){roleLifeState.todayTab=tab;roleLifeSetTab('today');return}
+  const changed=roleLifeState.todayTab!==tab;
+  roleLifeState.todayTab=tab;roleLifeRender();
+  const kind=roleLifeVisibleRecord();if(kind&&(!roleLifeState.records[kind]||roleLifeState.records[kind].stale))roleLifeLoadRecords(kind);
+  if(changed){const panel=el('life-day-panel');if(panel&&typeof animateSubtab==='function')animateSubtab(panel)}
+}
+async function roleLifeLoadRecords(tab){
+  const kind=roleLifeKindForTab(tab),status=roleLifeState.data?.status;
+  if(!kind||!roleLifeState.data||status?.corrupt||status?.read_error||!roleLifeState.account||!roleLifeState.role)return;
+  const page=roleLifeState.page[kind]||1,generation=roleLifeState.generation||0,identity=roleLifeIdentity();
+  const sequences=roleLifeState.recordSequence||(roleLifeState.recordSequence={}),seq=sequences[kind]=(sequences[kind]||0)+1;
+  roleLifeState.records[kind]={...(roleLifeState.records[kind]||{}),loading:true,error:''};roleLifeRender();
+  const current=()=>roleLifeCurrent(generation,identity)&&roleLifeState.recordSequence[kind]===seq&&roleLifeState.page[kind]===page;
+  try{
+    const data=await api(roleLifeUrl('/api/role-life/records',{kind,page,page_size:20}),{cache:'no-store'});
+    if(!current())return;
+    if(data.corrupt||data.read_error||data.error)throw Error(data.error||(typeof data.read_error==='string'?data.read_error:'记录暂时无法读取'));
+    roleLifeState.records[kind]={...data,loading:false,stale:false};
+  }catch(e){if(current())roleLifeState.records[kind]={...roleLifeState.records[kind],loading:false,error:String(e.message||e),stale:true}}
+  finally{if(current())roleLifeRender()}
+}
+function roleLifeSetPage(tab,delta){
+  const kind=roleLifeKindForTab(tab);if(!kind)return;
+  const cur=roleLifeState.records[kind]||{};
+  const page=Math.max(1,(roleLifeState.page[kind]||cur.page||1)+delta);
+  if(cur.pages&&page>cur.pages)return;
+  roleLifeState.page[kind]=page;roleLifeLoadRecords(tab)
+}
+function roleLifeBaseConfig(){
+  const d=roleLifeState.data||{};
+  return JSON.parse(JSON.stringify(Object.assign({},d.default_config||{},d.config||{})))
+}
+// 草稿只存用户改过的键，渲染时叠加在服务端/默认配置之上；这样自动刷新
+// 不会被“一渲染就生成草稿”误判成正在编辑。
+function roleLifeDraftValues(){return Object.assign(roleLifeBaseConfig(),roleLifeState.draft||{})}
+function roleLifeSetDraft(key,value){
+  if(roleLifeState.saving)return;
+  const draft={...(roleLifeState.draft||{})};
+  if(value===roleLifeBaseConfig()[key])delete draft[key];else draft[key]=value;
+  roleLifeState.draft=Object.keys(draft).length?draft:null;
+  roleLifeMarkDraftDirty();
+  if(['enabled','timezone','model_override','maintenance_enabled'].includes(key))roleLifeRender();
+}
+function roleLifeMarkDraftDirty(){
+  const dirty=roleLifeHasDraft();
+  roleLifeState.message=dirty?'设置有未保存修改，请点击右上角「保存设置」':'';roleLifeState.messageKind='';
+  if(typeof state!=='undefined'&&state&&state.current==='role-life')state.dirty=dirty;
+  const save=el('saveState');if(save)save.textContent=dirty?'有未保存修改':'已同步';
+}
+async function roleLifeSaveConfig(){
+  if(!roleLifeEditable()||roleLifeState.saving)return;
+  const d=roleLifeState.data||{},generation=roleLifeState.generation||0,identity=roleLifeIdentity();
+  const cfg=Object.assign({},roleLifeState.draft||{});
+  const expectedRev=String(d.config_revision||'');
+  roleLifeState.saving=true;roleLifeState.message='正在保存…';roleLifeState.messageKind='';
+  const saveEl=el('saveState');if(saveEl)saveEl.textContent='正在保存...';
+  roleLifeRender();
+  let conflict409=false;
+  try{
+    const data=await api('/api/role-life/config',{method:'POST',body:JSON.stringify({
+      account:roleLifeState.account||d.account||'global',role_id:roleLifeState.role||d.role_id||'default',
+      expected_config_revision:expectedRev,config:cfg})});
+    if(!roleLifeCurrent(generation,identity))return;
+    roleLifeState.data=data;roleLifeState.selectorData=data;roleLifeState.updatedAt=Date.now();
+    roleLifeState.draft=null;roleLifeState.message='设置已保存';roleLifeState.messageKind='success';
+    if(typeof state!=='undefined'&&state&&state.current==='role-life')state.dirty=false;
+    const save=el('saveState');if(save)save.textContent='已同步';
+    toast('角色生活设置已保存',true);
+  }catch(e){if(roleLifeCurrent(generation,identity)){roleLifeState.message='保存失败：'+String(e.message||e);roleLifeState.messageKind='error';toast(roleLifeState.message,false);conflict409=Boolean(e&&Number(e.status)===409);const save=el('saveState');if(save)save.textContent=roleLifeHasDraft()?'有未保存修改':'已同步'}}
+  finally{if(roleLifeCurrent(generation,identity)){roleLifeState.saving=false;roleLifeRender();if(conflict409)await loadRoleLife(true,true)}}
+}
+async function roleLifeAction(action,extra={}){
+  // 损坏状态只允许“清空重建”（仍需页面二次确认）：其余操作一律只读。
+  const d0=roleLifeState.data||{};
+  const corruptClear=!!(action==='clear'&&d0.editable&&d0.status?.corrupt);
+  if(!corruptClear&&!roleLifeEditable())return toast('当前只读，无法操作',false);
+  const key=action+':'+(extra.job_id||extra.item_id||extra.experience_id||extra.note_id||extra.kind||'');
+  if(Object.values(roleLifeState.pending).some(Boolean))return toast('操作进行中，请稍候',false);
+  const generation=roleLifeState.generation||0,identity=roleLifeIdentity();
+  roleLifeState.pending[key]=true;roleLifeState.message='正在提交…';roleLifeState.messageKind='';roleLifeRender();
+  // 同一操作的网络失败重试必须复用同一个 request_id：服务端据此幂等，
+  // 不会因为重发而重复入队或重复清空。成功后再丢弃。
+  const requests=roleLifeState.requests||(roleLifeState.requests=Object.create(null));
+  if(!requests[key])requests[key]=roleLifeRequestId();
+  const okMessages={
+    clear:'已清空该角色生活',upsert_plan_item:'已保存日程安排',delete_plan_item:'已删除日程安排',
+    update_experience:'已保存生活记录',delete_experience:'已删除生活记录',
+    add_life_note:'已添加生活备注',delete_life_note:'已删除备注',
+  };
+  try{
+    await api('/api/role-life/action',{method:'POST',body:JSON.stringify(
+      roleLifeVersionPayload(Object.assign({action,request_id:requests[key]},extra)))});
+    if(!roleLifeCurrent(generation,identity))return;
+    delete requests[key];roleLifeState.message=okMessages[action]||'已提交，任务完成后会更新在这里';roleLifeState.messageKind='success';
+    toast(roleLifeState.message,true);
+    if(action==='clear')roleLifeState.records={activity:null,diary:null,dream:null,plans:null,jobs:null};
+    if(action==='upsert_plan_item'||action==='delete_plan_item')roleLifeState.planEditor=null;
+    if(action==='update_experience'||action==='delete_experience')roleLifeState.expEditor=null;
+    if(action==='add_life_note'){roleLifeState.noteEditor=false;roleLifeState.noteDraft=''}
+    await loadRoleLife(true);
+    const vis=roleLifeVisibleRecord();
+    if(vis&&(action==='update_experience'||action==='delete_experience'))await roleLifeLoadRecords(vis);
+  }catch(e){if(roleLifeCurrent(generation,identity)){const rawErr=String(e.message||e||'请稍后重试').trim();roleLifeState.message=/^(操作失败|保存失败|删除失败|清空失败|未能|无法|请先|当前)/.test(rawErr)?rawErr:('操作失败：'+rawErr);roleLifeState.messageKind='error';toast(roleLifeState.message,false);if(e&&Number(e.status)===409){delete requests[key];await loadRoleLife(true,true)}}}
+  finally{if(roleLifeCurrent(generation,identity)){delete roleLifeState.pending[key];roleLifeRender()}}
+}
+function roleLifeRegenerate(){return roleLifeAction('regenerate_plan')}
+function roleLifeEnqueue(kind,args){return roleLifeAction('enqueue',args?{kind,args}:{kind})}
+function roleLifeRetry(jobId){return roleLifeAction('retry',{job_id:String(jobId||'')})}
+function roleLifeOpenPlanEditor(itemId=''){
+  const items=(roleLifeState.data?.status?.plan?.items)||[];
+  const found=itemId?items.find(i=>String(i.id)===String(itemId)):null;
+  roleLifeState.expEditor=null;
+  roleLifeState.planEditor=found?{
+    item_id:String(found.id||''),title:String(found.title||''),
+    purpose:String(found.purpose||''),
+    start:roleLifeFmtTime(found.start,true),end:roleLifeFmtTime(found.end,true),
+  }:{item_id:'',title:'',purpose:'',start:'09:00',end:'10:00'};
+  roleLifeRender();
+}
+function roleLifeCancelPlanEditor(){roleLifeState.planEditor=null;roleLifeRender()}
+async function roleLifeSavePlanEditor(){
+  const title=String(el('lifePlanTitle')?.value??roleLifeState.planEditor?.title??'').trim();
+  const start=String(el('lifePlanStart')?.value??roleLifeState.planEditor?.start??'').trim();
+  const end=String(el('lifePlanEnd')?.value??roleLifeState.planEditor?.end??'').trim();
+  const purpose=String(el('lifePlanPurpose')?.value??roleLifeState.planEditor?.purpose??'').trim();
+  if(roleLifeState.planEditor){
+    Object.assign(roleLifeState.planEditor,{title,start,end,purpose});
+  }
+  if(!title)return toast('请填写活动名称',false);
+  if(!start||!end)return toast('请填写起止时间',false);
+  await roleLifeAction('upsert_plan_item',{params:{
+    item_id:String(roleLifeState.planEditor?.item_id||''),title,purpose,start,end,
+  }});
+}
+async function roleLifeDeletePlanItem(itemId){
+  if(!confirm('确定删除这个未开始的活动安排？'))return;
+  await roleLifeAction('delete_plan_item',{item_id:String(itemId||'')});
+}
+async function roleLifeTriggerActivity(itemId){
+  await roleLifeAction('trigger_activity',{item_id:String(itemId||'')});
+}
+function roleLifeFindExpText(expId){
+  const recs=roleLifeState.records||{};
+  for(const k of ['activity','diary','dream']){
+    const hit=(recs[k]?.items||[]).find(r=>String(r.id)===String(expId));
+    if(hit)return String(hit.text||'');
+  }
+  const recHit=(roleLifeState.data?.status?.recent||[]).find(r=>String(r.id)===String(expId));
+  return recHit?String(recHit.text||''):'';
+}
+function roleLifeOpenExpEditor(expId='',planItemId=''){
+  roleLifeState.planEditor=null;
+  let text=expId?roleLifeFindExpText(expId):'';
+  if(!text&&planItemId){
+    const item=(roleLifeState.data?.status?.plan?.items||[]).find(i=>String(i.id)===String(planItemId));
+    if(item?.experience_id)text=roleLifeFindExpText(item.experience_id);
+  }
+  roleLifeState.expEditor={experience_id:String(expId||''),plan_item_id:String(planItemId||''),text};
+  roleLifeRender();
+}
+function roleLifeCancelExpEditor(){roleLifeState.expEditor=null;roleLifeRender()}
+async function roleLifeSaveExpEditor(){
+  const text=String(el('lifeExpText')?.value??roleLifeState.expEditor?.text??'').trim();
+  if(roleLifeState.expEditor)roleLifeState.expEditor.text=text;
+  if(!text)return toast('内容不能为空',false);
+  await roleLifeAction('update_experience',{params:{
+    experience_id:String(roleLifeState.expEditor?.experience_id||''),
+    plan_item_id:String(roleLifeState.expEditor?.plan_item_id||''),text,
+  }});
+}
+async function roleLifeDeleteExperience(expId){
+  if(!confirm('确定删除这条生活记录？'))return;
+  await roleLifeAction('delete_experience',{experience_id:String(expId||'')});
+}
+function roleLifeOpenNoteEditor(){roleLifeState.noteEditor=true;roleLifeState.noteDraft='';roleLifeRender()}
+function roleLifeCancelNoteEditor(){roleLifeState.noteEditor=false;roleLifeState.noteDraft='';roleLifeRender()}
+async function roleLifeSaveNote(){
+  const text=String(el('lifeNoteText')?.value??roleLifeState.noteDraft??'').trim();
+  roleLifeState.noteDraft=text;
+  if(!text)return toast('请填写备注内容',false);
+  await roleLifeAction('add_life_note',{text});
+}
+async function roleLifeDeleteNote(noteId){
+  await roleLifeAction('delete_life_note',{note_id:String(noteId||'')});
+}
+async function roleLifeClear(){
+  const s=(roleLifeState.data||{}).status||{};
+  const corrupt=!!s.corrupt;
+  const text=corrupt
+    ?'状态文件不可读，清空将先备份原文件再重建空白状态（不影响聊天记录）。请输入「清空」确认。'
+    :'将清空此角色的日程、经历、睡眠、日记与梦（不影响聊天记录）。请输入「清空」确认。';
+  const input=prompt(text);
+  if(input!=='清空')return;
+  await roleLifeAction('clear',corrupt?{allow_corrupt:true}:{})
+}
+function roleLifeTab(title,key){return `<button type="button" id="life-record-${key}" class="life-tab ${roleLifeState.subTab===key?'is-active':''}" role="tab" aria-controls="life-record-panel" tabindex="${roleLifeState.subTab===key?0:-1}" aria-selected="${roleLifeState.subTab===key}" onclick="roleLifeSetSubTab('${key}')">${title}</button>`}
+function roleLifeZone(){return roleLifeState.data?.config?.timezone||roleLifeState.data?.default_config?.timezone||'Asia/Shanghai'}
+function roleLifeFmtTime(ts,timeOnly=false){
+  const n=Number(ts);if(!Number.isFinite(n)||n<=0)return '—';
+  const opts={timeZone:roleLifeZone(),hour:'2-digit',minute:'2-digit',hourCycle:'h23'};
+  if(!timeOnly)Object.assign(opts,{month:'2-digit',day:'2-digit'});
+  try{return new Intl.DateTimeFormat('zh-CN',opts).format(new Date(n*1000))}catch(e){return '时间不可用'}
+}
+function roleLifeIcon(name){
+  const shapes={sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/>',moon:'<path d="M20 14a8 8 0 0 1-10-10 8 8 0 1 0 10 10Z"/>',clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',book:'<path d="M12 5v15M3 4h5a4 4 0 0 1 4 2 4 4 0 0 1 4-2h5v15h-5a4 4 0 0 0-4 2 4 4 0 0 0-4-2H3Z"/>',refresh:'<path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 6a8 8 0 0 1 14 6M4 12a8 8 0 0 0 14 6"/>',alert:'<path d="M12 3 2 21h20Z"/><path d="M12 9v5m0 3v1"/>',leaf:'<path d="M20 3C8 2 3 8 5 15s15 6 15-12Z"/><path d="M4 21 15 10"/>'};
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${shapes[name]||shapes.book}</svg>`
+}
+function roleLifeEmpty(title,detail,action='',icon='book'){
+  return `<div class="life-empty"><span class="life-empty-icon">${roleLifeIcon(icon)}</span><h3>${esc(title)}</h3><p>${esc(detail)}</p>${action?`<div class="life-actions">${action}</div>`:''}</div>`
+}
+function roleLifeNotice(text,type='info'){
+  return `<div class="life-notice ${type==='error'?'is-error':type==='success'?'is-success':''}" role="${type==='error'?'alert':'status'}"><span class="life-notice-icon">${roleLifeIcon(type==='error'?'alert':'leaf')}</span><p>${esc(text)}</p></div>`
+}
+function roleLifeBusy(){return roleLifeState.saving||Object.values(roleLifeState.pending||{}).some(Boolean)}
+function roleLifeActionButton(label,call,{primary=false,enabled=true,key=''}={}){
+  const pending=!!roleLifeState.pending?.[key];
+  return `<button type="button" class="btn ${primary?'primary':''}" ${!enabled||roleLifeBusy()?'disabled':''} aria-busy="${pending}" onclick="${call}">${pending?'正在提交…':esc(label)}</button>`
+}
+function roleLifeJobLabel(kind){return ({plan:'安排日程',activity:'记录经历',diary:'写日记',dream:'记录梦境',maintenance:'更新状态'})[kind]||'生活任务'}
+function roleLifePager(kind,data){
+  const page=Number(data.page||1),pages=Math.max(1,Number(data.pages||1));
+  if(pages<=1)return '';
+  return `<nav class="life-pager" aria-label="记录翻页"><button type="button" class="btn" ${page<=1||data.loading?'disabled':''} onclick="roleLifeSetPage('${kind}',-1)">上一页</button><span>第 ${page} / ${pages} 页</span><button type="button" class="btn" ${page>=pages||data.loading?'disabled':''} onclick="roleLifeSetPage('${kind}',1)">下一页</button></nav>`
+}
+function roleLifeRecordBody(record){
+  const text=String(record.text||''),detail=esc(String(record.id||record.created_at||text.slice(0,24)));
+  return text.length>320?`<details class="life-reading" data-life-detail="${detail}"><summary><span class="life-excerpt">${esc(text.slice(0,180))}…</span><span class="life-reading-toggle">展开全文</span></summary><div class="life-prose">${esc(text)}</div></details>`:`<div class="life-prose">${esc(text||'暂无正文')}</div>`
+}
+function roleLifeRecordCard(record,editableRecords=false){
+  const dream=record.dream||record.kind==='dream';
+  const recId=String(record.id||'');
+  const editing=editableRecords&&roleLifeState.expEditor&&String(roleLifeState.expEditor.experience_id)===recId&&recId;
+  const actions=editableRecords&&recId?`<div class="life-item-actions"><button type="button" class="life-mini-btn" data-exp-id="${esc(recId)}" onclick="roleLifeOpenExpEditor(this.dataset.expId,'')">编辑</button><button type="button" class="life-mini-btn is-danger" data-exp-id="${esc(recId)}" onclick="roleLifeDeleteExperience(this.dataset.expId)">删除</button></div>`:'';
+  const editor=editing?roleLifeExpEditorHtml():'';
+  return `<article class="life-record"><div class="life-record-head"><span class="life-record-kind">${roleLifeIcon(dream?'moon':'book')}${esc(roleLifeKindLabel(record.kind,dream))}</span><time>${esc(record.date||'')}${record.created_at?' · '+esc(roleLifeFmtTime(record.created_at,true)):''}</time></div>${editing?editor:roleLifeRecordBody(record)}${editing?'':actions}</article>`
+}
+function roleLifeExpEditorHtml(){
+  const ed=roleLifeState.expEditor;if(!ed)return '';
+  return `<div class="life-inline-form"><label for="lifeExpText">编辑内容</label><textarea id="lifeExpText" maxlength="1200" placeholder="写下这次的经过、感受或修改后的正文…" oninput="if(roleLifeState.expEditor)roleLifeState.expEditor.text=this.value">${esc(ed.text||'')}</textarea><div class="life-actions"><button type="button" class="btn life-btn-accent" onclick="roleLifeSaveExpEditor()">保存</button><button type="button" class="btn" onclick="roleLifeCancelExpEditor()">取消</button></div></div>`
+}
+function roleLifeTimeline(items,compact=false,allowManage=false){
+  const sorted=[...items].sort((a,b)=>Number(a.start||0)-Number(b.start||0));
+  const enabled=!!roleLifeState.data?.status?.enabled;
+  const activeExp=roleLifeState.expEditor;
+  return `<ol class="life-timeline ${compact?'is-compact':''}">${sorted.map(item=>{
+    const itemId=String(item.id||'');
+    const st=String(item.status||'');
+    const canEditPlan=allowManage&&itemId&&st==='planned';
+    const canGen=allowManage&&enabled&&itemId&&!item.experience_id&&['planned','active','interrupted'].includes(st);
+    const canWriteExp=allowManage&&itemId;
+    const itemActions=allowManage&&itemId?`<div class="life-item-actions">${canEditPlan?`<button type="button" class="life-mini-btn" data-item-id="${esc(itemId)}" onclick="roleLifeOpenPlanEditor(this.dataset.itemId)">编辑</button><button type="button" class="life-mini-btn is-danger" data-item-id="${esc(itemId)}" onclick="roleLifeDeletePlanItem(this.dataset.itemId)">删除</button>`:''}${canGen?`<button type="button" class="life-mini-btn" data-item-id="${esc(itemId)}" onclick="roleLifeTriggerActivity(this.dataset.itemId)">生成经历</button>`:''}${canWriteExp?`<button type="button" class="life-mini-btn" data-exp-id="${esc(item.experience_id||'')}" data-item-id="${esc(itemId)}" onclick="roleLifeOpenExpEditor(this.dataset.expId,this.dataset.itemId)">${item.experience_id?'编辑经历':'手写经历'}</button>`:''}</div>`:'';
+    const inlineExp=allowManage&&activeExp&&String(activeExp.plan_item_id)===itemId&&itemId?roleLifeExpEditorHtml():'';
+    return `<li class="life-timeline-item ${st==='active'?'is-current':''}"><div class="life-timeline-time"><time>${esc(roleLifeFmtTime(item.start,true))}</time><span>${esc(roleLifeFmtTime(item.end,true))}</span></div><span class="life-timeline-dot" aria-hidden="true"></span><div class="life-timeline-content"><div class="life-row-head"><h4>${esc(item.title||'未命名活动')}</h4>${roleLifeStatusPill(item.status)}</div>${item.purpose&&!compact?`<p>${esc(item.purpose)}</p>`:''}${item.experience_id?'<span class="life-meta">经历已保存</span>':''}${itemActions}${inlineExp}</div></li>`;
+  }).join('')}</ol>`
+}
+// 用量未知字段既可能来自 status 顶层，也可能只在 usage 里；两处都认，避免
+// 内核只在一个位置暴露时页面退化成“0 次”。
+function roleLifeBudgetUnknown(s){
+  s=s||{};const u=s.usage||{};
+  // 完全读不出状态（corrupt）时用量天然未知，绝不当 0。
+  return !!(s.budget_unknown||u.budget_unknown||s.corrupt||u.corrupt
+    ||u.role_24h===null)
+}
+function roleLifeBudgetUnknownUntil(s){
+  s=s||{};const u=s.usage||{};
+  return Number(s.budget_unknown_until||u.budget_unknown_until||0)||0
+}
+function roleLifeCorruptBackup(s){
+  s=s||{};return String(s.corrupt_backup||'')
+}
+function roleLifeStatusPill(status){
+  const map={planned:['未开始',''],active:['进行中','ok'],completed:['已完成','ok'],
+    interrupted:['已中断','bad'],skipped:['已跳过',''],pending:['排队中',''],running:['生成中','ok'],
+    succeeded:['成功','ok'],failed:['失败','bad'],unknown:['结果未知','bad'],retried:['已重试','']};
+  const [text,cls]=map[status]||[status||'未知',''];
+  return `<span class="pill ${cls}">${esc(text)}</span>`
+}
+function roleLifeOverview(){
+  const d=roleLifeState.data||{},s=d.status||{},next=s.next_node,activity=s.current_activity;
+  if(s.corrupt){
+    const until=roleLifeBudgetUnknownUntil(s);
+    return `<section class="card">${roleLifeEmpty('状态不可读','文件损坏或身份不符，不会当成空数据继续运行。','','alert')}${roleLifeNotice(s.error||'状态文件不可读','error')}<p class="life-caption">${until?'生成已保护性暂停至 '+esc(roleLifeFmtTime(until))+'；':''}清空前会先备份原文件。</p><div class="life-actions">${roleLifeActionButton('清空并重建（二次确认）','roleLifeClear()',{enabled:d.editable,key:'clear:'})}</div></section>`
+  }
+  if(s.read_error)return `<section class="card">${roleLifeEmpty('暂时读不到状态','读取文件或连接超时，请稍后重新读取。','','alert')}${roleLifeNotice(s.error||(typeof s.read_error==='string'?s.read_error:'读取失败'),'error')}<div class="life-actions"><button type="button" class="btn" onclick="loadRoleLife(true)">重新读取</button></div></section>`;
+  const items=Array.isArray(s.plan?.items)?s.plan.items:[],recent=Array.isArray(s.recent)?s.recent:[];
+  const jobs=Array.isArray(s.jobs)?s.jobs:[],failed=jobs.filter(j=>['failed','unknown'].includes(j.status));
+  const enabled=!!s.enabled,unknown=roleLifeBudgetUnknown(s),until=roleLifeBudgetUnknownUntil(s),backup=roleLifeCorruptBackup(s);
+  const draftCfg=roleLifeDraftValues();
+  const completedCount=items.filter(i=>i.status==='completed').length;
+  const headline=!enabled?'角色生活已关闭':s.sleeping?'正在休息':activity?.title||'暂时空闲';
+  const intro=!enabled?'打开上方「角色生活总开关」并点右上角「保存设置」后，机器人会按当前人设和作息默默过日子。':s.sleeping?'休息期间暂不主动搭话，发来的消息仍会照常回复。':activity?.purpose||'按作息安排推进，空余时间会慢慢留下新片段。';
+  const openSettings='<button type="button" class="btn" onclick="roleLifeSetTab(\'settings\')">调整作息与偏好</button>';
+  const sortedItems=items.slice().sort((a,b)=>Number(a.start)-Number(b.start));
+  const heroMiddle=enabled?`<div class="life-hero-stats">
+      <div class="life-stat"><span class="life-meta">今日进度</span><strong>${items.length?`已完成 ${completedCount} / ${items.length} 项`:'等待排程'}</strong></div>
+      <div class="life-stat"><span class="life-meta">作息设置</span><strong>${draftCfg.sleep_enabled?`${esc(draftCfg.sleep_start||'00:30')} · 睡 ${esc(draftCfg.sleep_hours??8)} 小时`:'未开启睡眠'}</strong></div>
+      <div class="life-stat"><span class="life-meta">后台运行</span><strong>${d.runtime_running===false?'仅 WebUI':'自动推进中'}</strong></div>
+    </div>`:`<div class="life-guide-list">
+      <div class="life-guide-item"><strong>1. 自己过日子</strong><span>按作息与偏好自动排日程、记录活动经过、晚上写简短日记，醒来偶有梦境。</span></div>
+      <div class="life-guide-item"><strong>2. 聊天更有活人感</strong><span>正常聊天和主动搭话时适度带出近况与心情，不刷屏、不每轮生硬汇报行程。</span></div>
+      <div class="life-guide-item"><strong>3. 随时可控</strong><span>总开关关闭时不运行后台任务、不消耗模型额度；切换人设时原有生活记录也会保留。</span></div>
+    </div>`;
+  const alerts=[
+    unknown?roleLifeNotice('角色用量未知，已保护性暂停生成'+(until?'至 '+roleLifeFmtTime(until):'')+'。','error'):'',
+    backup?roleLifeNotice('已从损坏状态恢复，原件已备份为 '+backup,'info'):'',
+  ].filter(Boolean).join('');
+  return `${alerts}<div class="life-overview-grid">
+    <section class="card life-hero ${enabled?'is-enabled':'is-paused'}"><div class="life-eyebrow">${roleLifeIcon(s.sleeping?'moon':'sun')}<span>${enabled?(s.sleeping?'此刻 · 睡眠中':'此刻 · 清醒'):'尚未启用'}</span><span class="pill">${esc(s.date||'角色日常')}</span></div>
+      <h3>${esc(headline)}</h3><p class="life-lead">${esc(intro)}</p>
+      ${s.mood?.mood||s.mood?.energy?`<div class="life-mood"><span class="life-mood-dot" aria-hidden="true"></span><span>${esc(s.mood.mood||'')}${s.mood.energy?' · 精力 '+esc(s.mood.energy):''}</span></div>`:''}
+      ${heroMiddle}
+      <div class="life-hero-footer"><div class="life-next"><span class="life-meta">${s.sleeping?'预计醒来':'接下来'}</span><strong>${s.sleeping?esc(roleLifeFmtTime(s.sleep?.end)):next?esc(next.label):'等待新的安排'}</strong>${!s.sleeping&&next?.at?`<time>${esc(roleLifeFmtTime(next.at))}</time>`:''}</div>
+      ${enabled?'<button type="button" class="btn primary" onclick="roleLifeSetTab(\'today\')">看看今天</button>':d.editable?openSettings:'<span class="pill">仅可查看</span>'}</div></section>
+    <section class="card life-today-preview"><div class="section-head"><div><h3>今天的安排</h3><p>${items.length?'今日行程概览':'今天还没有安排。'}</p></div><span class="pill">${items.length} 项</span></div>
+      ${items.length?roleLifeTimeline(sortedItems.slice(0,5),true):roleLifeEmpty('今天还没有安排',enabled?'后台会按时间生成，也可以去日程页重排。':'开启角色生活后，这里会显示今日安排。','','clock')}
+      ${items.length>5?'<button type="button" class="life-text-button" onclick="roleLifeSetTab(\'today\')">查看完整日程 →</button>':''}</section>
+    <section class="card life-recent-preview"><div class="section-head"><div><h3>最近留下的片段</h3><p>活动经历、日记与梦境</p></div><button type="button" class="life-text-button" onclick="roleLifeSetTab('experiences')">全部记录 →</button></div>
+      ${recent.length?`<div class="life-recent-grid">${recent.slice(0,3).map(r=>roleLifeRecordCard(r,false)).join('')}</div>`:roleLifeEmpty('还没有生活片段','活动结束后，留下的经历、日记和梦境会出现在这里。')}
+    </section>
+    ${failed.length?`<section class="card life-alert-bar"><div class="life-row-head"><div><h4>有 ${failed.length} 个后台任务未能完成</h4><p class="life-caption">可在任务页查看原因或手动重试。</p></div><button type="button" class="btn" onclick="roleLifeSetTab('jobs')">查看任务</button></div></section>`:''}
+  </div>`
+}
+function roleLifeKindLabel(kind,dream){
+  if(dream||kind==='dream')return '梦境';
+  if(kind==='diary')return '日记';
+  if(kind==='activity')return '经历';
+  return String(kind||'记录')
+}
+function roleLifePlanEditorHtml(){
+  const ed=roleLifeState.planEditor;if(!ed)return '';
+  return `<div class="life-inline-form"><h4>${ed.item_id?'编辑日程安排':'新增日程安排'}</h4><div class="life-inline-grid"><div class="life-setting-field"><label for="lifePlanTitle">活动名称</label><input id="lifePlanTitle" type="text" maxlength="80" value="${esc(ed.title||'')}" placeholder="例如：整理书桌" oninput="if(roleLifeState.planEditor)roleLifeState.planEditor.title=this.value"></div><div class="life-inline-times"><div class="life-setting-field"><label for="lifePlanStart">开始</label><input id="lifePlanStart" type="time" value="${esc(ed.start||'09:00')}" oninput="if(roleLifeState.planEditor)roleLifeState.planEditor.start=this.value"></div><div class="life-setting-field"><label for="lifePlanEnd">结束</label><input id="lifePlanEnd" type="time" value="${esc(ed.end||'10:00')}" oninput="if(roleLifeState.planEditor)roleLifeState.planEditor.end=this.value"></div></div></div><div class="life-setting-field"><label for="lifePlanPurpose">目的/备注（可选）</label><input id="lifePlanPurpose" type="text" maxlength="200" value="${esc(ed.purpose||'')}" placeholder="简短说明想做的事" oninput="if(roleLifeState.planEditor)roleLifeState.planEditor.purpose=this.value"></div><div class="life-actions"><button type="button" class="btn life-btn-accent" onclick="roleLifeSavePlanEditor()">保存安排</button><button type="button" class="btn" onclick="roleLifeCancelPlanEditor()">取消</button></div></div>`
+}
+function roleLifeNotesCard(editable){
+  const notes=Array.isArray(roleLifeState.data?.status?.life_notes)?roleLifeState.data.status.life_notes:[];
+  const open=!!roleLifeState.noteEditor;
+  const editor=open?`<div class="life-inline-form"><label for="lifeNoteText">记一条生活备注（仅用于排日程和写日记）</label><input id="lifeNoteText" type="text" maxlength="120" value="${esc(roleLifeState.noteDraft||'')}" placeholder="例如：周末想去公园散步看枫叶" oninput="roleLifeState.noteDraft=this.value"><div class="life-actions"><button type="button" class="btn life-btn-accent" onclick="roleLifeSaveNote()">保存备注</button><button type="button" class="btn" onclick="roleLifeCancelNoteEditor()">取消</button></div></div>`:'';
+  return `<section class="card life-notes-card"><div class="section-head"><div><h3>生活备注</h3><p>手动记下给角色的日常小提示，供排日程和写日记参考（不会自动抓取聊天内容）。</p></div>${editable&&!open?'<button type="button" class="btn" onclick="roleLifeOpenNoteEditor()">+ 记一条备注</button>':''}</div>${editor}${notes.length?`<ul class="life-notes-list">${notes.map(n=>`<li class="life-note-row"><div><span class="life-prose">${esc(n.text||'')}</span><span class="life-meta">${esc(n.date||'')} · 手动添加</span></div>${editable?`<button type="button" class="life-mini-btn is-danger" data-note-id="${esc(n.id||'')}" onclick="roleLifeDeleteNote(this.dataset.noteId)">删除</button>`:''}</li>`).join('')}</ul>`:!open?'<p class="life-caption">还没有备注，手动添加后会出现在这里。</p>':''}</section>`
+}
+function roleLifeTodayTab(){
+  const s=roleLifeState.data?.status||{},items=Array.isArray(s.plan?.items)?s.plan.items:[];
+  const history=roleLifeState.todayTab==='plans',editable=roleLifeEditable();
+  const tabs=`<div class="life-subtabs" role="tablist" aria-label="日程范围" onkeydown="roleLifeTabKey(event)">${[['today','今天'],['plans','历史日程']].map(([key,title])=>`<button type="button" id="life-day-${key}" class="life-tab ${history===(key==='plans')?'is-active':''}" role="tab" aria-controls="life-day-panel" aria-selected="${history===(key==='plans')}" tabindex="${history===(key==='plans')?0:-1}" onclick="roleLifeSetToday('${key}')">${title}</button>`).join('')}</div>`;
+  return tabs+`<div id="life-day-panel" role="tabpanel" aria-labelledby="life-day-${history?'plans':'today'}">${history?roleLifePlansTab():`<section class="card"><div class="section-head"><div><h3>${esc(s.date||'今天')} · 一天的安排</h3><p>时间按 ${esc(roleLifeZone())} 显示</p></div><div class="life-actions"><span class="pill">${items.length} 项</span>${editable?'<button type="button" class="btn" onclick="roleLifeOpenPlanEditor(\'\')">+ 添加安排</button>':''}</div></div>${roleLifePlanEditorHtml()}
+    ${items.length?roleLifeTimeline(items,false,editable):roleLifeEmpty('今天还没有安排',s.enabled?'可等待自动安排、手动添加或重排今天剩余时段。':'开启角色生活后即可自动生成日程，也可以现在手动添加。','','clock')}
+    <div class="life-actions life-section-footer">${roleLifeActionButton('重排今天剩余安排','roleLifeRegenerate()',{primary:true,enabled:editable&&s.enabled,key:'regenerate_plan:'})}<span class="life-caption">只调整还没开始的活动，保留正在进行和已完成的记录。</span></div></section>${roleLifeNotesCard(editable)}`}</div>`
+}
+function roleLifeRecordsState(kind){
+  const data=roleLifeState.records[kind];
+  if(!data||data.loading&&!Array.isArray(data.items))return '<div class="life-loading" role="status"><span class="life-loader" aria-hidden="true"></span>正在整理记录…</div>';
+  if(data.error)return roleLifeNotice('记录读取失败：'+data.error,'error')+`<div class="life-actions"><button type="button" class="btn" onclick="roleLifeLoadRecords('${kind}')">重新读取</button></div>`;
+  if(data.loading)return '<p class="life-caption" role="status">正在更新，下面暂为上次读取的内容。</p>';
+  if(data.stale)return '<p class="life-caption">下面是上次读取的内容。</p>';
+  return ''
+}
+function roleLifeRecordList(title,desc,kind){
+  const data=roleLifeState.records[kind],items=Array.isArray(data?.items)?data.items:[];
+  const canWrite=roleLifeEditable()&&roleLifeState.data?.status?.enabled;
+  const editableRecords=roleLifeEditable();
+  const action=kind==='diary'?roleLifeActionButton('写日记',"roleLifeEnqueue('diary')",{enabled:canWrite,key:'enqueue:diary'}):kind==='dream'?roleLifeActionButton('生成梦',"roleLifeEnqueue('dream')",{enabled:canWrite,key:'enqueue:dream'}):'';
+  return `<section class="card" aria-busy="${!!data?.loading}"><div class="section-head"><div><h3>${esc(title)}</h3><p>${esc(desc)}</p></div>${action||`<span class="pill">${Number(data?.total||0)} 条</span>`}</div>${roleLifeRecordsState(kind)}
+    ${items.length?`<div class="life-record-list">${items.map(r=>roleLifeRecordCard(r,editableRecords)).join('')}</div>`:data&&!data.loading&&!data.error?roleLifeEmpty('还没有'+title,kind==='dream'?'睡醒后生成的梦境会留在这里。':kind==='diary'?'一天的活动记录整理成日记后会显示在这里。':'活动结束后留下的片段会显示在这里。'):''}
+    ${data?roleLifePager(kind,data):''}</section>`
+}
+function roleLifePlansTab(){
+  const data=roleLifeState.records.plans,items=Array.isArray(data?.items)?data.items:[],days=new Map();
+  for(const item of items){const day=item.date||'历史日程';if(!days.has(day))days.set(day,[]);days.get(day).push(item)}
+  return `<section class="card" aria-busy="${!!data?.loading}"><div class="section-head"><div><h3>走过的日程</h3><p>按日期回顾过去的日程安排。</p></div></div>${roleLifeRecordsState('plans')}
+    ${items.length?[...days].map(([day,records])=>`<section class="life-history-day"><h4>${esc(day)}</h4>${roleLifeTimeline(records)}</section>`).join(''):data&&!data.loading&&!data.error?roleLifeEmpty('还没有历史日程','开启生活后，过去的安排会按日期保留。','','clock'):''}${data?roleLifePager('plans',data):''}</section>`
+}
+function roleLifeJobsTab(){
+  const data=roleLifeState.records.jobs,items=Array.isArray(data?.items)?data.items:[];
+  return `<section class="card" aria-busy="${!!data?.loading}"><div class="section-head"><div><h3>后台任务</h3><p>查看日程、经历、日记与梦的生成记录。</p></div></div>${roleLifeRecordsState('jobs')}
+    ${items.length?`<div class="life-job-list">${items.map(job=>`<article class="life-job"><div class="life-row-head"><div><h4>${esc(roleLifeJobLabel(job.kind))}</h4><p class="life-caption">${esc(roleLifeFmtTime(job.created_at))} · 尝试 ${esc(job.attempts||0)} 次</p></div>${roleLifeStatusPill(job.status)}</div>
+      ${job.error?`<details class="life-job-error" data-life-detail="job-${esc(job.id)}"><summary>${job.status==='unknown'?'请求结果不明，不会自动重发':'查看失败原因'}</summary><pre>${esc(job.error)}</pre></details>`:''}
+      ${['failed','unknown'].includes(job.status)?`<div class="life-actions"><button type="button" class="btn" ${roleLifeEditable()&&!roleLifeBusy()&&roleLifeState.data?.status?.enabled?'':'disabled'} data-job-id="${esc(job.id)}" onclick="roleLifeRetry(this.dataset.jobId)">${roleLifeState.pending?.['retry:'+job.id]?'正在提交…':'重试任务'}</button></div>`:''}</article>`).join('')}</div>`:data&&!data.loading&&!data.error?roleLifeEmpty('后台还很安静','开启生活后，生成的日程、经历、日记和梦会显示在这里。'):''}${data?roleLifePager('jobs',data):''}</section>`
+}
+function roleLifeBooleanField(label,key,desc){
+  const value=!!roleLifeDraftValues()[key];
+  return `<div class="life-toggle-row"><div><label id="life-label-${key}" for="life-field-${key}">${esc(label)}</label><p id="life-help-${key}" class="life-caption">${esc(desc)}</p></div><button type="button" id="life-field-${key}" class="switch ${value?'on':''}" role="switch" aria-checked="${value}" aria-labelledby="life-label-${key}" aria-describedby="life-help-${key}" ${roleLifeEditable()?'':'disabled'} onclick="roleLifeToggle('${key}',this)"></button></div>`
+}
+function roleLifeToggle(key,elNode){
+  if(!roleLifeEditable())return;
+  const next=!roleLifeDraftValues()[key];
+  roleLifeSetDraft(key,next);
+  if(elNode){elNode.classList.toggle('on',next);elNode.setAttribute('aria-checked',String(next))}
+}
+function roleLifeNumberField(label,key,desc,min,max,step){
+  const v=roleLifeDraftValues()[key]??'';
+  return `<div class="life-setting-field"><label for="life-field-${key}">${esc(label)}</label><input id="life-field-${key}" type="number" ${roleLifeEditable()?'':'disabled'} min="${min}" max="${max}" step="${step||1}" value="${esc(v)}" aria-describedby="life-help-${key}" oninput="roleLifeSetDraft('${key}',this.value===''?'':Number(this.value))"><p class="life-caption" id="life-help-${key}">${esc(desc)}</p></div>`
+}
+function roleLifeTextField(label,key,desc,placeholder){
+  const v=roleLifeDraftValues()[key]??'',type=['sleep_start','diary_time'].includes(key)?'time':'text';
+  return `<div class="life-setting-field"><label for="life-field-${key}">${esc(label)}</label><input id="life-field-${key}" type="${type}" ${roleLifeEditable()?'':'disabled'} value="${esc(v)}" placeholder="${esc(placeholder||'')}" aria-describedby="life-help-${key}" oninput="roleLifeSetDraft('${key}',this.value)"><p class="life-caption" id="life-help-${key}">${esc(desc)}</p></div>`
+}
+function roleLifeSelectField(label,key,desc,options){
+  const v=String(roleLifeDraftValues()[key]??'');
+  return `<div class="life-setting-field"><label for="life-field-${key}">${esc(label)}</label><select id="life-field-${key}" ${roleLifeEditable()?'':'disabled'} aria-describedby="life-help-${key}" onchange="roleLifeSetDraft('${key}',this.value)"><option value="">跟随现有判断/对话模型轮换</option>${options.map(o=>`<option value="${esc(o.value||o)}" ${String(o.value||o)===v?'selected':''}>${esc(o.label||o)}</option>`).join('')}${v&&!options.some(o=>String(o.value||o)===v)?`<option value="${esc(v)}" selected>${esc(v)}（当前保存值不可用，将暂停）</option>`:''}</select><p class="life-caption" id="life-help-${key}">${esc(desc)}</p></div>`
+}
+function roleLifeSettingsTab(){
+  const editable=roleLifeEditable(),draft=roleLifeDraftValues();
+  const models=(roleLifeState.data?.models||[]).map(m=>({value:m.label,label:m.label}));
+  const tzOptions=['Asia/Shanghai','Asia/Tokyo','Asia/Singapore','Europe/London','America/New_York','America/Los_Angeles','UTC'];
+  return `<div class="life-settings-layout"><div class="life-settings-main">
+    <section class="card"><div class="section-head"><div><h3>日常里有什么</h3><p>按需开关各项日常内容；后台是否运行由页面顶部的「角色生活总开关」统一控制，修改后点右上角「保存设置」生效。</p></div></div><div class="life-toggle-grid">
+      ${roleLifeBooleanField('每日日程','plan_enabled','为当天安排符合人设的活动')}
+      ${roleLifeBooleanField('活动经历','activity_enabled','活动结束后留下经过和感受')}
+      ${roleLifeBooleanField('睡眠','sleep_enabled','按作息进入睡眠时段；睡着时不主动搭话，发来的消息仍照常回复')}
+      ${roleLifeBooleanField('日记','diary_enabled','按当天经历写一篇简短日记')}
+      ${roleLifeBooleanField('梦','dream_enabled','睡醒后生成一段梦境记录')}
+      ${roleLifeBooleanField('情绪影响回复语气','mood_tone_enabled','把当前心情、精力和刚醒状态柔和融入日常回复')}
+      ${roleLifeBooleanField('节假日与季节感知','env_awareness_enabled','安排日程和写日记时参考星期、季节和节假日')}
+    </div></section>
+    <section class="card"><div class="section-head"><div><h3>作息与节奏</h3><p>按角色自己的时区安排睡眠与日记时间。</p></div></div><div class="life-form-grid life-form-grid-auto">
+      <div class="life-setting-field"><label for="life-field-timezone">时区</label><select id="life-field-timezone" ${editable?'':'disabled'} onchange="roleLifeSetDraft('timezone',this.value)">${tzOptions.map(t=>`<option value="${esc(t)}" ${draft.timezone===t?'selected':''}>${esc(t)}</option>`).join('')}${draft.timezone&&!tzOptions.includes(draft.timezone)?`<option value="${esc(draft.timezone)}" selected>${esc(draft.timezone)}</option>`:''}</select><p class="life-caption">日程和时间显示都按此时区。</p></div>
+      ${roleLifeNumberField('每天安排几件事','activities_per_day','建议 4～6 项，最多 12 项。',1,12)}
+      ${roleLifeTextField('准备睡觉的时间','sleep_start','24 小时制，例如 00:30。','00:30')}
+      ${roleLifeNumberField('睡多久（小时）','sleep_hours','允许 1～12 小时。',1,12)}
+      ${roleLifeTextField('写日记的时间','diary_time','整理当天已经留下的经历。','23:50')}
+    </div></section>
+    <section class="card"><div class="section-head"><div><h3>生活偏好</h3><p>给它一点方向，别把一天规定得太满。</p></div></div><div class="life-setting-field"><label for="roleLifePreference">喜欢怎样生活</label><textarea id="roleLifePreference" maxlength="500" ${editable?'':'disabled'} placeholder="例如：喜欢安静的早晨、做饭和散步，周末给自己多留一点空闲。" oninput="roleLifeSetDraft('preference',this.value)">${esc(draft.preference||'')}</textarea><p class="life-caption">最多 500 字，作为角色安排日常时的参考；人格设定仍在「人格设定」页，切换人设只改变角色性格，不清空已有生活记录。</p></div></section>
+    <details class="card life-advanced" data-life-detail="advanced"><summary><div><h3>高级设置</h3><p>调整使用的模型、状态更新与记录保留。</p></div><span aria-hidden="true">⌄</span></summary><div class="life-advanced-content">
+      <div class="life-form-grid">${roleLifeSelectField('生活模型','model_override','留空则沿用判断/对话模型；指定模型不可用时暂不生成。',models)}${roleLifeNumberField('记录保留天数','retention_days','经历、日记、梦和备注的保留天数。',1,365)}</div>
+      ${roleLifeBooleanField('定期状态更新','maintenance_enabled','默认关闭，开启后定期更新心情与精力。')}
+      <div class="life-form-grid">${roleLifeNumberField('状态更新间隔（秒）','maintenance_interval_seconds','开启定期更新后生效，最短 300 秒。',300,86400)}</div>
+    </div></details>
+    <section class="life-danger-zone"><div><h3>清空角色生活</h3><p>删除日程、经历、日记、梦与备注，不影响聊天记录。</p></div><button type="button" class="life-text-button is-danger" ${editable&&!roleLifeBusy()?'':'disabled'} onclick="roleLifeClear()">清空生活…</button></section>
+  </div></div>`
+}
+function roleLifeDraftReset(){
+  if(roleLifeState.saving)return;
+  roleLifeState.draft=null;roleLifeState.message='';roleLifeState.messageKind='';
+  if(typeof state!=='undefined'&&state&&state.current==='role-life')state.dirty=false;
+  const save=el('saveState');if(save)save.textContent='已同步';
+  roleLifeRender()
+}
+function roleLifeSelector(){return ''}
+function renderRoleLifeInner(){
+  const d=roleLifeState.data;
+  if(!d&&roleLifeState.loading)return `<div class="life-loading-page"><span class="life-loader"></span><strong>正在读取角色生活</strong><p>正在加载本地生活档案…</p></div>`;
+  if(!d)return `<div class="life-error-page">${roleLifeNotice(roleLifeState.error||'角色生活暂时无法读取','error')}<button type="button" class="btn" onclick="loadRoleLife(true)">重新读取</button></div>`;
+  const s=d.status||{},corrupt=s.corrupt||s.read_error,editable=roleLifeEditable(),draft=roleLifeDraftValues();
+  const masterOn=!!draft.enabled;
+  const masterDirty=roleLifeState.draft&&Object.prototype.hasOwnProperty.call(roleLifeState.draft,'enabled');
+  const personaName=String(d.active_persona_name||'').trim()||(d.presets||[]).find(p=>String(p.id)===String(roleLifeState.role||d.role_id))?.name||'默认人设';
+  const body=corrupt&&roleLifeState.tab!=='overview'?`<section class="card life-state-block"><div class="life-empty"><span class="life-empty-icon">${roleLifeIcon('alert')}</span><h3>${s.corrupt?'状态文件不可读':'暂时读取不到状态'}</h3><p>${esc(s.error||(typeof s.read_error==='string'?s.read_error:'请返回概览查看处理方式。'))}</p><button type="button" class="btn" onclick="roleLifeSetTab('overview')">返回概览</button></div></section>`:
+    roleLifeState.tab==='overview'?roleLifeOverview():roleLifeState.tab==='today'?roleLifeTodayTab():roleLifeState.tab==='settings'?roleLifeSettingsTab():roleLifeState.tab==='jobs'?roleLifeJobsTab():
+    `<div class="life-record-page"><div class="life-subtabs" role="tablist" aria-label="生活记录" onkeydown="roleLifeTabKey(event)">${roleLifeTab('活动经历','activity')}${roleLifeTab('日记','diary')}${roleLifeTab('梦','dream')}</div><div id="life-record-panel" role="tabpanel" aria-labelledby="life-record-${roleLifeState.subTab}">${roleLifeState.subTab==='diary'?roleLifeRecordList('日记','按日期阅读角色的日记。','diary'):roleLifeState.subTab==='dream'?roleLifeRecordList('梦','醒来后留下的梦境片段。','dream'):roleLifeRecordList('活动经历','活动结束后留下的日常片段。','activity')}</div></div>`;
+  const runtimeNote=d.runtime_running===false?' · 仅 WebUI（启动主程序后自动推进）':'';
+  const statusPill=masterDirty?(masterOn?'待保存 · 将开启':'待保存 · 将关闭'):(masterOn?'运行中':'已关闭');
+  return `<header class="card role-life-bar"><div class="life-bar-top"><div class="life-bar-identity"><span class="role-life-mark">${roleLifeIcon('leaf')}</span><div class="life-bar-heading"><div class="life-bar-title"><h2>角色生活</h2><span class="pill ${masterOn&&!masterDirty?'ok':''}">${statusPill}</span></div><p class="life-bar-meta" role="status">当前人设：${esc(personaName)} · ${esc(roleLifeZone())} · ${roleLifeState.loading?'正在刷新…':roleLifeState.updatedAt?'上次读取 '+esc(roleLifeFmtTime(roleLifeState.updatedAt/1000,true)):'等待同步'}${runtimeNote}</p></div></div><div class="life-bar-actions"><div class="life-master-control"><label for="life-master-switch">角色生活总开关</label><button type="button" id="life-master-switch" class="switch ${masterOn?'on':''}" role="switch" aria-checked="${masterOn}" aria-label="角色生活总开关" ${editable?'':'disabled'} onclick="roleLifeSetDraft('enabled',!roleLifeDraftValues().enabled)"></button></div><button type="button" class="btn life-refresh-btn" onclick="loadRoleLife(true)" ${roleLifeState.loading?'disabled':''}>${roleLifeState.loading?'读取中…':'刷新'}</button></div></div><div class="life-bar-intro"><p class="life-intro-text">让机器人在后台按作息自己过日子（排日程、留经历、写日记、做梦），正常聊天和主动搭话时会自然带出近期状态，让对话更有活人感。</p></div></header>
+    ${roleLifeState.error?roleLifeNotice('刷新失败，当前保留上次读取的内容：'+roleLifeState.error,'error'):''}
+    ${roleLifeState.message?`<div class="life-page-message ${roleLifeState.messageKind==='error'?'is-error':roleLifeState.messageKind==='success'?'is-success':''}" role="status">${esc(roleLifeState.message)}</div>`:''}
+    <nav class="life-main-tabs" role="tablist" aria-label="角色生活页面" onkeydown="roleLifeTabKey(event)">${ROLE_LIFE_TABS.map(([key,title])=>`<button type="button" id="life-tab-${key}" class="life-tab ${roleLifeState.tab===key?'is-active':''}" role="tab" aria-controls="life-panel-${key}" aria-selected="${roleLifeState.tab===key}" tabindex="${roleLifeState.tab===key?0:-1}" onclick="roleLifeSetTab('${key}')">${esc(title)}</button>`).join('')}</nav>
+    <div id="life-panel-${roleLifeState.tab}" class="role-life-panel" role="tabpanel" aria-labelledby="life-tab-${roleLifeState.tab}">${body}</div>`
+}
+function renderRoleLife(){
+  return `<section class="role-life" id="section_role_life">${renderRoleLifeInner()}</section>`
+}
+// 自动刷新：只在角色生活页且未编辑草稿时轻量重载，避免把正在输入的内容冲掉。
+if(typeof setInterval==='function')setInterval(()=>{if(state.current==='role-life'&&!roleLifeState.loading&&!roleLifeHasDraft()&&!roleLifeBusy()&&!roleLifeState.planEditor&&!roleLifeState.expEditor&&!roleLifeState.noteEditor&&!document.hidden&&roleLifeState.tab!=='settings'&&!(el('section_role_life')?.contains(document.activeElement)&&['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName)))loadRoleLife(false,true)},15000);
 
 const AGENT_LEVEL_LABEL={user:'所有人',admin:'仅管理员'};
 function renderAgent(){

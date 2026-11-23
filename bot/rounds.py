@@ -164,6 +164,14 @@ def message_tokens(message: dict, estimator: "Callable[[str], int] | None" = Non
     if estimator is None:
         from bot.estimate import estimate_tokens as estimator  # 延迟导入，避免循环依赖
     total = estimator(_text(message.get("content")))
+    # Sidecars carry no base64, but rebuilt image blocks still consume a model
+    # budget. Charge a conservative floor instead of treating pictures as free.
+    content = message.get("content")
+    blocks = sum(isinstance(item, dict) and item.get("type") == "image_url"
+                 for item in content) if isinstance(content, list) else 0
+    refs = message.get("image_refs")
+    ref_count = len(refs) if isinstance(refs, list) else 0
+    total += 256 * max(blocks, ref_count)
     for call in message.get("tool_calls") or []:
         if not isinstance(call, dict):
             continue
@@ -204,6 +212,8 @@ def describe_message(message: dict, limit: int = 1000) -> str:
         text = "工具结果: " + _text(message.get("content"))
     else:
         text = {"user": "用户", "assistant": "助手"}.get(role, role) + ": " + _text(message.get("content"))
+    if message.get("image_refs"):
+        text += f" [本轮含{len(message['image_refs'])}张图片]"
     return text[:limit]
 
 

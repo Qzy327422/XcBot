@@ -301,7 +301,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         env["print"] = logs.append
         async def planner(cid, cfg):
             return await env["_proactive_run_planner"](False, cid, cfg)
-        config = {"private": {"enabled": True, "trigger_probability": 0, "observation": {"trigger_probability": 1}}}
+        config = {"private": {"enabled": True, "trigger_probability": 0, "observation": {"enabled": True, "trigger_probability": 1}}}
         scheduler = proactive.ProactiveReplyScheduler(lambda: config, planner, planner, logs.append)
         with tempfile.TemporaryDirectory() as directory, patch.object(proactive, "_STATE_DIR", directory), \
                 patch.object(proactive, "_scheduler", scheduler), \
@@ -392,7 +392,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_initial_wait_invalid_actions_and_model_error_use_default_without_writer(self):
         import tempfile
         from bot import proactive_reply as proactive
-        for decision in ("[WAIT 20]", "[WAIT 90]", "[WAIT nope]", "[PASS]", "[SEND]\n不应发送", None):
+        for decision in ("[WAIT 20]", "[PASS]", "[WAIT 90]", "[WAIT nope]", "[SEND]\n不应发送", None):
             with self.subTest(decision=decision):
                 env, _, calls, sends, _, _ = self.environment([decision])
                 logs, clock = [], [100.0]
@@ -403,7 +403,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                     env["_ProactiveContext"].agen_content = failed
                 async def planner(cid, cfg):
                     return await env["_proactive_run_planner"](False, cid, cfg)
-                scheduler = proactive.ProactiveReplyScheduler(lambda: {"private": {"enabled": True, "observation": {"trigger_probability": 1}}}, planner, planner)
+                scheduler = proactive.ProactiveReplyScheduler(lambda: {"private": {"enabled": True, "observation": {"enabled": True, "trigger_probability": 1}}}, planner, planner)
                 with tempfile.TemporaryDirectory() as directory, patch.object(proactive, "_STATE_DIR", directory), \
                         patch.object(proactive, "_scheduler", scheduler), \
                         patch.object(proactive.time, "time", side_effect=lambda: clock[0]), \
@@ -414,13 +414,15 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(scheduler.complete_normal_reply(False, "123", normal_handled=True,
                         message_id="normal", ticket=ticket, reply_sent=True))
                     await scheduler._tick_async(include_cold=False)
-                    self.assertEqual(scheduler.get_session_state(False, "123")["observation"]["wait_until"],
-                                     120 if decision == "[WAIT 20]" else 160)
+                    if decision == "[PASS]":
+                        self.assertIsNone(scheduler.get_session_state(False, "123")["observation"])
+                    else:
+                        self.assertEqual(scheduler.get_session_state(False, "123")["observation"]["wait_until"],
+                                         120 if decision == "[WAIT 20]" else 160)
                     self.assertFalse(sends)
                     if calls:
                         self.assertEqual(len(calls), 1)
-                        self.assertIn("首次观察时间规划", calls[0][0])
-                        self.assertIn("自主选择", calls[0][1])
+                        self.assertIn("首次观察判断", calls[0][0])
                     scheduler.stop()
 
     async def test_stale_writer_finally_cannot_wait_or_finish_new_normal_episode(self):
@@ -434,7 +436,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                 async def planner(cid, cfg):
                     return await env["_proactive_run_planner"](False, cid, cfg)
                 scheduler = proactive.ProactiveReplyScheduler(lambda: {"private": {"enabled": True,
-                    "trigger_probability": 1, "observation": {"trigger_probability": 1},
+                    "trigger_probability": 1, "observation": {"enabled": True, "trigger_probability": 1},
                     "idle_threshold_seconds": 0, "min_interval_between_proactive_seconds": 0}}, planner, planner)
                 async def generate(writer, prompt, request):
                     ticket = scheduler.notify_user_message_received(False, "123", message_id="new-normal")
@@ -505,6 +507,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             "filter_sensitive_content": lambda text: text,
             "build_llm_user_message": lambda text: text,
             "_merge_extra_user_suffix": lambda text, extra: text,
+            "_history_user_message": lambda context, text, *args, **kwargs: {"role": "user", "content": text},
             "log_api_request": lambda **kwargs: None,
             "log_api_success": lambda **kwargs: None,
         })
@@ -816,6 +819,276 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         env = extracted({"_proactive_parse_reply"}, {})
         for text in ("", "send anything", "[PASS]\n原因", "[SEND]"):
             self.assertFalse(env["_proactive_parse_reply"](text)[0])
+
+    async def test_agent_send_serialized_releases_lock_when_cancelled_mid_wait(self):
+        lock = threading.Lock()
+        env = extracted({"_agent_send_serialized"}, {
+            "asyncio": asyncio, "threading": threading,
+            "_agent_send_lock": lock, "_AGENT_SEND_LOCK_TIMEOUT": 5.0,
+        })
+        lock.acquire()
+        called = []
+
+        async def send_op():
+            called.append(True)
+            return True
+
+        task = asyncio.create_task(env["_agent_send_serialized"](send_op, "text"))
+        await asyncio.sleep(0.02)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        lock.release()
+        await asyncio.sleep(0.05)
+        self.assertFalse(called)
+        self.assertTrue(lock.acquire(timeout=0.5))
+        lock.release()
+
+    def test_build_group_context_record_text_applies_sensitive_filter(self):
+        from bot.group_chat_context import format_group_message
+
+        class Text:
+            def __init__(self, text):
+                self.text = text
+
+        env = extracted({"build_group_context_record_text"}, {
+            "Segments": types.SimpleNamespace(
+                At=type("At", (), {}), Text=Text,
+                Image=type("Image", (), {}), Reply=type("Reply", (), {}),
+            ),
+            "extract_image_urls_from_message": lambda msg: [],
+            "filter_sensitive_content": lambda s: s.replace("违禁词", "***"),
+            "format_group_message": format_group_message,
+        })
+        event = types.SimpleNamespace(user_id=2, message=[Text("你好 违禁词 世界")])
+        out = env["build_group_context_record_text"](event, "群友", "fallback")
+        self.assertNotIn("违禁词", out)
+        self.assertIn("***", out)
+
+    async def test_group_proactive_history_preserves_group_tail_context(self):
+        env, ctx, _, sends, _, _ = self.environment(["[SEND]\nchat", "我也觉得"])
+        self.assertTrue(await env["_proactive_run_planner"](True, "123", {}))
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(ctx.history[-1], {"role": "assistant", "content": "我也觉得"})
+        self.assertEqual(ctx.history[-2]["role"], "user")
+        self.assertIn("群友: 明天考试", ctx.history[-2]["content"])
+
+    async def test_process_and_send_reconciles_partial_send_on_context_history(self):
+        from bot import proactive_reply
+        from bot.message_runtime import CURRENT_REQUEST, MessageIndex, ReplyDecision, RequestState, bind_request
+
+        class Text:
+            def __init__(self, text):
+                self.text = text
+
+        class Reply:
+            def __init__(self, message_id):
+                self.id = str(message_id)
+
+        class Message:
+            def __init__(self, *contents):
+                self.contents = list(contents)
+
+        for fail_at, expected_history in (
+            (1, [{"role": "user", "content": "你好"}, {"role": "assistant", "content": "第一段"}]),
+            (0, [{"role": "user", "content": "你好"}]),
+        ):
+            with self.subTest(fail_at=fail_at):
+                sent_count = {"n": 0}
+
+                class Actions:
+                    async def send(self, **kwargs):
+                        idx = sent_count["n"]
+                        sent_count["n"] += 1
+                        if idx >= fail_at:
+                            return {"status": "failed", "retcode": 1400, "message": "send failed"}
+                        return {"status": "ok", "retcode": 0, "data": {"message_id": 50 + idx}}
+
+                ctx = FakeContext()
+                ctx.history = [
+                    {"role": "user", "content": "你好"},
+                    {"role": "assistant", "content": "第一段<split>第二段"},
+                ]
+                env = {
+                    "asyncio": types.SimpleNamespace(sleep=self._async_noop),
+                    "time": __import__("time"), "random": __import__("random"),
+                    "re": __import__("re"), "threading": threading,
+                    "CURRENT_REQUEST": CURRENT_REQUEST, "INDEX": MessageIndex(),
+                    "_normal_ai_state": lambda: CURRENT_REQUEST.get(),
+                    "Manager": types.SimpleNamespace(Message=Message),
+                    "Segments": types.SimpleNamespace(Text=Text, Reply=Reply),
+                    "get_runtime_others": lambda: {},
+                    "is_feature_enabled": lambda *a, **k: False,
+                    "build_final_send_parts": lambda value: value.split("<split>"),
+                    "find_llm_reply_failover_keyword": lambda value: "",
+                    "is_split_reply_quote_enabled": lambda value: False,
+                    "attach_trace_send": lambda *a, **k: True,
+                    "_current_bot_self_id": "1",
+                    "_consume_social_reply": lambda state: None,
+                    "_agent_actions": lambda actions: actions,
+                    "log_console": lambda *a, **k: None,
+                    "proactive_reply": proactive_reply,
+                }
+                extracted({
+                    "_receipt_succeeded", "_extract_send_message_id",
+                    "send_error_detail", "_reconcile_partial_send_history",
+                    "process_and_send",
+                }, env)
+                event = types.SimpleNamespace(self_id=1, user_id=2, group_id=3, message_id=10)
+                decision = ReplyDecision("1", True, "3", actor_id="2", sample=0.1, source="normal")
+                state = RequestState("1", True, "3", decision, event=event, actions=Actions())
+                with bind_request(state), patch.object(proactive_reply, "notify_bot_message_sent"):
+                    await env["process_and_send"](
+                        state.actions, event, "第一段<split>第二段", True, context=ctx,
+                    )
+                self.assertEqual(ctx.history, expected_history)
+                self.assertGreater(ctx.saved, 0)
+
+    async def test_reconcile_partial_send_targets_exact_entry_across_concurrent_turn(self):
+        from bot import proactive_reply
+        from bot.message_runtime import CURRENT_REQUEST, MessageIndex, ReplyDecision, RequestState, bind_request
+
+        class Text:
+            def __init__(self, text):
+                self.text = text
+
+        class Message:
+            def __init__(self, *contents):
+                self.contents = list(contents)
+
+        for second_text, fail_at, expected_first, expected_second in (
+            ("A<split>B", 1, "A", "A<split>B"),
+            ("第二轮正文", 1, "A", "第二轮正文"),
+            ("第二轮正文", 0, "[此条回复发送失败，用户未收到]", "第二轮正文"),
+        ):
+            with self.subTest(second_text=second_text, fail_at=fail_at):
+                sent_count = {"n": 0}
+                ctx = FakeContext()
+                entry1 = {"role": "assistant", "content": "A<split>B"}
+                entry2 = {"role": "assistant", "content": second_text}
+                ctx.history = [{"role": "user", "content": "一"}, entry1]
+
+                class Actions:
+                    async def send(self, **kwargs):
+                        idx = sent_count["n"]
+                        sent_count["n"] += 1
+                        if idx == 0:
+                            # 模拟第一段等待/发完期间第二轮已写入历史末尾
+                            ctx.history.extend([{"role": "user", "content": "二"}, entry2])
+                        if idx >= fail_at:
+                            return {"status": "failed", "retcode": 1400}
+                        return {"status": "ok", "retcode": 0, "data": {"message_id": 60 + idx}}
+
+                env = {
+                    "asyncio": types.SimpleNamespace(sleep=self._async_noop),
+                    "time": __import__("time"), "random": __import__("random"),
+                    "re": __import__("re"), "threading": threading,
+                    "CURRENT_REQUEST": CURRENT_REQUEST, "INDEX": MessageIndex(),
+                    "_normal_ai_state": lambda: CURRENT_REQUEST.get(),
+                    "Manager": types.SimpleNamespace(Message=Message),
+                    "Segments": types.SimpleNamespace(Text=Text),
+                    "get_runtime_others": lambda: {},
+                    "is_feature_enabled": lambda *a, **k: False,
+                    "build_final_send_parts": lambda value: value.split("<split>"),
+                    "find_llm_reply_failover_keyword": lambda value: "",
+                    "is_split_reply_quote_enabled": lambda value: False,
+                    "attach_trace_send": lambda *a, **k: True,
+                    "_current_bot_self_id": "1",
+                    "_consume_social_reply": lambda state: None,
+                    "_agent_actions": lambda actions: actions,
+                    "log_console": lambda *a, **k: None,
+                    "proactive_reply": proactive_reply,
+                }
+                extracted({
+                    "_receipt_succeeded", "_extract_send_message_id",
+                    "send_error_detail", "_reconcile_partial_send_history",
+                    "process_and_send",
+                }, env)
+                event = types.SimpleNamespace(self_id=1, user_id=2, group_id=3, message_id=10)
+                state = RequestState(
+                    "1", True, "3",
+                    ReplyDecision("1", True, "3", actor_id="2", sample=0.1, source="normal"),
+                    event=event, actions=Actions(),
+                )
+                state._last_assistant_entry = entry1
+                with bind_request(state), patch.object(proactive_reply, "notify_bot_message_sent"):
+                    await env["process_and_send"](
+                        state.actions, event, "A<split>B", True, context=ctx,
+                    )
+                self.assertEqual(entry1["content"], expected_first)
+                self.assertEqual(entry2["content"], expected_second)
+
+    async def test_proactive_send_saves_history_even_when_continuation_or_lock_contended(self):
+        env, ctx, _, sends, notes, permit = self.environment(["[SEND]\nchat", "第一句<split>第二句"])
+        orig_send = env["_current_qq_actions"].send
+
+        async def racing_send(**kwargs):
+            res = await orig_send(**kwargs)
+            # 第一段刚收到成功回执后，模拟熔断/资格翻转为 False 且锁被短暂占用
+            permit["value"] = False
+            return res
+
+        env["_current_qq_actions"].send = racing_send
+        self.assertTrue(await env["_proactive_run_planner"](False, "123", {}))
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(ctx.history[-1], {"role": "assistant", "content": "第一句"})
+        self.assertEqual(ctx.saved, 1)
+
+    async def test_poke_fallback_syncs_assistant_history_before_reconcile(self):
+        from bot import proactive_reply
+        from bot.message_runtime import CURRENT_REQUEST, MessageIndex, ReplyDecision, RequestState, bind_request
+        ctx = FakeContext()
+        long_entry = {"role": "assistant", "content": "很长" * 150}
+        ctx.history = [{"role": "user", "content": "拍了拍你"}, long_entry]
+        env = {
+            "asyncio": types.SimpleNamespace(sleep=self._async_noop),
+            "time": __import__("time"), "random": __import__("random"),
+            "re": __import__("re"), "threading": threading,
+            "CURRENT_REQUEST": CURRENT_REQUEST, "INDEX": MessageIndex(),
+            "_normal_ai_state": lambda: CURRENT_REQUEST.get(),
+            "Manager": types.SimpleNamespace(Message=lambda *x: x),
+            "Segments": types.SimpleNamespace(Text=lambda x: x),
+            "get_runtime_others": lambda: {},
+            "is_feature_enabled": lambda *a, **k: False,
+            "build_final_send_parts": lambda value: value.split("<split>"),
+            "find_llm_reply_failover_keyword": lambda value: "",
+            "is_split_reply_quote_enabled": lambda value: False,
+            "attach_trace_send": lambda *a, **k: True,
+            "_current_bot_self_id": "1",
+            "_consume_social_reply": lambda state: None,
+            "_agent_actions": lambda actions: actions,
+            "log_console": lambda *a, **k: None,
+            "proactive_reply": proactive_reply,
+        }
+        extracted({
+            "_receipt_succeeded", "_extract_send_message_id",
+            "send_error_detail", "_sync_assistant_history_text",
+            "_reconcile_partial_send_history", "process_and_send",
+        }, env)
+        env["_sync_assistant_history_text"](ctx, long_entry, "被测试拍到了！")
+        self.assertEqual(long_entry["content"], "被测试拍到了！")
+
+        class FailActions:
+            async def send(self, **kwargs):
+                return {"status": "failed", "retcode": 1400}
+
+        event = types.SimpleNamespace(self_id=1, user_id=2, group_id=None, message_id=10)
+        state = RequestState(
+            "1", False, "2",
+            ReplyDecision("1", False, "2", actor_id="2", sample=0.1, source="normal"),
+            event=event, actions=FailActions(),
+        )
+        with bind_request(state), patch.object(proactive_reply, "notify_bot_message_sent"):
+            await env["process_and_send"](
+                state.actions, event, "被测试拍到了！", False,
+                context=ctx, history_entry=long_entry,
+            )
+        self.assertEqual(ctx.history, [{"role": "user", "content": "拍了拍你"}])
+
+    @staticmethod
+    async def _async_noop(_=0):
+        return None
 
 
 if __name__ == "__main__":
