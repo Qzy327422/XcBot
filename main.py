@@ -8103,6 +8103,7 @@ async def _generate_proactive_content(writer, prompt, request):
                        user_level="user", actions=None, event=None,
                        extra={"self_id": request.self_id, "social": request.social})
     messages = writer._build_messages(prompt)
+    _pro_cur_turn_start = max(1, len(messages) - (1 if prompt is not None else 0)) if messages else 0
     totals = [0, 0, 0]
     cached_total = 0
     reasoning_parts, attempts = [], []
@@ -8138,6 +8139,26 @@ async def _generate_proactive_content(writer, prompt, request):
                 kwargs["reasoning_effort"] = extra["reasoning_effort"]
             import copy as _copy_mod
             req_snapshot = {**_copy_mod.deepcopy(kwargs), "display_model": display or model, "base_url": base}
+            _pro_raw_msgs = req_snapshot.get("messages")
+            if isinstance(_pro_raw_msgs, list) and _pro_raw_msgs:
+                _pro_hist_start = 1 if _pro_raw_msgs[0].get("role") == "system" else 0
+                _pro_cur_start = min(len(_pro_raw_msgs), max(_pro_hist_start, int(_pro_cur_turn_start)))
+                if _pro_cur_start > _pro_hist_start:
+                    req_snapshot["messages"] = _pro_raw_msgs[:_pro_hist_start] + _pro_raw_msgs[_pro_cur_start:]
+            if isinstance(req_snapshot.get("tools"), list):
+                _pro_tool_names = [
+                    (
+                        str((t.get("function") or {}).get("name") or t.get("name") or "").strip()
+                        if isinstance(t, dict)
+                        else str(t or "").strip()
+                    )
+                    for t in req_snapshot["tools"]
+                ]
+                _pro_tool_names = [n for n in _pro_tool_names if n]
+                if _pro_tool_names:
+                    req_snapshot["tools"] = _pro_tool_names
+                else:
+                    req_snapshot.pop("tools", None)
             last_request_payload = req_snapshot
             if callable(_log_req):
                 try:
@@ -10085,6 +10106,7 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                             self, message, supports_multimodal, direct_image_mode)
                         relay_total_tokens, relay_prompt_tokens, relay_completion_tokens = relay_usage
                         messages = self._build_messages(supports_multimodal=supports_multimodal)
+                        _t_cur_turn_start = len(messages)
                         _raw_user_text = build_llm_user_message(user_content)
                         if callable(_compose_user):
                             request_user_text = _compose_user(
@@ -10130,6 +10152,7 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                             if _now_str:
                                 request_user_text += f"\n\n<system_reminder>Current time: {_now_str}</system_reminder>"
                         messages = self._build_messages(request_user_text, supports_multimodal=supports_multimodal)
+                        _t_cur_turn_start = max(1, len(messages) - 1) if messages else 0
 
                     _last_user_content = user_content
 
@@ -10190,6 +10213,26 @@ class EnhancedLimitedDeepSeekContext(LimitedDeepSeekContext):
                                         "display_model": display_model,
                                         "base_url": base_url,
                                     }
+                                    _raw_msgs = _snap.get("messages")
+                                    if isinstance(_raw_msgs, list) and _raw_msgs:
+                                        _hist_start = 1 if _raw_msgs[0].get("role") == "system" else 0
+                                        _cur_start = min(len(_raw_msgs), max(_hist_start, int(_t_cur_turn_start)))
+                                        if _cur_start > _hist_start:
+                                            _snap["messages"] = _raw_msgs[:_hist_start] + _raw_msgs[_cur_start:]
+                                    if isinstance(_snap.get("tools"), list):
+                                        _snap_tool_names = [
+                                            (
+                                                str((t.get("function") or {}).get("name") or t.get("name") or "").strip()
+                                                if isinstance(t, dict)
+                                                else str(t or "").strip()
+                                            )
+                                            for t in _snap["tools"]
+                                        ]
+                                        _snap_tool_names = [n for n in _snap_tool_names if n]
+                                        if _snap_tool_names:
+                                            _snap["tools"] = _snap_tool_names
+                                        else:
+                                            _snap.pop("tools", None)
                                     _t_req_state["attempt"] = _snap
                                     _t_req_state["last"] = _snap
                             except Exception:

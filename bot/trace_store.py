@@ -373,11 +373,39 @@ class TraceStore:
         return str(value)
 
     @classmethod
+    def _compact_tool_names(cls, tools: Any) -> list[str]:
+        names: list[str] = []
+        if not isinstance(tools, list):
+            return names
+        for item in tools:
+            name = ""
+            if isinstance(item, str):
+                name = item.strip()
+            elif isinstance(item, dict):
+                fn = item.get("function")
+                if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+                    name = fn["name"].strip()
+                elif isinstance(item.get("name"), str):
+                    name = item["name"].strip()
+            if name:
+                names.append(name)
+        return names
+
+    @classmethod
     def _sanitize_request_payload(cls, payload: Any) -> dict:
         if not isinstance(payload, dict) or not payload:
             return {}
         clean = cls._sanitize_json_value(payload, 0)
-        return clean if isinstance(clean, dict) else {}
+        if not isinstance(clean, dict):
+            return {}
+        clean.pop("omitted_history_messages", None)
+        if "tools" in clean:
+            tool_names = cls._compact_tool_names(clean.get("tools"))
+            if tool_names:
+                clean["tools"] = tool_names
+            else:
+                clean.pop("tools", None)
+        return clean
 
     def _sanitize_attempts(self, attempts: Any) -> list[dict]:
         rows: list[dict] = []

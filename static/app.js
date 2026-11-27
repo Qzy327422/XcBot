@@ -1318,14 +1318,6 @@ function traceResolveRequest(d){
   }
   return {payload,attempts:withReq,selectedIdx,isLegacy};
 }
-function traceCopyRequest(){
-  const d=traceState.detail;if(!d)return;
-  const {payload}=traceResolveRequest(d);
-  const text=JSON.stringify(payload||{},null,2);
-  if(navigator.clipboard?.writeText){
-    navigator.clipboard.writeText(text).then(()=>toast('已复制完整请求 JSON',true)).catch(()=>toast('复制失败',false));
-  }else{toast('当前浏览器不支持一键复制',false)}
-}
 function traceFormatMsgContent(content){
   if(content==null)return '--';
   if(typeof content==='string')return content;
@@ -1347,10 +1339,11 @@ function renderTraceRequestCard(d){
   const {payload,attempts,selectedIdx,isLegacy}=traceResolveRequest(d);
   const open=!!traceState.reqOpen;
   const msgs=Array.isArray(payload?.messages)?payload.messages:[];
-  const tools=Array.isArray(payload?.tools)?payload.tools:[];
+  const rawTools=Array.isArray(payload?.tools)?payload.tools:[];
+  const toolNames=rawTools.map(t=>typeof t==='string'?t.trim():String(t?.function?.name||t?.name||'').trim()).filter(Boolean);
   const modelName=payload?.display_model||payload?.model||d.display_model||d.model||'--';
   const summaryParts=[`模型 ${modelName}`,`${msgs.length} 条 messages`];
-  if(tools.length)summaryParts.push(`${tools.length} 个 tools`);
+  if(toolNames.length)summaryParts.push(`${toolNames.length} 个 tools`);
   if(payload?.reasoning_effort)summaryParts.push(`思考 ${payload.reasoning_effort}`);
   const rightPill=attempts.length>1?`${attempts.length} 次尝试`:(isLegacy?'旧版记录':`${msgs.length} 条`);
   let body='';
@@ -1364,10 +1357,14 @@ function renderTraceRequestCard(d){
     if(payload?.reasoning_effort)metaPills.push(`<span class="pill">reasoning_effort: ${esc(payload.reasoning_effort)}</span>`);
     if(payload?.tool_choice)metaPills.push(`<span class="pill">tool_choice: ${esc(typeof payload.tool_choice==='string'?payload.tool_choice:JSON.stringify(payload.tool_choice))}</span>`);
     if(payload?.timeout!=null)metaPills.push(`<span class="pill">timeout: ${esc(payload.timeout)}s</span>`);
-    if(tools.length)metaPills.push(`<span class="pill">tools: ${esc(tools.length)}</span>`);
+    if(toolNames.length)metaPills.push(`<span class="pill">tools: ${esc(toolNames.length)}</span>`);
+    const displayPayload=payload&&typeof payload==='object'?{...payload}:{};
+    delete displayPayload.omitted_history_messages;
+    if(toolNames.length)displayPayload.tools=toolNames;
+    else delete displayPayload.tools;
     let detailHtml='';
     if(mode==='raw'){
-      detailHtml=`<pre class="trace-text trace-json">${esc(JSON.stringify(payload||{},null,2))}</pre>`;
+      detailHtml=`<pre class="trace-text trace-json">${esc(JSON.stringify(displayPayload,null,2))}</pre>`;
     }else{
       const msgHtml=msgs.length?`<div class="trace-msg-list">${msgs.map((m,i)=>{
         const role=String(m?.role||'unknown').toLowerCase();
@@ -1377,12 +1374,12 @@ function renderTraceRequestCard(d){
         const chars=(formatted||'').length+tcJson.length;
         return `<div class="field trace-msg-item"><div class="trace-msg-head"><b>#${i+1}</b><span class="trace-role-badge ${roleCls}">${esc(role)}</span>${m?.name?`<span class="pill">${esc(m.name)}</span>`:''}${m?.tool_call_id?`<span class="pill">call_id: ${esc(m.tool_call_id)}</span>`:''}<span class="pill">${esc(chars)} 字</span></div>${formatted?`<div class="trace-text">${esc(formatted)}</div>`:''}${tcJson?`<div class="desc" style="margin:6px 0 4px">tool_calls</div><div class="trace-text">${esc(tcJson)}</div>`:''}</div>`;
       }).join('')}</div>`:'<div class="desc">无 messages 字段</div>';
-      const toolsHtml=tools.length?`<details class="trace-tools-fold"><summary><span>工具定义（tools · ${tools.length} 个）</span><span class="desc" style="margin:0">点击查看 Schema</span></summary><pre class="trace-text trace-json">${esc(JSON.stringify(tools,null,2))}</pre></details>`:'';
+      const toolsHtml=toolNames.length?`<details class="trace-tools-fold"><summary><span>挂载工具（tools · ${toolNames.length} 个）</span><span class="desc" style="margin:0">点击查看列表</span></summary><pre class="trace-text trace-json">${esc(JSON.stringify(toolNames,null,2))}</pre></details>`:'';
       detailHtml=msgHtml+toolsHtml;
     }
-    body=`<div class="trace-fold-body">${isLegacy?'<div class="desc" style="margin-bottom:10px">该条为旧版追踪记录，仅保留了系统提示词；之后的新对话将记录完整请求体。</div>':''}<div class="trace-req-bar">${attemptBar}<div class="trace-req-actions"><button type="button" class="btn ${mode==='structured'?'primary':''}" onclick="traceSetReqMode('structured')">分块视图</button><button type="button" class="btn ${mode==='raw'?'primary':''}" onclick="traceSetReqMode('raw')">原始 JSON</button><button type="button" class="btn" onclick="traceCopyRequest()">复制 JSON</button></div></div>${metaPills.length?`<div class="trace-req-meta">${metaPills.join('')}</div>`:''}${detailHtml}</div>`;
+    body=`<div class="trace-fold-body">${isLegacy?'<div class="desc" style="margin-bottom:10px">该条为旧版追踪记录，仅保留了系统提示词；之后的新对话将记录完整请求体。</div>':''}<div class="trace-req-bar">${attemptBar}<div class="trace-req-actions"><button type="button" class="btn ${mode==='structured'?'primary':''}" onclick="traceSetReqMode('structured')">分块视图</button><button type="button" class="btn ${mode==='raw'?'primary':''}" onclick="traceSetReqMode('raw')">原始 JSON</button></div></div>${metaPills.length?`<div class="trace-req-meta">${metaPills.join('')}</div>`:''}${detailHtml}</div>`;
   }
-  return `<div class="card" id="traceRequestCard"><div class="section-head trace-fold-head" style="${open?'':'margin-bottom:0'}" onclick="traceToggleReq()"><div><h3>最终发送请求</h3><p>${esc(summaryParts.join(' · '))} · 点击${open?'收起':'展开'}</p></div><div class="trace-fold-right"><span class="pill">${esc(rightPill)}</span><span class="trace-caret ${open?'is-open':''}" aria-hidden="true">${TRACE_CARET_SVG}</span></div></div>${body}</div>`;
+  return `<div class="card" id="traceRequestCard"><div class="section-head trace-fold-head" style="${open?'':'margin-bottom:0'}" onclick="traceToggleReq()"><div><h3>请求体预览</h3><p>${esc(summaryParts.join(' · '))} · 点击${open?'收起':'展开'}</p></div><div class="trace-fold-right"><span class="pill">${esc(rightPill)}</span><span class="trace-caret ${open?'is-open':''}" aria-hidden="true">${TRACE_CARET_SVG}</span></div></div>${body}</div>`;
 }
 function traceTogglePending(){return traceState.savedEnabled!==null&&traceState.enabled!==null&&!!traceState.enabled!==!!traceState.savedEnabled}
 function traceToggle(sw){

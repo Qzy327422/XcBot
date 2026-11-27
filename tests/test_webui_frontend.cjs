@@ -1257,7 +1257,7 @@ test('弹窗回车即时渲染、日志自动滚动、统计页升级、追踪�
   assert.doesNotMatch(statsHtml,/仅统计真正触发 Bot 的消息/);
   assert.doesNotMatch(statsHtml,/统计说明/);
 
-  // 4. Trace detail defaults 最终发送请求 and 上下文历史 to collapsed, supports retry attempt switching & raw JSON toggle
+  // 4. Trace detail defaults 请求体预览 and 上下文历史 to collapsed, supports retry attempt switching & raw JSON toggle
   vm.runInContext(section('let traceState=', '// 自检结果存在这里'),h.context);
   h.run(`
     traceState.openId='t1';
@@ -1268,26 +1268,36 @@ test('弹窗回车即时渲染、日志自动滚动、统计页升级、追踪�
       system_prompt:'sys prompt',prompt_chars:10,user_message:'hi',reply:'hello',
       history_count:1,history_overview:[{role:'user',chars:4,content:'prev'}],
       tokens:{prompt:500,completion:100,cached:200,total:600},
-      request_payload:{model:'m2',display_model:'p1/m2',stream:false,messages:[{role:'system',content:'sys2'},{role:'user',content:'hi'}]},
+      request_payload:{model:'m2',display_model:'p1/m2',stream:false,omitted_history_messages:2,messages:[{role:'system',content:'sys2'},{role:'user',content:'hi'}],tools:['web_search','read_file']},
       attempts:[
-        {index:0,ok:false,model:'m1',display_model:'p1/m1',duration_ms:400,category:'rate_limit',error:'429',request_payload:{model:'m1',display_model:'p1/m1',messages:[{role:'system',content:'sys1'}]}},
-        {index:1,ok:true,model:'m2',display_model:'p1/m2',duration_ms:1100,category:'success',request_payload:{model:'m2',display_model:'p1/m2',messages:[{role:'system',content:'sys2'},{role:'user',content:'hi'}]}}
+        {index:0,ok:false,model:'m1',display_model:'p1/m1',duration_ms:400,category:'rate_limit',error:'429',request_payload:{model:'m1',display_model:'p1/m1',messages:[{role:'system',content:'sys1'}],tools:[{type:'function',function:{name:'legacy_tool',parameters:{type:'object',properties:{path:{type:'string'}}}}}]}},
+        {index:1,ok:true,model:'m2',display_model:'p1/m2',duration_ms:1100,category:'success',request_payload:{model:'m2',display_model:'p1/m2',omitted_history_messages:2,messages:[{role:'system',content:'sys2'},{role:'user',content:'hi'}],tools:['web_search','read_file']}}
       ]
     };
   `);
   const collapsedTrace=h.run('renderTraceDetail()');
-  assert.match(collapsedTrace,/最终发送请求/);
+  assert.match(collapsedTrace,/请求体预览/);
+  assert.match(collapsedTrace,/2 条 messages/);
+  assert.doesNotMatch(collapsedTrace,/最终发送请求/);
+  assert.doesNotMatch(collapsedTrace,/已略去/);
   assert.doesNotMatch(collapsedTrace,/当次系统提示词/);
   assert.doesNotMatch(collapsedTrace,/sys2/);
   assert.doesNotMatch(collapsedTrace,/prev/);
   h.run(`traceState.reqOpen=true;`);
   const expandedFinal=h.run('renderTraceDetail()');
   assert.match(expandedFinal,/sys2/);
+  assert.match(expandedFinal,/web_search/);
+  assert.doesNotMatch(expandedFinal,/复制 JSON/);
+  assert.doesNotMatch(expandedFinal,/已略去/);
+  assert.doesNotMatch(expandedFinal,/omitted_history_messages/);
   assert.match(expandedFinal,/#1 p1\/m1 \(失败\)/);
   assert.match(expandedFinal,/#2 p1\/m2 \(成功 · 最终\)/);
   h.run(`traceState.reqAttempt=0;traceState.reqMode='raw';`);
   const expandedFirstRaw=h.run('renderTraceDetail()');
   assert.match(expandedFirstRaw,/sys1/);
+  assert.match(expandedFirstRaw,/legacy_tool/);
+  assert.doesNotMatch(expandedFirstRaw,/parameters/);
+  assert.doesNotMatch(expandedFirstRaw,/properties/);
   assert.match(expandedFirstRaw,/&quot;model&quot;: &quot;m1&quot;/);
 
   // 5. MCP save unified into saveAll(), no duplicate inner 保存配置 button, rename updates data-mcp-name

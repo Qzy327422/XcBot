@@ -30,7 +30,7 @@
   "_comment_protocol": "协议类型，固定 OneBot。Hyper 框架启动时硬索引此字段，改成其他值会启动失败。",
   "Others": {
     "project_name": "XcBot",
-    "version_name": "v4.2",
+    "version_name": "v4.2.1",
     "slogan": "✨ 忻城 ✨",
     "robot_name_triggers": [
       "忻城"

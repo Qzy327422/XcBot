@@ -298,6 +298,186 @@ class PromptStructureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<role_life", stored_user)
         self.assertNotIn("<current_time>", stored_user)
 
+    async def test_trace_request_payload_omits_history_while_keeping_llm_messages(self):
+        import copy as _copy
+        import time as _time
+        from bot.agent_context import AgentTurnContext
+        from bot.rounds import extract_agent_trail, fix_messages, split_into_rounds
+        import bot.agent_stream as _agent_stream_mod
+
+        _src = MAIN_PATH.read_text(encoding="utf-8")
+        _tree = ast.parse(_src, filename=str(MAIN_PATH))
+        cls_node = next(n for n in _tree.body if isinstance(n, ast.ClassDef) and n.name == "EnhancedLimitedDeepSeekContext")
+
+        seen_payload_msgs = []
+        seen_payload_tools = []
+        recorded_traces = []
+
+        async def fake_req_completion(client, kwargs, timeout=None, stream_callback=None, reasoning_callback=None, abort=None):
+            seen_payload_msgs.append(_copy.deepcopy(list(kwargs.get("messages") or [])))
+            seen_payload_tools.append(_copy.deepcopy(list(kwargs.get("tools") or [])))
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="当前回复", tool_calls=None))],
+                usage=SimpleNamespace(total_tokens=20, prompt_tokens=15, completion_tokens=5),
+            )
+
+        class _BaseCtx:
+            def __init__(self, system_prompt="", *args, **kwargs):
+                self.system_prompt = system_prompt
+                self.history = [
+                    {"role": "user", "content": "历史问题1"},
+                    {"role": "assistant", "content": "历史回答1"},
+                ]
+                self.max_rounds = 10
+                self.max_context_tokens = 0
+                self._history_lock = threading.Lock()
+                self.total_tokens = 0
+                self.total_calls = 0
+                self.auto_compress_enabled = False
+                self.compressor = None
+                self.session_id = "group_1002"
+                self.context_type = "group"
+                self.chat_id = "1002"
+
+            def _clean_content(self, c):
+                return str(c or "")
+
+            def _get_client(self, *a, **kw):
+                return object()
+
+            def _build_messages(self, user_prompt=None, **kw):
+                msgs = [{"role": "system", "content": self.system_prompt}]
+                for m in self.history:
+                    msgs.append({"role": m.get("role", "user"), "content": m.get("content", "")})
+                if user_prompt is not None:
+                    msgs.append({"role": "user", "content": user_prompt})
+                return msgs
+
+            def _enforce_message_limit(self):
+                pass
+
+            def get_message_count(self):
+                return len(self.history)
+
+        async def _acquire_lock(lock, timeout=None):
+            lock.acquire()
+            return True
+
+        async def _fake_prepare_turn_images(ctx_s, msg, supports_mm, direct=False):
+            return str(msg.get("text", "")), [], [], (0, 0, 0)
+
+        class _FakeKM:
+            def get_attempt_count(self):
+                return 1
+
+            def get_next_for_request(self, **kw):
+                return ("https://mock/v1", "KEY-1", "mock-m", False, 10, "mock-m", "", {})
+
+            def make_attempt_identity(self, *a):
+                return a
+
+            def mark_success(self, *a, **kw):
+                pass
+
+        _dummy_tool_name = "_trace_compact_dummy_tool"
+        bot_agent.REGISTRY._tools[_dummy_tool_name] = bot_agent.ToolSpec(
+            name=_dummy_tool_name,
+            description="dummy schema",
+            parameters={"type": "object", "properties": {"query": {"type": "string", "description": "kw"}}, "required": ["query"]},
+            handler=lambda args, ctx: "ok",
+            level="user",
+        )
+        env = {
+            "asyncio": asyncio,
+            "datetime": datetime,
+            "threading": threading,
+            "re": re,
+            "time": _time,
+            "copy": _copy,
+            "ContextCompressor": object,
+            "LimitedDeepSeekContext": _BaseCtx,
+            "_normal_ai_state": lambda: None,
+            "key_manager": _FakeKM(),
+            "is_agent_enabled_for": lambda is_grp, cid: True,
+            "get_agent_settings": lambda: bot_agent.AgentSettings(
+                enabled=True, max_rounds=3, retry_attempts=1, show_time=False,
+                enabled_tools={_dummy_tool_name: True}, allowed_names={_dummy_tool_name},
+            ),
+            "build_agent_context": lambda **kw: bot_agent.AgentContext(user_id="778899", is_group=True, user_level="user", extra={}),
+            "_agent_fs_tools": SimpleNamespace(primary_root=lambda ctx: "."),
+            "AGENT_REGISTRY": bot_agent.REGISTRY,
+            "is_trace_recording": lambda: True,
+            "add_trace_record": lambda rec: (recorded_traces.append(rec) or "trace_1"),
+            "_agent_trace_calls": lambda ctx: [],
+            "_agent_trace_follow_ups": lambda ctx: [],
+            "AgentTurnContext": AgentTurnContext,
+            "extract_agent_trail": extract_agent_trail,
+            "fix_messages": fix_messages,
+            "split_into_rounds": split_into_rounds,
+            "get_runtime_setting": lambda *a, **kw: {},
+            "get_runtime_others": lambda: {},
+            "normalize_bool_config": lambda v, default=False: bool(v),
+            "get_multimodal_image_mode": lambda: "relay",
+            "get_configured_multimodal_model": lambda: "",
+            "_prepare_history_turn_images": _fake_prepare_turn_images,
+            "_merge_extra_user_suffix": lambda a, b: a + ("\n\n" + b if b else ""),
+            "_role_life_apply_to_context": lambda ctx, msg: "",
+            "_follow_ups_context_suffix": lambda ctx: "",
+            "user_cfg": {"auto_compress_after_messages": 40},
+            "clamp_compression_trigger_rounds": lambda a, b: a,
+            "log_api_request": lambda *a, **kw: None,
+            "log_api_success": lambda *a, **kw: None,
+            "log_api_failure": lambda *a, **kw: None,
+            "add_token_usage": lambda *a, **kw: None,
+            "split_reasoning_output": lambda msg: (msg.content, ""),
+            "_extract_tool_calls": lambda msg: msg.tool_calls,
+            "tool_call_names": lambda calls: [],
+            "check_final_reply_for_failover": lambda text: None,
+            "filter_sensitive_content": lambda s: str(s or ""),
+            "_history_user_message": lambda ctx, content, refs, msgs: {"role": "user", "content": content},
+            "_format_exc_text": lambda e: str(e),
+            "acquire_history_lock": _acquire_lock,
+            "_HISTORY_LOCK_TIMEOUT": 5.0,
+            "AGENT_ABORTS": SimpleNamespace(begin=lambda sid: None, end=lambda sid: None),
+            "ReplySuppressed": type("ReplySuppressed", (Exception,), {}),
+            "traceback": __import__("traceback"),
+            "ReplyKeywordFailure": ValueError,
+            "AgentContext": bot_agent.AgentContext,
+            "run_tool_loop": bot_agent.run_tool_loop,
+            "_run_tool_loop": bot_agent.run_tool_loop,
+            "print": lambda *a, **kw: None,
+        }
+        _exec_main(env, "_xml_attr", "_compose_llm_user_prompt", "build_llm_user_message", "build_openai_message_content")
+        exec(compile(ast.Module(body=[cls_node], type_ignores=[]), str(MAIN_PATH), "exec"), env)
+
+        ctx_obj = env["EnhancedLimitedDeepSeekContext"](system_prompt="你是测试助手", session_id="group_1002", context_type="group", chat_id="1002")
+        ctx_obj._save_memory = lambda: True
+        ctx_obj._prune_history_images = lambda: None
+        orig_fn = _agent_stream_mod.request_chat_completion
+        _agent_stream_mod.request_chat_completion = fake_req_completion
+        try:
+            await ctx_obj.agen_content({"text": "最新消息"}, agent_meta={"user_id": "778899"})
+        finally:
+            _agent_stream_mod.request_chat_completion = orig_fn
+            bot_agent.REGISTRY._tools.pop(_dummy_tool_name, None)
+
+        # 实际发送给模型的消息仍然包含全部历史上下文，且 tools 仍是完整 schema
+        self.assertEqual(len(seen_payload_msgs[-1]), 4)
+        self.assertEqual([m["content"] for m in seen_payload_msgs[-1][1:3]], ["历史问题1", "历史回答1"])
+        self.assertEqual(seen_payload_tools[-1][0]["function"]["name"], _dummy_tool_name)
+        self.assertIn("parameters", seen_payload_tools[-1][0]["function"])
+
+        # Trace 的「请求体预览」只保留 system + 当轮消息，不带 omitted_history_messages，tools 精简为纯工具名列表
+        trace = recorded_traces[-1]
+        self.assertEqual(trace["history_count"], 2)
+        req_payload = trace["request_payload"]
+        self.assertNotIn("omitted_history_messages", req_payload)
+        self.assertEqual(req_payload["tools"], [_dummy_tool_name])
+        self.assertEqual(len(req_payload["messages"]), 2)
+        self.assertEqual(req_payload["messages"][0]["role"], "system")
+        self.assertIn("最新消息", req_payload["messages"][1]["content"])
+        self.assertNotIn("历史问题1", str(req_payload["messages"]))
+
 
 if __name__ == "__main__":
     unittest.main()

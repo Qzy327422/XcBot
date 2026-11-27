@@ -831,7 +831,7 @@ class BatchFixesAndUpgradesTests(unittest.TestCase):
             store.save(force=True)
             detail = store.get_record(tid)
             self.assertEqual(detail["request_payload"]["model"], "m2")
-            self.assertEqual(len(detail["request_payload"]["tools"]), 1)
+            self.assertEqual(detail["request_payload"]["tools"], ["web_search"])
             att0_req = detail["attempts"][0]["request_payload"]
             self.assertNotIn("api_key", att0_req)
             img_val = att0_req["messages"][0]["content"][0]["image_url"]["url"]
