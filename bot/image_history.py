@@ -226,15 +226,20 @@ async def prepare_turn_images(context, message, store, *, download, relay,
 
 
 async def describe_retained_images(context, store, *, relay, state=None, visible=None, index=None):
-    """For a text-only model describe only the latest retained image-bearing turn."""
+    """For a text-only model describe the latest retained turn with visible images."""
     scope = scope_for(context, state)
     allowed = lambda ref: ref_visible(ref, state, visible=visible, index=index)
-    latest = next((msg for msg in reversed(getattr(context, "history", []))
-                   if msg.get("image_refs") and (visible is None or visible(msg))), None)
-    if latest is None:
-        return (0, 0, 0)
-    refs = [ref for ref in latest["image_refs"] if allowed(ref)]
-    if not refs or store.describe_refs(scope, refs, visible=allowed):
+    latest = None
+    refs = []
+    for msg in reversed(getattr(context, "history", [])):
+        if not msg.get("image_refs") or (visible is not None and not visible(msg)):
+            continue
+        candidate_refs = [ref for ref in msg["image_refs"] if allowed(ref)]
+        if candidate_refs:
+            latest = msg
+            refs = candidate_refs
+            break
+    if latest is None or not refs or store.describe_refs(scope, refs, visible=allowed):
         return (0, 0, 0)
     missing = refs
     signature = history_signature(missing)
@@ -383,18 +388,15 @@ class ImageHistoryStore:
                 text = self._read_description(self._path(scope, key, ".group.json"), members, visible)
                 if text:
                     return text
-                # 兼容旧版单图缓存；旧版多图逐图缓存必须拒绝。
-                texts = []
-                for member in members:
-                    single_key = history_signature([member])
-                    text = self._read_description(self._path(scope, single_key, ".group.json"), [member], visible)
-                    if not text:
-                        text = self._read_description(self._path(scope, member["sha256"], ".json"), [member], visible)
-                    if not text:
-                        return ""
-                    if text not in texts:
-                        texts.append(text)
-                return "\n".join(texts)
+                # 仅单图允许回退旧版 .json 单图缓存；多图组合必须走组签名，不能拼单图短路
+                if len(members) != 1:
+                    return ""
+                member = members[0]
+                single_key = history_signature([member])
+                text = self._read_description(self._path(scope, single_key, ".group.json"), [member], visible)
+                if not text:
+                    text = self._read_description(self._path(scope, member["sha256"], ".json"), [member], visible)
+                return text or ""
         except (OSError, ValueError, TypeError):
             return ""
 

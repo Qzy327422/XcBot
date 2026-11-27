@@ -114,12 +114,16 @@ class MessageIndexTests(unittest.TestCase):
             {"id": "secret-id", "url": "file:///private/token.png"},
             {"type": b"binary", "id": "base64:" + huge, "summary": {"secret": huge}},
             {"type": "image", "url": "https://example.invalid/" + huge},
-            {"type": "must-not-survive", "url": "https://example.invalid/sixth"},
         ]
+        for idx in range(95):
+            media.append({"type": "image", "url": f"https://e.co/{idx}"})
+        media.append({"type": "must-not-survive", "url": "https://example.invalid/overflow"})
         result = self.record(text="图" * 10000, nickname=huge, media=media)
         self.assertEqual(len(result["text"]), 256)
         self.assertEqual(len(result["nickname"]), 128)
-        self.assertLessEqual(len(result["media"]), 5)
+        self.assertEqual(len(result["media"]), 99)
+        self.assertLessEqual(len(result["media"]), 100)
+        self.assertFalse(any(item.get("type") == "must-not-survive" for item in result["media"]))
         self.assertEqual(result["media"][0]["id"], "-8")
         self.assertEqual(len(result["media"][0]["summary"]), 256)
         self.assertEqual(len(result["media"][1]["type"]), 64)
@@ -131,7 +135,7 @@ class MessageIndexTests(unittest.TestCase):
         self.assertNotIn("data:image", repr(result))
         self.assertNotIn("base64:", repr(result))
         self.assertNotIn("file:///", repr(result))
-        self.assertLess(self.index.total_bytes, 20000)
+        self.assertLess(self.index.total_bytes, 65536)
 
     def test_malformed_media_and_binary_text_are_not_stringified(self):
         for media in (b"secret", "data:image/png;base64,secret", object(), 123,

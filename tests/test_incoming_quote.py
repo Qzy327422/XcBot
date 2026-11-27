@@ -627,7 +627,7 @@ class QuoteAdapterTests(unittest.IsolatedAsyncioTestCase):
         state.image_urls = ["https://example.invalid/already.png", urls[0]]
         await env["_resolve_incoming_quote"](event, actions, state)
         self.assertEqual(state.image_urls, ["https://example.invalid/already.png"] + urls)
-        self.assertEqual(len(index.resolve(*state.key, 42)["media"]), 5)
+        self.assertEqual(len(index.resolve(*state.key, 42)["media"]), 9)
         built = env["_build_normal_message"]({"text": "问图", "image_urls": []}, state)
         self.assertEqual(len(built["image_urls"]), 10)
         self.assertIn("九张图", built["text"])

@@ -78,11 +78,11 @@ class ChatroomRegressionTests(unittest.TestCase):
         self.assertEqual([m["role"] for m in loaded["messages"]], ["user", "assistant"])
         self.assertTrue(loaded["messages"][1]["error"])
 
-    def test_split_bubbles_each_keep_reasoning_outside_content(self):
+    def test_split_bubbles_keep_reasoning_only_on_first_segment(self):
         result = webui._chatroom_append_assistant(self.obj, "第一段<split>第二段", reasoning="独立思考")
         replies = [m for m in result["messages"] if m["role"] == "assistant"]
         self.assertEqual([m["content"] for m in replies], ["第一段", "第二段"])
-        self.assertEqual([m["reasoning"] for m in replies], ["独立思考", "独立思考"])
+        self.assertEqual([m.get("reasoning", "") for m in replies], ["独立思考", ""])
         with patch.object(webui, "_chatroom_endpoint_for_model", return_value={"supports_multimodal": False}), \
              patch.object(webui, "_chatroom_system_prompt", return_value="人格"):
             context = webui._chatroom_build_llm_messages(result, "provider/model")

@@ -28,14 +28,14 @@ AGENT_TOOL_META = [
     # 分成两个开关没有意义（只开一个都会让模型半途卡住）。
     {"key": "web_search", "title": "联网搜索", "level": "user", "default_enabled": True,
      "group": "联网", "card": "web",
-     "desc": "让 AI 搜索实时信息并打开网页读正文。优先用下方配置的 Tavily/博查，否则回落百度/DuckDuckGo。已禁止访问内网地址"},
+     "desc": "搜索实时信息并读取网页正文，优先使用下方配置的 Tavily/博查，否则回落百度/DuckDuckGo"},
     {"key": "fetch_webpage", "title": "读取网页", "level": "user", "default_enabled": True,
      "group": "联网", "card": "web", "desc": ""},
 
     # ---------- 插件桥接：两个工具是一套动作，合成一张卡片 ----------
     {"key": "call_plugin", "title": "调用插件", "level": "user", "default_enabled": True,
      "group": "插件", "card": "plugin",
-     "desc": "让 AI 自主调用 plugins/ 里已加载的插件（如 /天气 /生图），不必让用户自己打命令。含列出插件清单的能力"},
+     "desc": "让 AI 自动调用 plugins/ 里已加载的插件（如 /天气、/生图）"},
     {"key": "list_plugins", "title": "列出可用插件", "level": "user", "default_enabled": True,
      "group": "插件", "card": "plugin", "desc": ""},
 
@@ -90,8 +90,7 @@ AGENT_TOOL_META = [
     # 风险等级也一致：全是 admin，且都限制在会话工作区内。
     {"key": "file_write", "title": "文件与代码", "level": "admin", "default_enabled": True,
      "group": "其他", "card": "fs",
-     "desc": "⚠️ 让 AI 在自己的工作目录里读写文件、搜索内容、执行 Python 和系统命令。"
-             "无沙箱，等同于给出机器权限，仅在完全信任时开启"},
+     "desc": "⚠️ 在会话工作目录内读写文件、搜索内容及执行 Python/Shell（无沙箱，仅在完全信任时开启）"},
     {"key": "file_read", "level": "admin", "default_enabled": True,
      "group": "其他", "card": "fs", "title": "读文件", "desc": ""},
     {"key": "read_image", "level": "admin", "default_enabled": True,
@@ -109,7 +108,7 @@ AGENT_TOOL_META = [
 
     # ---------- MCP：需要配合下方的服务器配置，保留 ----------
     {"key": "mcp_tools", "title": "MCP 外部工具", "level": "admin", "default_enabled": True,
-     "group": "其他", "desc": "接入 data/mcp_server.json 里配置的 MCP 服务器，把它们的工具暴露给 AI。开启后在下方配置服务器"},
+     "group": "其他", "desc": "接入下方配置的 MCP 服务器，将其工具暴露给 AI"},
 
     # ---------- 机器人自身：只读，隐藏 ----------
     {"key": "read_bot_config", "title": "读机器人配置", "level": "admin", "default_enabled": True,

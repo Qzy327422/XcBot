@@ -378,7 +378,10 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                     context._history_lock.acquire()
                 else:
                     context.history = []
-                with patch.object(proactive_reply, "set_observation_wait", return_value=True):
+                finishes = []
+                with patch.object(proactive_reply, "set_observation_wait", return_value=True), \
+                        patch.object(proactive_reply, "finish_observation",
+                                     side_effect=lambda *a, **kw: finishes.append((a, kw)) or True):
                     self.assertFalse(await env["_proactive_run_planner"](False, "123",
                         {"_observation": {"generation": 7, "initial_wait": True}}))
                 if cause == "busy":
@@ -386,7 +389,11 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(calls)
                 self.assertFalse(sends)
                 self.assertTrue(any("未调用规划器" in line and "首次观察时间规划" in line for line in logs))
-                self.assertTrue(any("已回退默认等待" in line for line in logs))
+                if cause == "history":
+                    self.assertTrue(finishes)
+                    self.assertFalse(any("已回退默认等待" in line for line in logs))
+                else:
+                    self.assertTrue(any("已回退默认等待" in line for line in logs))
                 self.assertFalse(any("完整输出" in line for line in logs))
 
     async def test_initial_wait_invalid_actions_and_model_error_use_default_without_writer(self):
@@ -629,12 +636,10 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                     sent = await env["_proactive_run_planner"](False, "123", {})
                 self.assertEqual(sent, action == "reply")
                 self.assertEqual(len(calls), 2 if action == "reply" else 1)
-                self.assertEqual(len(waits), int(action in ("wait", "invalid")))
+                self.assertEqual(len(waits), int(action == "wait"))
                 if waits:
-                    self.assertEqual(waits[0][0][2], 37 if action == "wait" else None)
+                    self.assertEqual(waits[0][0][2], 37)
                     self.assertTrue(waits[0][1]["allow_start"])
-                if action == "invalid":
-                    self.assertTrue(any("回退默认等待" in line for line in logs))
 
     def test_native_planner_tools_allow_optional_text_and_validate_wait(self):
         import math

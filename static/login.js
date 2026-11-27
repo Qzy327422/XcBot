@@ -15,6 +15,7 @@ function applyCachedLook(){
     const look=JSON.parse(localStorage.getItem('xcbotLoginLook')||'null');
     if(!look)return;
     const root=document.documentElement;
+    if(look.uiVersion==='classic'||look.uiVersion==='modern')root.dataset.webuiVersion=String(look.uiVersion);
     if(look.preset)root.dataset.webuiPreset=String(look.preset);
     const blur=Math.max(0,Math.min(40,Number(look.blur||0)));
     root.style.setProperty('--user-bg-blur',blur+'px');

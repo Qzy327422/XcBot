@@ -73,7 +73,7 @@ def quote_id(value) -> str | None:
 
 def quote_mapping(value) -> dict | None:
     """读取字典、ObjectedJson.raw 或 SDK 字段；不 stringify 私密传输对象。"""
-    fields = ("status", "retcode", "ret_code", "data", "message_id", "self_id",
+    fields = ("status", "retcode", "ret_code", "data", "message_id", "message_seq", "self_id",
               "group_id", "message_type", "sender", "user_id", "target_id", "peer_id",
               "message", "raw_message", "time", "nickname", "card", "messages")
     seen = set()
@@ -118,7 +118,7 @@ def quote_scope(data, self_id, is_group, chat_id, *, author=None, trusted=False,
     if own is None or peer is None:
         return False, "session_id"
     returned_self = data.get("self_id")
-    if returned_self is not None and quote_id(returned_self) != own:
+    if returned_self not in (None, 0, "0", "") and quote_id(returned_self) != own:
         return False, "self_id_conflict"
     kind = data.get("message_type")
     if kind is not None and kind != ("group" if is_group else "private"):
@@ -133,62 +133,92 @@ def quote_scope(data, self_id, is_group, chat_id, *, author=None, trusted=False,
         return False, "group_id_conflict"
     if envelope:
         for name in ("user_id", "target_id", "peer_id"):
-            if data.get(name) is not None and quote_id(data[name]) != peer:
+            val = data.get(name)
+            if val not in (None, 0, "0", "") and quote_id(val) != peer:
                 return False, name + "_conflict"
         return trusted, None
     author = quote_id(author)
     if author not in (own, peer):
         return False, "author_id_conflict"
     # peer_id 总是会话对象；target_id 是消息接收者（入站应为自己）。
-    if data.get("peer_id") is not None and quote_id(data["peer_id"]) != peer:
+    peer_val = data.get("peer_id")
+    has_peer = peer_val not in (None, 0, "0", "")
+    if has_peer and quote_id(peer_val) != peer:
         return False, "peer_id_conflict"
     target = data.get("target_id")
+    has_target = target not in (None, 0, "0", "")
     expected = peer if author == own else own
-    if target is not None and quote_id(target) != expected:
+    if has_target and quote_id(target) != expected:
         return False, "target_id_conflict"
-    return author == peer or target is not None or data.get("peer_id") is not None or trusted, None
+    return author == peer or has_target or has_peer or trusted, None
 
 
-async def find_quote_in_history(actions, state, anchor) -> tuple[dict | None, str | None]:
+async def find_quote_in_history(actions, state, anchor, *, message_seq=None) -> tuple[dict | None, str | None]:
     """仅查询当前会话的小页；匹配真实 message_id 才能补足缺失 scope。"""
-    fetch = getattr(actions, "get_quote_history_with_receipt", None)
-    if callable(fetch):
-        ret = await fetch(state.is_group, state.chat_id, anchor)
-    else:
+    seq = quote_id(message_seq)
+    if seq in (None, "", "0"):
+        seq = None
+
+    async def _query(use_seq):
+        fetch = getattr(actions, "get_quote_history_with_receipt", None)
+        if callable(fetch):
+            if use_seq is not None:
+                try:
+                    return await fetch(state.is_group, state.chat_id, anchor, message_seq=use_seq)
+                except TypeError:
+                    return await fetch(state.is_group, state.chat_id, anchor)
+            return await fetch(state.is_group, state.chat_id, anchor)
         name = "get_group_msg_history" if state.is_group else "get_friend_msg_history"
         fetch = getattr(actions, name, None)
         if not callable(fetch):
-            return None, "history_unsupported"
-        # OneBot message_id 不是 NapCat message_seq；不传 seq，使用接口最近页默认值。
+            return None
         params = ({"group_id": int(state.chat_id), "count": 20}
                   if state.is_group else {"user_id": int(state.chat_id), "count": 20})
-        ret = await fetch(**params)
-    data, reason = quote_receipt_data(ret)
-    if reason:
-        return None, "history_" + reason
-    _, reason = quote_scope(data, *state.key, trusted=True, envelope=True)
-    if reason:
-        return None, "history_" + reason
-    messages = data.get("messages")
-    if not isinstance(messages, (list, tuple)):
-        return None, "history_messages_shape"
-    found = None
-    for item in messages[:20]:
-        item = quote_mapping(item)
-        if item is None:
-            return None, "history_item_shape"
-        sender = quote_mapping(item.get("sender")) or {}
-        author = sender.get("user_id", item.get("user_id"))
-        _, reason = quote_scope(item, *state.key, author=author, trusted=True)
+        if use_seq is not None:
+            params["message_seq"] = int(use_seq)
+        return await fetch(**params)
+
+    attempts = [seq, None] if seq is not None else [None]
+    last_reason = "history_message_id_not_found"
+    for idx, use_seq in enumerate(attempts):
+        ret = await _query(use_seq)
+        if ret is None and idx == 0 and getattr(actions, "get_quote_history_with_receipt", None) is None:
+            name = "get_group_msg_history" if state.is_group else "get_friend_msg_history"
+            if not callable(getattr(actions, name, None)):
+                return None, "history_unsupported"
+        data, reason = quote_receipt_data(ret)
+        if reason:
+            last_reason = "history_" + reason
+            if idx + 1 < len(attempts):
+                continue
+            return None, last_reason
+        _, reason = quote_scope(data, *state.key, trusted=True, envelope=True)
         if reason:
             return None, "history_" + reason
-        if quote_id(item.get("message_id")) == anchor:
+        messages = data.get("messages")
+        if not isinstance(messages, (list, tuple)):
+            return None, "history_messages_shape"
+        found = None
+        for raw_item in messages[:20]:
+            item = quote_mapping(raw_item)
+            if item is None:
+                continue
+            if quote_id(item.get("message_id")) != anchor:
+                continue
+            sender = quote_mapping(item.get("sender")) or {}
+            author = sender.get("user_id", item.get("user_id"))
+            _, item_reason = quote_scope(item, *state.key, author=author, trusted=True)
+            if item_reason:
+                return None, "history_" + item_reason
             if quote_id(author) is None:
                 return None, "history_author_missing"
             if found is not None:
                 return None, "history_duplicate_message_id"
             found = item
-    return (found, None) if found is not None else (None, "history_message_id_not_found")
+        if found is not None:
+            return found, None
+        last_reason = "history_message_id_not_found"
+    return None, last_reason
 
 
 def _finite_number(value) -> float | None:

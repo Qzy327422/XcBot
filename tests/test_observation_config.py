@@ -90,9 +90,7 @@ class ObservationSchemaTests(unittest.TestCase):
                     if name in OBSERVATION_BOUNDS:
                         self.assertEqual((spec["min"], spec["max"]), OBSERVATION_BOUNDS[name])
                         self.assertEqual(spec["step"], 0.05 if name == "trigger_probability" else 1)
-                self.assertIn("无人说话不催发", fields[prefix + "enabled"]["desc"])
-                self.assertIn("不是必须发送", fields[prefix + "enabled"]["desc"])
-                self.assertIn("普通一问一答不等", fields[prefix + "enabled"]["desc"])
+                self.assertIn("规划器", fields[prefix + "enabled"]["desc"])
                 self.assertEqual(fields[prefix + "debounce_seconds"]["label"],
                                  "有人接话后合并几秒再判断")
 
@@ -106,10 +104,7 @@ class ObservationSchemaTests(unittest.TestCase):
         descriptions = [probability["desc"], fields["Others.weak_blacklist_users"]["desc"],
                         next(x["desc"] for x in webui.FEATURE_META if x["key"] == "weak_blacklist")]
         for desc in descriptions:
-            self.assertIn("全局", desc)
-            self.assertIn("不影响命令和插件", desc)
-            self.assertIn("仅在引用他人消息时检查该作者", desc)
-            self.assertIn("未引用或引用自己", desc)
+            self.assertIn("AI 回复", desc)
 
     def test_real_normalizer_merges_independent_defaults_without_mutating_input(self):
         raw = {"group": {"observation": {"enabled": False, "debounce_seconds": 0}},

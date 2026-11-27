@@ -335,6 +335,22 @@ class WebUIConfigTests(unittest.TestCase):
         webui.save_ui_state({"form_values": {"PluginConfigs.weather.default_city": "杭州"}})
         self.assertEqual(json.loads(self.config.read_text(encoding="utf-8"))["PluginConfigs"]["weather"]["default_city"], "杭州")
 
+    def test_webui_ui_version_schema_and_roundtrip(self):
+        schema = {s["key"]: s for s in webui.build_ui_schema({})}
+        webui_fields = {f["path"]: f for f in schema["webui"]["fields"]}
+        self.assertIn("WebUI.ui_version", webui_fields)
+        self.assertEqual(webui_fields["WebUI.ui_version"]["default"], "classic")
+        self.assertEqual(webui_fields["WebUI.ui_version"]["options"], ["classic", "modern"])
+        self.assertEqual(webui.get_webui_config()["ui_version"], "classic")
+
+        webui.save_ui_state({"form_values": {"WebUI.ui_version": "modern"}})
+        self.assertEqual(webui.get_webui_config()["ui_version"], "modern")
+        self.assertEqual(json.loads(self.config.read_text(encoding="utf-8"))["WebUI"]["ui_version"], "modern")
+
+        webui.save_ui_state({"form_values": {"WebUI.ui_version": "classic"}})
+        self.assertEqual(webui.get_webui_config()["ui_version"], "classic")
+        self.assertEqual(json.loads(self.config.read_text(encoding="utf-8"))["WebUI"]["ui_version"], "classic")
+
     def test_store_yaml_top_level_string_whitelist_and_disabled_filter(self):
         text = '''name: forged
 path: ../../escape
@@ -544,9 +560,9 @@ class MemoryRuntimeTests(unittest.TestCase):
         exec(compile(ast.Module(body=[method], type_ignores=[]), "persona-offline", "exec"), env)
         prompt = env["_get_system_prompt"](object(), "测试用户", "private")
         self.assertTrue(prompt.startswith("测试角色用简短语气和测试用户聊天。"))
-        self.assertIn("【对话衔接】", prompt)
-        self.assertIn("不必每次以问题", prompt)
-        self.assertIn("不重复追问", prompt)
+        self.assertIn("<conversation_rules>", prompt)
+        self.assertIn("do not repeat answered questions", prompt)
+        self.assertIn("no need to end every reply with a question", prompt)
         self.assertEqual(cfg["personality_presets"][0]["prompt"], "{bot_name}用简短语气和{user_name}聊天。")
 
     def test_summary_unlimited_preserves_per_group_inflight_slot(self):
@@ -718,6 +734,119 @@ print("safe import ok")
             config_migrate.migrate(str(old_future), str(new_future), str(backup_dir))
             direct_cfg = json.loads(new_future.read_text(encoding="utf-8"))
             self.assertEqual(direct_cfg["config_version"], 99)
+
+
+class BatchFixesAndUpgradesTests(unittest.TestCase):
+    def test_role_life_flat_migration_and_save_validation_strip_legacy_comment_pollution(self):
+        import config_migrate
+
+        template = json.loads((ROOT / "config.default.json").read_text(encoding="utf-8"))
+        self.assertNotIn("_comment", template["RoleLife"])
+        self.assertNotIn("roles", template["RoleLife"])
+        self.assertIn("enabled", template["RoleLife"])
+
+        polluted = copy.deepcopy(template)
+        polluted["RoleLife"]["_comment"] = "legacy comment"
+        polluted["RoleLife"]["_comment_roles"] = "legacy roles comment"
+        polluted["RoleLife"]["roles"] = {}
+        polluted["RoleLife"]["enabled"] = True
+        polluted["RoleLife"]["sleep_hours"] = 7
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg_path = base / "config.json"
+            tpl_path = base / "config.default.json"
+            cfg_path.write_text(json.dumps(polluted, ensure_ascii=False, indent=2), encoding="utf-8")
+            tpl_path.write_text(json.dumps(template, ensure_ascii=False, indent=2), encoding="utf-8")
+            config_migrate.ensure_config_up_to_date(str(cfg_path), str(tpl_path), str(base / "backups"))
+            cleaned = json.loads(cfg_path.read_text(encoding="utf-8"))
+            self.assertNotIn("_comment", cleaned["RoleLife"])
+            self.assertNotIn("_comment_roles", cleaned["RoleLife"])
+            self.assertNotIn("roles", cleaned["RoleLife"])
+            self.assertTrue(cleaned["RoleLife"]["enabled"])
+            self.assertEqual(cleaned["RoleLife"]["sleep_hours"], 7)
+
+    def test_statistics_parser_includes_planner_role_life_cache_hit_and_keeps_vision_in_chat(self):
+        acc = webui._stat_new_accumulator()
+        ts = "2026-11-23 22:00:00"
+        one_day_ago = 0
+        lines = [
+            f"[{ts}] [STDOUT] [API] group_100 -> p/chat @api.example.com key=sk-111... msg=5 q=你好",
+            f"[{ts}] [STDOUT] [API] group_100 <- p/chat ok tokens=300 prompt=1000 cached=400 a=你好呀",
+            f"[{ts}] [STDOUT] [API] group_100:vision -> p/vis @api.example.com key=sk-111... msg=1 q=图片转述",
+            f"[{ts}] [STDOUT] [API] group_100:vision <- p/vis ok tokens=150 prompt=500 cached=100 a=一只猫",
+            f"[{ts}] [STDOUT] [API] proactive_judge_group_100 -> p/mini @api.example.com key=sk-111... msg=2 q=判断",
+            f"[{ts}] [STDOUT] [API] proactive_judge_group_100 <- p/mini ok tokens=80 prompt=500 cached=0 a=[PASS]",
+            f"[{ts}] [STDOUT] [API] role_life_diary -> p/mini @api.example.com key=sk-111... msg=2 q=diary",
+            f"[{ts}] [STDOUT] [API] role_life_diary <- p/mini ok tokens=120 a=今天很开心",
+            f"[{ts}] [STDOUT] [API] private_200 -> p/chat @api.example.com key=sk-111... msg=2 q=hi",
+            f"[{ts}] [STDOUT] [API] private_200 xx p/chat key=sk-111... err=429 rate limit",
+        ]
+        webui._stat_feed_lines(acc, lines, one_day_ago)
+        self.assertEqual(acc["message_scene"]["群聊"], 2)  # 正常群聊 + 群聊识图转述
+        self.assertEqual(acc["message_scene"]["规划器"], 1)
+        self.assertEqual(acc["message_scene"]["角色生活"], 1)
+        self.assertEqual(acc["message_scene"]["私聊"], 1)
+        self.assertNotIn("识图", acc["message_scene"])
+        self.assertEqual(acc["total_prompt_tokens"], 2000)
+        self.assertEqual(acc["total_cached_tokens"], 500)
+        # 群聊 100 与 群聊 100 (识图) 合并到同一个会话统计
+        self.assertEqual(acc["session_tokens_1d"]["群聊 100"]["tokens"], 450)
+        self.assertEqual(acc["session_tokens_1d"]["群聊 100"]["calls"], 2)
+
+    def test_trace_store_sanitizes_request_payload_base64_and_preserves_multi_attempt_snapshots(self):
+        import gc
+        from bot.trace_store import TraceStore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            store = TraceStore(path=Path(tmp) / "trace.json", max_records=10)
+            store.set_enabled(True)
+            b64 = "A" * 4096
+            req1 = {
+                "model": "m1",
+                "api_key": "sk-secret",
+                "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]}],
+            }
+            req2 = {
+                "model": "m2",
+                "stream": False,
+                "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}],
+                "tools": [{"type": "function", "function": {"name": "web_search"}}],
+            }
+            tid = store.add_record({
+                "ok": True,
+                "session_id": "group_100",
+                "model": "m2",
+                "request_payload": req2,
+                "attempts": [
+                    {"index": 0, "ok": False, "model": "m1", "error": "429", "request_payload": req1},
+                    {"index": 1, "ok": True, "model": "m2", "request_payload": req2},
+                ],
+            })
+            # 列表摘要不含完整请求体
+            listed = store.list_records()["records"]
+            self.assertEqual(len(listed), 1)
+            self.assertNotIn("request_payload", listed[0])
+            # 详情包含脱敏后的完整请求体与每次重试快照（同时验证落盘 SQLite 读取）
+            store.save(force=True)
+            detail = store.get_record(tid)
+            self.assertEqual(detail["request_payload"]["model"], "m2")
+            self.assertEqual(len(detail["request_payload"]["tools"]), 1)
+            att0_req = detail["attempts"][0]["request_payload"]
+            self.assertNotIn("api_key", att0_req)
+            img_val = att0_req["messages"][0]["content"][0]["image_url"]["url"]
+            self.assertTrue(img_val.startswith("[image_base64: image/png, ~"))
+            self.assertNotIn(b64[:32], img_val)
+            store.stop_flush_thread()
+            del store
+            gc.collect()
+
+    def test_no_kaomoji_left_in_bot_replies_and_defaults(self):
+        banned = ["(｡•ᴗ-)", "☆ヾ(≧▽≦*)o", "(◕ᴗ◕✿)", "v(◦'ωˉ◦)~♡", "(/≧▽≦)/", "φ(゜▽゜*)♪", "(╥﹏╥)", "ヾ(≧▽≦*)o", "o((>ω< ))o", "♪(≧∀≦)ゞ☆"]
+        for rel in ("main.py", "plugins/image_search/setup.py", "webui_core/features.py"):
+            content = (ROOT / rel).read_text(encoding="utf-8")
+            for k in banned:
+                self.assertNotIn(k, content, f"found leftover kaomoji {k} in {rel}")
 
 
 if __name__ == "__main__":

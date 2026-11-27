@@ -181,10 +181,10 @@ async def on_message(order, actions, Manager, Segments, bot_name,
         return True
 
     if any(keyword in search_query.lower() for keyword in SENSITIVE_KEYWORDS):
-        await send_text("搜索词包含敏感内容，请更换其他搜索词 (╥﹏╥)")
+        await send_text("搜索词包含敏感内容，请更换其他搜索词。")
         return True
 
-    tip = await send_text(f"{bot_name}正在搜索图片【{search_query}】 ヾ(≧▽≦*)o")
+    tip = await send_text(f"{bot_name}正在搜索图片【{search_query}】……")
 
     try:
         success, image_url, image_info = await _search_image(search_query, clean, log)
@@ -207,11 +207,11 @@ async def on_message(order, actions, Manager, Segments, bot_name,
             await send(*parts)
             _cooldowns[cd_key] = now
         else:
-            await send_text(f"未找到与【{search_query}】相关的图片，请尝试其他搜索词 (╥﹏╥)")
+            await send_text(f"未找到与【{search_query}】相关的图片，请尝试其他搜索词。")
     except Exception as e:
         if log:
             log(f"生图失败: {e}", "ERROR")
-        await send_text(f"图片搜索出错了，请稍后再试 (╥﹏╥)")
+        await send_text("图片搜索出错了，请稍后再试。")
     finally:
         # 撤回"正在搜索"提示，失败无所谓
         try:

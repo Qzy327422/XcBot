@@ -166,6 +166,10 @@ def normalize_config(raw: Any) -> dict[str, dict[str, Any]]:
 
 _STATE_DIR = os.path.join(str(BASE_DIR), "data", "proactive_state")
 MAX_SESSIONS = 1000
+MAX_OBSERVATION_WAKES = 12
+MAX_OBSERVATION_ERRORS = 3
+COLD_FINISH_MIN_CAP_SECONDS = 6 * 3600
+COLD_FINISH_MAX_CAP_SECONDS = 24 * 3600
 RECENT_PROACTIVE_LIMIT = 10
 RECENT_CONTENT_LIMIT = 1000
 RECENT_INCOMING_LIMIT = 128
@@ -206,6 +210,7 @@ class _Observation:
     message_sequence: int = 0
     consumed_sequence: int = 0
     wake_count: int = 0
+    error_streak: int = 0
     last_wake_at: float | None = None
     wake: _ObservationWake | None = None
     rearm_intent: tuple[int, float | None, bool] | None = None
@@ -230,6 +235,8 @@ def _default_state() -> dict[str, Any]:
         "next_check_at": 0.0,
         "last_attempt_at": 0.0,
         "unknown_until": 0.0,
+        "cold_finish_streak": 0,
+        "last_contact_id": "",
         "recent_angles": [],
         "recent_opportunity_ids": [],
         "recent_contact_ids": [],
@@ -240,10 +247,12 @@ def _default_state() -> dict[str, Any]:
 
 
 def _valid_follow_up(item: Any) -> bool:
+    status = item.get("status") if isinstance(item, dict) else None
+    min_sources = 1 if status == "open" else 0
     return (isinstance(item, dict) and isinstance(item.get("id"), str) and 0 < len(item["id"]) <= 64
             and isinstance(item.get("summary"), str) and 0 < len(item["summary"]) <= 500
-            and item.get("status") in ("open", "resolved", "cancelled")
-            and isinstance(item.get("sources"), list) and 1 <= len(item["sources"]) <= 8
+            and status in ("open", "resolved", "cancelled")
+            and isinstance(item.get("sources"), list) and min_sources <= len(item["sources"]) <= 8
             and all(isinstance(source, dict) and isinstance(source.get("id"), str)
                     and 0 < len(source["id"]) <= 128 and isinstance(source.get("author"), str)
                     and isinstance(source.get("text"), str) and len(source["text"]) <= 500
@@ -303,6 +312,9 @@ class _StateStore:
                     elif name in ("recent_angles", "recent_opportunity_ids", "recent_contact_ids"):
                         if isinstance(value, list):
                             state[name] = [item[:240] for item in value[-20:] if isinstance(item, str)]
+                    elif name == "last_contact_id":
+                        if isinstance(value, str):
+                            state[name] = value[:240]
                     elif name in ("background_calls", "contact_times"):
                         if isinstance(value, list):
                             state[name] = [item for item in value[-512:] if type(item) in (int, float)
@@ -527,11 +539,12 @@ class ProactiveReplyScheduler:
                 or not isinstance(sources, list)):
             return "error: 未结事项参数无效。"
         now = time.time()
+        closing_existing = bool(follow_up_id) and status in ("resolved", "cancelled")
         evidence = [{field: source.get(field) for field in ("id", "author", "text", "is_bot")}
                     for source in sources if isinstance(source, dict)]
         item = {"id": follow_up_id or uuid.uuid4().hex, "summary": summary.strip(),
                 "status": status, "sources": evidence, "created_at": now, "updated_at": now}
-        if len(evidence) != len(sources) or not _valid_follow_up(item):
+        if len(evidence) != len(sources) or (not closing_existing and not _valid_follow_up(item)):
             return "error: 必须提供当前会话可验证的用户消息来源。"
         with self._lock:
             if (not self._account_id or str(account_id) != self._account_id or not self._bootstrap_ready
@@ -550,22 +563,36 @@ class ProactiveReplyScheduler:
                 current_ids = {source["id"] for source in evidence}
                 item["sources"] = (evidence + [source for source in previous["sources"]
                                                 if source["id"] not in current_ids])[:8]
+                if not _valid_follow_up(item):
+                    return "error: 必须提供当前会话可验证的用户消息来源。"
             else:
                 duplicate = next((value for value in items if value["summary"] == item["summary"]
                                   and value["sources"] == evidence and value["status"] == status), None)
                 if duplicate is not None:
                     return json.dumps(duplicate, ensure_ascii=False)
-                if len(items) >= 20 and all(value["status"] == "open" for value in items):
-                    return "error: 当前会话未结事项已满，请先更新已有事项。"
             updated = [value for value in items if value["id"] != item["id"]]
-            if len(updated) >= 20:
-                closed = next(value for value in updated if value["status"] != "open")
-                updated.remove(closed)
-            if self._store.update(*key, lambda value: value.update(follow_ups=updated + [item])) is None:
-                return "error: 事项存储容量已满。"
+            while len(updated) >= 20:
+                closed = next((value for value in updated if value["status"] != "open"), None)
+                if closed is not None:
+                    updated.remove(closed)
+                else:
+                    # 满 20 条且全部 open 时，按最久未更新滚动淘汰，避免永久死锁
+                    oldest = min(updated, key=lambda v: float(v.get("updated_at", v.get("created_at", 0)) or 0))
+                    updated.remove(oldest)
+            with self._store._lock:
+                prev_follow_ups = copy.deepcopy(items)
+                was_dirty = key in self._store._dirty
+                if self._store.update(*key, lambda value: value.update(follow_ups=updated + [item])) is None:
+                    return "error: 事项存储容量已满。"
             try:
                 self._store.flush(*key)
             except OSError:
+                with self._store._lock:
+                    cached = self._store._cache.get(key)
+                    if isinstance(cached, dict):
+                        cached["follow_ups"] = prev_follow_ups
+                    if not was_dirty:
+                        self._store._dirty.pop(key, None)
                 return "error: 事项持久化未确认，未安排任何提醒。"
             return json.dumps(item, ensure_ascii=False)
 
@@ -583,17 +610,36 @@ class ProactiveReplyScheduler:
                 state["recent_opportunity_ids"] = (state["recent_opportunity_ids"] + [opportunity_id[:240]])[-20:]
             self._store.update(*key, mutate)
 
-    def mark_attempt(self, is_group: bool, chat_id: str, version: int, *, unknown: bool = False, account_id: str = "") -> None:
+    def mark_attempt(self, is_group: bool, chat_id: str, version: int, *, unknown: bool = False,
+                     cold_finished: bool = False, account_id: str = "") -> None:
         key = ("group" if is_group else "private", str(chat_id))
         cfg = self._config()[key[0]]
         with self._lock:
             if ((not account_id or str(account_id) == self._account_id)
                     and self._store.load(*key)["activity_version"] == version):
                 now = time.time()
-                self._store.update(*key, lambda s: s.update(last_attempt_at=now,
-                    unknown_until=max(s["unknown_until"], now + max(300, cfg["min_interval_between_proactive_seconds"])) if unknown else s["unknown_until"],
-                    next_check_at=max(s["next_check_at"], now + max(
-                        cfg["check_interval_seconds"], cfg["min_interval_between_proactive_seconds"] if unknown else 0))))
+                def mutate(s: dict[str, Any]) -> None:
+                    s["last_attempt_at"] = now
+                    if unknown:
+                        s["unknown_until"] = max(
+                            s["unknown_until"],
+                            now + max(300, cfg["min_interval_between_proactive_seconds"]),
+                        )
+                    wait_next = max(
+                        cfg["check_interval_seconds"],
+                        cfg["min_interval_between_proactive_seconds"] if unknown else 0,
+                    )
+                    if cold_finished:
+                        streak = int(s.get("cold_finish_streak", 0) or 0) + 1
+                        s["cold_finish_streak"] = streak
+                        cap = min(
+                            max(int(cfg["min_interval_between_proactive_seconds"]), COLD_FINISH_MIN_CAP_SECONDS),
+                            COLD_FINISH_MAX_CAP_SECONDS,
+                        )
+                        backoff = min(float(cfg["check_interval_seconds"]) * (2 ** min(streak, 10)), float(cap))
+                        wait_next = max(wait_next, backoff)
+                    s["next_check_at"] = max(s["next_check_at"], now + wait_next)
+                self._store.update(*key, mutate)
                 self._flush()
 
     def _report(self, message: str) -> None:
@@ -854,6 +900,8 @@ class ProactiveReplyScheduler:
                 state["last_user_message_at"] = now
                 state["unanswered_count"] = 0
                 state["consecutive_bot_count"] = 0
+                state["cold_finish_streak"] = 0
+                state["next_check_at"] = 0.0
                 state["activity_version"] += 1
             updated = self._store.update(kind, chat_id, mutate)
             if updated is None:
@@ -1004,6 +1052,29 @@ class ProactiveReplyScheduler:
             self._cancel_episode_locked(key, reason="finish")
             return True
 
+    def note_observation_planner_outcome(self, is_group: bool, chat_id: str, *,
+                                         expected_activity_version: int | None = None,
+                                         expected_generation: int | None = None,
+                                         ok: bool, invalid: bool = False) -> bool:
+        """记录观察期规划器成功/失败；连续异常达到上限或 INVALID 时终止观察，防止 60s 死循环。"""
+        key = ("group" if is_group else "private", str(chat_id))
+        cfg = self._config()[key[0]]
+        with self._lock:
+            episode = self._observation_locked(key, cfg)
+            if not self._matches_observation_locked(key, episode,
+                    expected_activity_version, expected_generation):
+                return False
+            if episode is None:
+                return False
+            if ok:
+                episode.error_streak = 0
+                return True
+            episode.error_streak += 1
+            if invalid or episode.error_streak >= MAX_OBSERVATION_ERRORS:
+                self._cancel_episode_locked(key, reason="invalid_limit" if invalid else "error_limit")
+                return False
+            return True
+
     def cancel_observations(self, reason: str = "disconnect", *, kind: str | None = None,
                             guard: Callable[[], bool] | None = None) -> None:
         """撤销全部或指定类型资格；保留防打扰计数，重开不恢复旧任务。"""
@@ -1052,6 +1123,10 @@ class ProactiveReplyScheduler:
                 now = time.time()
                 state["last_proactive_at"] = now
                 state["total_proactive_sent"] += 1
+                state["cold_finish_streak"] = 0
+                state["next_check_at"] = 0.0
+                if contact_id:
+                    state["last_contact_id"] = contact_id[:240]
                 if new_contact:
                     if kind == "private":
                         state["unanswered_count"] += 1
@@ -1145,7 +1220,8 @@ class ProactiveReplyScheduler:
         return len([t for t in state["contact_times"] if now - t < 86400]) >= limit
 
     def _eligible(self, kind: str, chat_id: str, cfg: dict[str, Any],
-                  state: dict[str, Any], now: float, continuation: bool = False) -> bool:
+                  state: dict[str, Any], now: float, continuation: bool = False,
+                  *, contact_id: str = "") -> bool:
         if (self._stop.is_set() or (self._requires_bootstrap and not self._bootstrap_ready)
                 or not cfg["enabled"] or not self._is_allowed(cfg, chat_id)
                 or (self._account_id and ((kind, chat_id) not in self._history_allowed
@@ -1159,8 +1235,9 @@ class ProactiveReplyScheduler:
         for start, end in cfg["quiet_hours"]:
             if start == end or (start <= hour < end if start < end else hour >= start or hour < end):
                 return False
+        same_batch = bool(continuation and contact_id and state.get("last_contact_id") == contact_id[:240])
         counter, limit = _counter_limit(kind, cfg)
-        if state[counter] >= limit:
+        if state[counter] >= limit and not same_batch:
             return False
         if continuation:
             return True
@@ -1177,7 +1254,8 @@ class ProactiveReplyScheduler:
                 and (state["last_attempt_at"] <= 0 or now - state["last_attempt_at"] >= cfg["check_interval_seconds"]))
 
     def can_send(self, is_group: bool, chat_id: str, activity_version: int,
-                 continuation: bool = False, *, observation_generation: int | None = None) -> bool:
+                 continuation: bool = False, *, observation_generation: int | None = None,
+                 contact_id: str = "") -> bool:
         """逐条提交闸门；observation 与逻辑发送拆段 continuation 相互独立。"""
         kind, chat_id = ("group" if is_group else "private"), str(chat_id)
         key = (kind, chat_id)
@@ -1194,14 +1272,14 @@ class ProactiveReplyScheduler:
             if not continuation and self._daily_contacts_exhausted(cfg, state, now):
                 return False
             if observation_generation is None:
-                return self._eligible(kind, chat_id, cfg, state, now, continuation)
+                return self._eligible(kind, chat_id, cfg, state, now, continuation, contact_id=contact_id)
             wake = episode.wake if episode is not None else None
             if (type(observation_generation) is not int or wake is None
                     or wake.generation != observation_generation
                     or wake.activity_version != activity_version
                     or not (wake.initial_wait or wake.new_messages or wake.timeout)):
                 return False
-            if not self._eligible(kind, chat_id, cfg, state, now, continuation=True):
+            if not self._eligible(kind, chat_id, cfg, state, now, continuation=True, contact_id=contact_id):
                 return False
             if wake.initial_wait:
                 return True
@@ -1242,6 +1320,9 @@ class ProactiveReplyScheduler:
             # 最短 wake 间隔限制 judge 成本；无固定聊天总轮数/总窗口。
             if (now - state["last_proactive_at"] < interval
                     or (episode.last_wake_at is not None and now - episode.last_wake_at < interval)):
+                return None
+            if episode.wake_count >= MAX_OBSERVATION_WAKES:
+                self._cancel_episode_locked(key, reason="max_wakes")
                 return None
             self._observation_generation += 1
             episode.generation = self._observation_generation
@@ -1330,7 +1411,8 @@ class ProactiveReplyScheduler:
                         cfg = cfg_all[kind]
                         if ((kind, cid) not in self._active_sessions and cfg["enabled"]
                                 and self._is_allowed(cfg, cid)
-                                and ((kind, cid) in self._known_histories or cid in cfg["whitelist"])):
+                                and ((kind, cid) in self._known_histories or cid in cfg["whitelist"]
+                                     or self._store.load(kind, cid)["last_user_message_at"] > 0)):
                             self._register(kind, cid, cfg_all)
             with self._lock:
                 sessions = list(self._active_sessions)
@@ -1459,10 +1541,11 @@ def get_session_state(is_group: bool, chat_id: str) -> dict[str, Any]:
 
 
 def can_send(is_group: bool, chat_id: str, activity_version: int,
-             continuation: bool = False, *, observation_generation: int | None = None) -> bool:
+             continuation: bool = False, *, observation_generation: int | None = None,
+             contact_id: str = "") -> bool:
     sched = _scheduler
     return sched is not None and sched.can_send(is_group, chat_id, activity_version,
-        continuation, observation_generation=observation_generation)
+        continuation, observation_generation=observation_generation, contact_id=contact_id)
 
 
 def notify_user_message_received(is_group: bool, chat_id: str, *,
@@ -1554,10 +1637,25 @@ def record_plan(is_group: bool, chat_id: str, version: int, plan: dict, opportun
         sched.record_plan(is_group, chat_id, version, plan, opportunity_id, account_id=account_id)
 
 
-def mark_attempt(is_group: bool, chat_id: str, version: int, *, unknown: bool = False, account_id: str = "") -> None:
+def mark_attempt(is_group: bool, chat_id: str, version: int, *, unknown: bool = False,
+                 cold_finished: bool = False, account_id: str = "") -> None:
     sched = _scheduler
     if sched is not None:
-        sched.mark_attempt(is_group, chat_id, version, unknown=unknown, account_id=account_id)
+        sched.mark_attempt(is_group, chat_id, version, unknown=unknown,
+                           cold_finished=cold_finished, account_id=account_id)
+
+
+def note_observation_planner_outcome(
+    is_group: bool, chat_id: str, *, expected_activity_version: int | None = None,
+    expected_generation: int | None = None, ok: bool, invalid: bool = False,
+) -> bool:
+    sched = _scheduler
+    if sched is None:
+        return True
+    return sched.note_observation_planner_outcome(
+        is_group, chat_id, expected_activity_version=expected_activity_version,
+        expected_generation=expected_generation, ok=ok, invalid=invalid,
+    )
 
 
 def touch_session(is_group: bool, chat_id: str) -> None:

@@ -149,8 +149,9 @@ class RetryMediaAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapted, *usage = await adapt(context, raw, False)
         self.assertEqual(usage, [18, 13, 5])
         self.assertNotIn("image_url", str(adapted))
-        self.assertEqual(adapted[1]["content"][0], original_text)
-        self.assertIn("红色标记", adapted[1]["content"][-1]["text"])
+        self.assertIsInstance(adapted[1]["content"], str)
+        self.assertIn("保留原文字", adapted[1]["content"])
+        self.assertIn("红色标记", adapted[1]["content"])
         self.assertEqual(raw, before)
         self.assertEqual(relay.await_args_list[0].args,
                          (context, "保留原文字", [DATA_URL, "https://example.invalid/a.png"]))
@@ -170,14 +171,15 @@ class RetryMediaAdapterTests(unittest.IsolatedAsyncioTestCase):
                 adapted, total, prompt, completion = await adapt(None, raw, False)
                 self.assertNotIn("image_url", str(adapted))
                 self.assertNotIn(DATA_URL, str(adapted))
-                self.assertEqual(adapted[0]["content"][0]["text"], "保留文字")
-                self.assertEqual(adapted[0]["content"][-1]["text"], "[图片]")
+                self.assertIsInstance(adapted[0]["content"], str)
+                self.assertIn("保留文字", adapted[0]["content"])
+                self.assertIn("[图片]", adapted[0]["content"])
                 self.assertEqual((total, prompt, completion), (0, 0, 0) if isinstance(result, Exception) else result[1:])
                 self.assertIn(DATA_URL, str(raw))
         relay = AsyncMock(side_effect=AssertionError("没有有效 URL 时不能请求"))
         adapt = load_media_helpers(relay)["_adapt_agent_retry_trail"]
         adapted, *_ = await adapt(None, [{"role": "user", "content": [image_block("")]}], False)
-        self.assertEqual(adapted[0]["content"][-1]["text"], "[图片]")
+        self.assertEqual(adapted[0]["content"], "[图片]")
         relay.assert_not_awaited()
 
     async def test_actual_read_image_helper_with_temporary_one_pixel_png(self):

@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import shutil
@@ -305,7 +306,49 @@ def _apply_default_upgrades(config: dict, template: dict,
     return changed
 
 
-def upgrade_proactive_and_role_life_config(config: dict, template: dict, *, from_version: int = 0) -> bool:
+_ROLE_LIFE_FLAT_KEYS = frozenset({
+    "enabled", "plan_enabled", "activity_enabled", "sleep_enabled",
+    "diary_enabled", "dream_enabled", "mood_tone_enabled", "env_awareness_enabled",
+    "maintenance_enabled", "maintenance_interval_seconds", "timezone",
+    "sleep_start", "sleep_hours", "diary_time", "activities_per_day",
+    "retention_days", "model_override", "preference",
+})
+
+
+def _is_pure_legacy_role_life(section: Any) -> bool:
+    return (
+        isinstance(section, dict)
+        and isinstance(section.get("roles"), dict)
+        and not any(k in _ROLE_LIFE_FLAT_KEYS for k in section)
+    )
+
+
+def _clean_role_life_section(config: dict, original_role_life: Any = None) -> bool:
+    """保持纯旧版 roles 兼容，同时彻底剥离混入新版扁平 RoleLife 的 _comment / roles 脏键。"""
+    changed = False
+    if _is_pure_legacy_role_life(original_role_life):
+        config["RoleLife"] = copy.deepcopy(original_role_life)
+    role_life = config.get("RoleLife")
+    if isinstance(role_life, dict):
+        if any(k in _ROLE_LIFE_FLAT_KEYS for k in role_life):
+            for dead in [k for k in list(role_life.keys()) if k in ("roles", "role_daily_limit", "weather_city") or str(k).startswith("_comment")]:
+                role_life.pop(dead, None)
+                changed = True
+        elif isinstance(role_life.get("roles"), dict):
+            for role_map in role_life["roles"].values():
+                if isinstance(role_map, dict):
+                    for rcfg in role_map.values():
+                        if isinstance(rcfg, dict):
+                            for dead in ("role_daily_limit", "weather_city"):
+                                if dead in rcfg:
+                                    rcfg.pop(dead, None)
+                                    changed = True
+    return changed
+
+
+def upgrade_proactive_and_role_life_config(
+    config: dict, template: dict, *, from_version: int = 0, original_role_life: Any = None
+) -> bool:
     """清理已废除的主动回复/角色生活字段，并在低于目标版本升级时更新未自定义的旧默认值。"""
     if not isinstance(config, dict):
         return False
@@ -330,16 +373,8 @@ def upgrade_proactive_and_role_life_config(config: dict, template: dict, *, from
                             obs.pop(dead, None)
                             changed = True
 
-    role_life = config.get("RoleLife")
-    if isinstance(role_life, dict) and isinstance(role_life.get("roles"), dict):
-        for role_map in role_life["roles"].values():
-            if isinstance(role_map, dict):
-                for rcfg in role_map.values():
-                    if isinstance(rcfg, dict):
-                        for dead in ("role_daily_limit", "weather_city"):
-                            if dead in rcfg:
-                                rcfg.pop(dead, None)
-                                changed = True
+    if _clean_role_life_section(config, original_role_life=original_role_life):
+        changed = True
 
     if from_version < 8 and _apply_default_upgrades(config, template, _PROACTIVE_V8_UPGRADES):
         changed = True
@@ -389,12 +424,27 @@ def ensure_config_up_to_date(config_path: str = "config.json", template_path: st
     template_program_version = get_program_version(template)
     current_program_version = get_program_version(current)
 
-    merged = deep_merge(template, current)
+    # 先迁移旧版 split_reply_quote.default_enabled，再执行 deep_merge，避免被模板默认值 true 覆盖
+    quote_migrated = False
+    legacy_quote = current.get("split_reply_quote")
+    legacy_fs = current.get("FeatureSwitches")
+    if (
+        isinstance(legacy_quote, dict)
+        and "default_enabled" in legacy_quote
+        and not (isinstance(legacy_fs, dict) and "split_reply_quote" in legacy_fs)
+    ):
+        migrated_val = bool(legacy_quote.get("default_enabled"))
+        merged = deep_merge(template, current)
+        merged.setdefault("FeatureSwitches", {})["split_reply_quote"] = migrated_val
+        quote_migrated = True
+    else:
+        merged = deep_merge(template, current)
     provider_migrated = migrate_v14_llm_config(merged)
     personality_migrated = sync_personality_prompt_to_presets(merged)
     welcome_migrated = upgrade_group_join_welcome(merged, template)
     proactive_life_migrated = upgrade_proactive_and_role_life_config(
-        merged, template, from_version=current_config_version
+        merged, template, from_version=current_config_version,
+        original_role_life=current.get("RoleLife"),
     )
     merged[CONFIG_VERSION_KEY] = max(current_config_version, template_config_version, CURRENT_CONFIG_VERSION)
     # deep_merge 会保护 Others.version_name，升级时需显式同步到模板程序版本。
@@ -412,6 +462,8 @@ def ensure_config_up_to_date(config_path: str = "config.json", template_path: st
 
     current_keys = collect_keys(current)
     template_keys = collect_keys(template)
+    if _is_pure_legacy_role_life(current.get("RoleLife")):
+        template_keys = {k for k in template_keys if not (k == "RoleLife" or k.startswith("RoleLife."))}
     missing_keys = sorted(template_keys - current_keys)
     legacy_migrated = looks_like_v14_config(current)
     version_upgraded = current_config_version < merged[CONFIG_VERSION_KEY]
@@ -423,6 +475,7 @@ def ensure_config_up_to_date(config_path: str = "config.json", template_path: st
         and not personality_migrated
         and not welcome_migrated
         and not proactive_life_migrated
+        and not quote_migrated
         and not legacy_migrated
         and not program_version_changed
     ):
@@ -468,7 +521,8 @@ def migrate(old_path: str, new_path: str, backup_dir: str, *, remove_old: bool =
     sync_personality_prompt_to_presets(merged)
     old_version = get_config_version(old_config)
     upgrade_proactive_and_role_life_config(
-        merged, new_template, from_version=old_version
+        merged, new_template, from_version=old_version,
+        original_role_life=old_config.get("RoleLife"),
     )
     merged[CONFIG_VERSION_KEY] = max(
         old_version, get_config_version(new_template) or CURRENT_CONFIG_VERSION, CURRENT_CONFIG_VERSION

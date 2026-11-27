@@ -819,14 +819,14 @@ class BudgetTests(unittest.IsolatedAsyncioTestCase):
         await h.wait_idle()
         state = await h.run_until("2026-03-10", "10:05")
         item = state["plans"]["2026-03-10"]["items"][0]
-        self.assertEqual(item["status"], "active")  # 到点≠完成
+        self.assertEqual(item["status"], "interrupted")  # 到点≠完成且不再长期卡在 active
         self.assertEqual(item["experience_id"], "")
         self.assertEqual([e for e in state["experiences"] if e["kind"] == "activity"], [])
         failed = [j for j in state["jobs"].values() if j["kind"] == "activity"]
         self.assertTrue(failed and all(j["status"] == "failed" for j in failed))
         # 再 tick 仍不会把计划装成经历/完成
         state = await h.run_until("2026-03-10", "10:10")
-        self.assertEqual(state["plans"]["2026-03-10"]["items"][0]["status"], "active")
+        self.assertEqual(state["plans"]["2026-03-10"]["items"][0]["status"], "interrupted")
         self.assertEqual([e for e in state["experiences"] if e["kind"] == "activity"], [])
 
     async def test_storage_failure_never_sends_request(self):

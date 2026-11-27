@@ -323,7 +323,7 @@ class CompressionTests(unittest.TestCase):
                 snapshot = copy.deepcopy(original)
                 context = FakeContext(original, save_result=result, save_error=error)
                 self.model_outputs = [structured()]
-                self.assertFalse(self.compress(context))
+                self.assertFalse(self.compress(context, session=f"offline-save-{result}"))
                 self.assert_unchanged(context, original, snapshot)
                 self.assertEqual(context.events, ["save"])
                 self.assertIsNone(context.saved)
@@ -384,22 +384,32 @@ class CompressionTests(unittest.TestCase):
         self.assertEqual(context.events, ["save", "prune"])
         self.assertEqual(context.saved, context.history)
 
-    def test_oversized_material_rejects_explicitly_without_model_or_history_loss(self):
-        oversized = [
-            [{"role": "assistant", "content": PREFIX + "1轮] " + "旧" * 33000}] + dialogue(),
-            [{"role": "user", "content": "新" * 33000}] + dialogue(),
-            dialogue(510),
-        ]
-        for original in oversized:
-            with self.subTest(size=len(original)):
-                snapshot = copy.deepcopy(original)
-                context = FakeContext(original)
-                self.assertFalse(self.compress(context))
-                self.assert_unchanged(context, original, snapshot)
-                self.assertEqual(context.events, [])
+    def test_oversized_material_rejects_unsplittable_but_truncates_and_batches_rounds(self):
+        # 1) 单条无法切分的 33K 旧摘要仍明确拒绝，不丢失历史
+        unsplittable = [{"role": "assistant", "content": PREFIX + "1轮] " + "旧" * 33000}] + dialogue()
+        snapshot = copy.deepcopy(unsplittable)
+        ctx_unsplittable = FakeContext(unsplittable)
+        self.assertFalse(self.compress(ctx_unsplittable))
+        self.assert_unchanged(ctx_unsplittable, unsplittable, snapshot)
+        self.assertEqual(ctx_unsplittable.events, [])
         self.assertEqual(self.api_calls, [])
         self.assertIn("超过", self.logs.getvalue())
         self.assertIn("含旧摘要", self.logs.getvalue())
+
+        # 2) 单条超大工具结果/消息可安全截断并完成压缩；> 32K 的多轮记录按最旧批次压缩不死锁
+        huge_tool = [{"role": "user", "content": "新" * 33000}] + dialogue()
+        ctx_huge = FakeContext(huge_tool)
+        self.model_outputs = [structured("已总结超长输入")]
+        self.assertTrue(self.compress(ctx_huge, session="offline-huge"))
+        self.assertTrue(ctx_huge.history[0]["content"].startswith(PREFIX))
+
+        many_rounds = dialogue(510)
+        ctx_many = FakeContext(many_rounds)
+        self.model_outputs = [structured("分批总结最旧轮次")]
+        self.assertTrue(self.compress(ctx_many, session="offline-many"))
+        self.assertTrue(ctx_many.history[0]["content"].startswith(PREFIX))
+        # 分批压缩只压了一部分旧轮次，未压到的后续轮次仍完整保留在历史中
+        self.assertGreater(len(ctx_many.history), 5)
 
     def test_second_compression_receives_first_summary_and_updates_state(self):
         fact = "用户明确过敏花生；边界长期有效，不得遗漏。"

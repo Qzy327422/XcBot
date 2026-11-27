@@ -219,17 +219,24 @@ class SocialContext:
             ready = False
         if not ready:
             return "error: 当前会话未注册可用的事项记录回调。"
+        closing_existing = bool(follow_up_id) and status in ("resolved", "cancelled")
         if (not isinstance(summary, str) or not summary.strip() or len(summary) > 500
                 or status not in ("open", "resolved", "cancelled")
                 or not isinstance(follow_up_id, str) or len(follow_up_id) > 64
-                or not isinstance(source_ids, list) or not 1 <= len(source_ids) <= 8
+                or not isinstance(source_ids, list)
+                or (not closing_existing and not 1 <= len(source_ids) <= 8)
+                or (closing_existing and len(source_ids) > 8)
                 or any(not isinstance(value, str) or not value or len(value) > 128 for value in source_ids)
                 or len(set(source_ids)) != len(source_ids)):
             return "error: 事项必须包含简短摘要、有效状态及1～8个真实来源ID。"
         sources = []
         for message_id in source_ids:
             item = self._snapshot.get(message_id)
-            if item is None or item["is_bot"] or item["recalled"] or not self._visible(item):
+            if item is None:
+                if closing_existing:
+                    continue
+                return "error: 来源ID必须是本回合当前会话可见且未撤回的用户消息。"
+            if item["is_bot"] or item["recalled"] or not self._visible(item):
                 return "error: 来源ID必须是本回合当前会话可见且未撤回的用户消息。"
             sources.append(dict(item))
         try:
@@ -332,7 +339,7 @@ def register_social_tools(registry: ToolRegistry | None = None) -> None:
          "只记录用户明说的内容，不能猜测已完成或编造承诺。提供follow_up_id更新open/resolved/cancelled。"
          "不是定时提醒，不发送消息，不保证未来联系。",
          {"summary": {"type": "string", "minLength": 1, "maxLength": 500},
-          "source_ids": {"type": "array", "minItems": 1, "maxItems": 8, "items": message_id},
+          "source_ids": {"type": "array", "minItems": 0, "maxItems": 8, "items": message_id},
           "follow_up_id": {"type": "string", "maxLength": 64},
           "status": {"type": "string", "enum": ["open", "resolved", "cancelled"]}},
          ["summary", "source_ids"], "record_follow_up"),

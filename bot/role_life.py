@@ -638,12 +638,12 @@ class RoleLifeEngine:
                     # 没有任何预设且未填写人设文本时，用最小兜底人格让本地界面仍可查看与编辑
                     return Persona(
                         role_id=GLOBAL_ROLE,
-                        role_key=persona_role_key(GLOBAL_ROLE),
-                        name=self._bot_display_name() or "机器人",
                         raw_prompt=f"你是{self._bot_display_name() or '机器人'}。",
                         revision=hashlib.sha256(
                             f"fallback:{self._bot_display_name()}".encode("utf-8")
                         ).hexdigest()[:16],
+                        preset_id=GLOBAL_ROLE,
+                        name=self._bot_display_name() or "机器人",
                     )
             presets = others.get("personality_presets", [])
             if not isinstance(presets, list):
@@ -973,6 +973,17 @@ class RoleLifeEngine:
                 item["status"] = "interrupted"
                 item["ended_at"] = now
                 continue
+            item_jobs = [
+                j for j in (state.get("jobs") or {}).values()
+                if isinstance(j, Mapping) and j.get("kind") == "activity"
+                and j.get("dedupe_key") == f"activity:{item.get('id')}"
+            ]
+            if any(j.get("status") in ("failed", "unknown") for j in item_jobs) and not any(
+                j.get("status") in ("pending", "running") for j in item_jobs
+            ):
+                item["status"] = "interrupted"
+                item["ended_at"] = now
+                continue
             item["status"] = "active"
             item.setdefault("started_at", start)
             self._make_job(
@@ -1287,6 +1298,23 @@ class RoleLifeEngine:
             else:
                 metrics["last_error"] = error[:300]
                 metrics["last_error_at"] = now
+                if job.get("kind") == "activity" and status in ("failed", "unknown"):
+                    target_id = str(((job.get("args") or {}).get("item") or {}).get("id") or "").strip()
+                    if not target_id and str(job.get("dedupe_key") or "").startswith("activity:"):
+                        target_id = str(job.get("dedupe_key") or "")[len("activity:"):]
+                    if target_id:
+                        for plan in (state.get("plans") or {}).values():
+                            if not isinstance(plan, dict):
+                                continue
+                            for pitem in plan.get("items") or []:
+                                if (
+                                    isinstance(pitem, dict)
+                                    and pitem.get("id") == target_id
+                                    and pitem.get("status") == "active"
+                                    and float(pitem.get("end") or 0) <= now
+                                ):
+                                    pitem["status"] = "interrupted"
+                                    pitem["ended_at"] = now
         try:
             self.store.update(account, role_id, mutate)
         except Exception as exc:
@@ -1444,13 +1472,26 @@ class RoleLifeEngine:
         if not _valid_date(day):
             return "invalid:plan_date"
         cfg = job.config
-        limit = min(MAX_PLAN_ITEMS, int(cfg["activities_per_day"]))
-        # 目标是某一天的完整日程：睡段按该日前后各一天计算，而不是按“现在”。
-        sleep_start_ts = clock.hhmm(day, cfg["sleep_start"])
+        existing = (state.get("plans") or {}).get(day)
+        if existing is not None and not job.args.get("replace"):
+            return "stale:plan_exists"
+        history: list[dict[str, Any]] = []
+        if existing is not None:
+            # “重排今天剩余安排”：已开始/已完成等历史条目不能抹掉，新条目
+            # 不得与历史重叠；历史 ID 原样保留，且总条数受 MAX_PLAN_ITEMS 约束。
+            history = [copy.deepcopy(i) for i in existing.get("items", [])
+                       if i.get("status") in ("active", "completed", "interrupted", "skipped")]
+        limit = min(MAX_PLAN_ITEMS, int(cfg["activities_per_day"]), max(0, MAX_PLAN_ITEMS - len(history)))
+        if limit <= 0:
+            return "invalid:plan_empty"
+        # 目标是某一天的完整日程：睡段按每日本地 HH:MM 计算，避免跨夏令时偏移 1 小时。
         sleep_hours = int(cfg["sleep_hours"])
-        sleeping_ranges = [(clock.plus_hours(sleep_start_ts, delta * 24),
-                            clock.plus_hours(sleep_start_ts, delta * 24 + sleep_hours))
-                           for delta in (-1, 0, 1)] if cfg.get("sleep_enabled") else []
+        sleeping_ranges: list[tuple[float, float]] = []
+        if cfg.get("sleep_enabled"):
+            for delta in (-1, 0, 1):
+                s_day = clock.add_days(day, delta)
+                s_start = clock.hhmm(s_day, cfg["sleep_start"])
+                sleeping_ranges.append((s_start, clock.plus_hours(s_start, sleep_hours)))
         day_start, day_end = clock.day_start(day), clock.next_day_start(day)
         items = []
         for index, raw in enumerate(raw_items[:MAX_PLAN_ITEMS * 2]):
@@ -1472,6 +1513,8 @@ class RoleLifeEngine:
                 continue
             if end <= now:
                 continue
+            if any(start < h["end"] and end > h["start"] for h in history):
+                continue
             if any(start < other["end"] and end > other["start"] for other in items):
                 continue
             items.append({
@@ -1484,21 +1527,6 @@ class RoleLifeEngine:
                 break
         if not items:
             return "invalid:plan_empty"
-        # 已有计划时，自动作业不覆盖；手动 regenerate 明确替换。
-        existing = (state.get("plans") or {}).get(day)
-        if existing is not None and not job.args.get("replace"):
-            return "stale:plan_exists"
-        history: list[dict[str, Any]] = []
-        if existing is not None:
-            # “重排今天剩余安排”：已开始/已完成等历史条目不能抹掉，新条目
-            # 不得与历史重叠；历史 ID 原样保留。
-            history = [copy.deepcopy(i) for i in existing.get("items", [])
-                       if i.get("status") in ("active", "completed", "interrupted", "skipped")]
-            items = [i for i in items
-                     if not any(i["start"] < h["end"] and i["end"] > h["start"]
-                                for h in history)]
-            if not items:
-                return "invalid:plan_empty"
         serial = int(state.get("plan_serial") or 0) + 1
         for index, item in enumerate(items):
             # occurrence 级唯一 ID：重排后旧 activity job 不会认领新条目。
@@ -1600,6 +1628,9 @@ class RoleLifeEngine:
         energy = str(result.get("energy", "") or "").strip()[:40]
         if not mood and not energy:
             return "invalid:mood_empty"
+        if not mood and energy:
+            prev_mood = state.get("mood") if isinstance(state.get("mood"), Mapping) else {}
+            mood = str(prev_mood.get("mood") or "").strip()[:40] or "平稳"
         state["mood"] = {"mood": mood, "energy": energy, "source_ids": [job.job_id],
                          "updated_at": now}
         return ""
@@ -1634,10 +1665,28 @@ class RoleLifeEngine:
              and float(i.get("start") or 0) <= now < float(i.get("end") or 0)),
             None,
         )
-        sleeping = self._current_sleep(cfg, clock, now) is not None
-        sleep_info = state.get("sleep") if isinstance(state.get("sleep"), dict) else None
-        sleep_end = float(sleep_info.get("end") or 0) if sleep_info else 0.0
-        recent_woke_up = bool(not sleeping and sleep_end > 0 and 0 <= now - sleep_end <= 2700)
+        current_sleep = self._current_sleep(cfg, clock, now)
+        sleeping = current_sleep is not None
+        if not cfg.get("sleep_enabled"):
+            sleep_info = None
+            recent_woke_up = False
+        elif sleeping:
+            _sday, s_start, s_end = current_sleep
+            stored_sleep = state.get("sleep") if isinstance(state.get("sleep"), dict) else None
+            if (
+                stored_sleep
+                and float(stored_sleep.get("start") or 0) == s_start
+                and float(stored_sleep.get("end") or 0) == s_end
+            ):
+                sleep_info = stored_sleep
+            else:
+                sleep_info = {"date": _sday, "start": s_start, "end": s_end}
+            recent_woke_up = False
+        else:
+            stored_sleep = state.get("sleep") if isinstance(state.get("sleep"), dict) else None
+            sleep_info = stored_sleep if stored_sleep else None
+            sleep_end = float(sleep_info.get("end") or 0) if sleep_info else 0.0
+            recent_woke_up = bool(sleep_end > 0 and 0 <= now - sleep_end <= 2700)
         recent = [e for e in state.get("experiences", [])
                   if e.get("kind") in ("activity", "diary", "dream")]
         recent.sort(key=lambda e: e.get("created_at", 0), reverse=True)
@@ -1771,10 +1820,12 @@ class RoleLifeEngine:
         else:
             raise ValueError("unknown record kind")
         total = len(records)
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = max(1, min(page, pages))
         start = (page - 1) * page_size
         return {"items": records[start:start + page_size], "page": page,
                 "page_size": page_size, "total": total,
-                "pages": max(1, (total + page_size - 1) // page_size)}
+                "pages": pages}
 
     def usage(self, account: str, role_id: str, now: float | None = None) -> dict[str, Any]:
         now = self._now(now)
@@ -2132,8 +2183,14 @@ class RoleLifeEngine:
             if not payload.get("item"):
                 return None
         elif kind == "diary":
-            payload.setdefault("date", today)
-            payload["material"] = self._diary_material(current, today)
+            target_day = str(payload.get("date") or today).strip() or today
+            payload["date"] = target_day
+            if any(
+                e.get("kind") == "diary" and e.get("date") == target_day
+                for e in (current.get("experiences") or [])
+            ):
+                raise ValueError("当天日记已存在")
+            payload["material"] = self._diary_material(current, target_day)
             if not payload["material"]:
                 return None
         elif kind == "dream":
@@ -2143,6 +2200,12 @@ class RoleLifeEngine:
                     return None
                 payload["sleep_start"] = sleep.get("start")
                 payload["sleep_end"] = sleep.get("end")
+            dream_id = f"dream-{int(float(payload.get('sleep_start') or 0))}"
+            if any(
+                e.get("kind") == "dream" and e.get("id") == dream_id
+                for e in (current.get("experiences") or [])
+            ):
+                raise ValueError("本次睡眠的梦境已生成")
             payload["material"] = self._recent_material(current, limit=6)
         elif kind == "maintenance":
             payload["material"] = self._recent_material(current)
@@ -2285,6 +2348,10 @@ class RoleLifeEngine:
             elif orig_kind == "diary":
                 target_day = str(new_args.get("date") or today)
                 new_args["material"] = self._diary_material(state, target_day)
+            elif orig_kind == "activity":
+                new_args["manual"] = True
+            state["revision"] = persona.revision
+            state["config_revision"] = config_revision(cfg)
             jobs[new_id] = {
                 "id": new_id, "kind": original.get("kind"), "status": "pending",
                 "created_at": now, "started_at": 0, "finished_at": 0,

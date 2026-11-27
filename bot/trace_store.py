@@ -20,6 +20,7 @@ from __future__ import annotations
 import atexit
 import copy
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -27,6 +28,9 @@ import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any, Optional
+
+_DATA_IMAGE_URI_RE = re.compile(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$", re.DOTALL)
+_SENSITIVE_REQUEST_KEYS = frozenset({"api_key", "authorization", "x-api-key"})
 
 from bot.io_json import atomic_write_json
 from bot.paths import BASE_DIR
@@ -334,6 +338,47 @@ class TraceStore:
             return raw, False
         return raw[:limit], True
 
+    @classmethod
+    def _sanitize_json_value(cls, value: Any, depth: int = 0) -> Any:
+        if depth > 14:
+            return str(value)
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            m = _DATA_IMAGE_URI_RE.match(value)
+            if m:
+                mime, b64 = m.group(1), m.group(2)
+                approx_bytes = int(len(b64) * 3 / 4)
+                if approx_bytes >= 1024:
+                    size_label = f"~{max(1, round(approx_bytes / 1024))} KB"
+                else:
+                    size_label = f"~{approx_bytes} B"
+                return f"[image_base64: {mime}, {size_label}]"
+            return value
+        if isinstance(value, dict):
+            out = {}
+            for k, v in value.items():
+                ks = str(k)
+                if ks.lower() in _SENSITIVE_REQUEST_KEYS:
+                    continue
+                out[ks] = cls._sanitize_json_value(v, depth + 1)
+            return out
+        if isinstance(value, (list, tuple)):
+            return [cls._sanitize_json_value(item, depth + 1) for item in value]
+        if hasattr(value, "model_dump"):
+            try:
+                return cls._sanitize_json_value(value.model_dump(), depth + 1)
+            except Exception:
+                pass
+        return str(value)
+
+    @classmethod
+    def _sanitize_request_payload(cls, payload: Any) -> dict:
+        if not isinstance(payload, dict) or not payload:
+            return {}
+        clean = cls._sanitize_json_value(payload, 0)
+        return clean if isinstance(clean, dict) else {}
+
     def _sanitize_attempts(self, attempts: Any) -> list[dict]:
         rows: list[dict] = []
         if not isinstance(attempts, list):
@@ -342,7 +387,7 @@ class TraceStore:
             if not isinstance(item, dict):
                 continue
             error_text, _ = self._clip(item.get("error", ""), self.ERROR_MAX)
-            rows.append({
+            row = {
                 "index": int(item.get("index") or 0),
                 "started_at": float(item.get("started_at") or 0.0),
                 "duration_ms": int(item.get("duration_ms") or 0),
@@ -357,7 +402,17 @@ class TraceStore:
                 "category": str(item.get("category") or ("success" if item.get("ok") else "other")),
                 "error_type": str(item.get("error_type") or ""),
                 "error": error_text,
-            })
+            }
+            req_payload = self._sanitize_request_payload(item.get("request_payload"))
+            if req_payload:
+                row["request_payload"] = req_payload
+            if isinstance(item.get("tokens"), dict):
+                row["tokens"] = {
+                    "total": int(item["tokens"].get("total") or 0),
+                    "prompt": int(item["tokens"].get("prompt") or 0),
+                    "completion": int(item["tokens"].get("completion") or 0),
+                }
+            rows.append(row)
         return rows
 
     def _sanitize_tool_calls(self, calls: Any) -> list[dict]:
@@ -479,6 +534,12 @@ class TraceStore:
         }
 
         attempts = self._sanitize_attempts(record.get("attempts"))
+        request_payload = self._sanitize_request_payload(record.get("request_payload"))
+        if not request_payload:
+            for item in reversed(attempts):
+                if isinstance(item.get("request_payload"), dict) and item["request_payload"]:
+                    request_payload = item["request_payload"]
+                    break
         raw_tool_calls = record.get("tool_calls") if isinstance(record.get("tool_calls"), list) else []
         tool_calls = self._sanitize_tool_calls(raw_tool_calls)
         follow_ups = self._sanitize_follow_ups(record.get("follow_ups"))
@@ -496,6 +557,7 @@ class TraceStore:
             "chat_id": str(chat_id) if chat_id is not None else "",
             "system_prompt": prompt_text,
             "prompt_chars": len(raw_prompt),
+            "request_payload": request_payload,
             "user_message": user_text,
             "user_chars": len(raw_user),
             "user_truncated": user_truncated,

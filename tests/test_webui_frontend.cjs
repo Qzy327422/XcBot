@@ -1075,6 +1075,356 @@ test('角色生活页顶部说明功能作用，开启态展示速览指标、�
   assert.match(h.run('renderRoleLife()'),/life-toggle-grid/);
 });
 
+test('WebUI 界面外观页默认旧版经典卡片风，支持实时切换新版并隔离液态玻璃引擎', () => {
+  const h=harness();
+  const storage={};
+  h.context.localStorage={
+    getItem(k){return Object.prototype.hasOwnProperty.call(storage,k)?storage[k]:null},
+    setItem(k,v){storage[k]=String(v)},
+    removeItem(k){delete storage[k]},
+  };
+  const root={dataset:{webuiVersion:'classic'},style:{setProperty(){},getPropertyValue(){return ''}},classList:classes()};
+  const glassCalls=[];
+  h.context.document.documentElement=root;
+  h.context.getComputedStyle=()=>({getPropertyValue:()=>''});
+  h.context.liquidGlassController={setEnabled(on){glassCalls.push(['svg',!!on]);return !!on},syncRefraction(){}};
+  h.context.liquidGlassLensController={setEnabled(on){glassCalls.push(['lens',!!on])},refresh(){}};
+  vm.runInContext(section('function normalizeWebuiVersion(', 'function showLiquidGlassStatus('),h.context);
+  vm.runInContext(section('const APPEARANCE_CACHE_KEY=', 'function shrinkBackgroundForLogin('),h.context);
+  vm.runInContext(section('function settingsTabs(', 'function scrollToRouteSection('),h.context);
+  const selectNode=node('classic');
+  h.nodes.set('f_WebUI_ui_version',selectNode);
+  h.run(`
+    renderField=(f,v)=>'<div data-field="'+f.path+'">'+(v??'')+'</div>';
+    pages=()=>state.bundle.ui_schema;
+    state.bundle.ui_schema=[{key:'webui',title:'WebUI',fields:[
+      {path:'WebUI.ui_version',category:'界面外观'},
+      {path:'WebUI.theme_preset',category:'界面外观'},
+      {path:'WebUI.liquid_glass',category:'界面外观'},
+    ]}];
+    state.bundle.form_values={'WebUI.ui_version':'classic','WebUI.theme_preset':'aurora','WebUI.background_image':'','WebUI.liquid_glass':true};
+  `);
+  // Default is classic (old cartoon card WebUI) with liquid glass intact
+  assert.equal(h.run(`normalizeWebuiVersion('')`),'classic');
+  h.run(`applyWebuiAppearance()`);
+  assert.equal(root.dataset.webuiVersion,'classic');
+  assert.equal(root.classList.contains('liquid-glass'),true);
+  const classicHtml=h.run(`renderOrganizedSettings({key:'webui',title:'WebUI',fields:state.bundle.ui_schema[0].fields})`);
+  assert.match(classicHtml,/旧版 WebUI · 经典卡片风（默认）/);
+  assert.match(classicHtml,/新版 WebUI · 现代工作台/);
+  assert.match(classicHtml,/当前：旧版经典卡片风/);
+  assert.match(classicHtml,/ui-version-card is-active" data-ui-version="classic"/);
+  assert.equal(h.run(`(html=>html.split('data-field="WebUI.ui_version"').length-1)`)(classicHtml),0);
+
+  // Switch to modern (new workbench WebUI): liquid glass must be turned off automatically
+  glassCalls.length=0;
+  h.run(`switchWebuiVersion('modern')`);
+  assert.equal(root.dataset.webuiVersion,'modern');
+  assert.equal(root.classList.contains('liquid-glass'),false);
+  assert.deepEqual(glassCalls,[['svg',false],['lens',false]]);
+  assert.equal(selectNode.value,'modern');
+  assert.equal(h.run(`state.bundle.form_values['WebUI.ui_version']`),'modern');
+  assert.equal(h.run('state.dirty'),true);
+  assert.equal(JSON.parse(storage.xcbotAppearanceCache).uiVersion,'modern');
+  assert.equal(JSON.parse(storage.xcbotLoginLook).uiVersion,'modern');
+  const modernHtml=h.run(`renderSettingsTab('webui','appearance')`);
+  assert.match(modernHtml,/当前：新版现代工作台/);
+  assert.match(modernHtml,/仅旧版经典卡片风生效/);
+  assert.match(modernHtml,/ui-version-card is-active" data-ui-version="modern"/);
+
+  // Switch back to classic: liquid glass re-enables automatically without losing setting
+  glassCalls.length=0;
+  h.run(`switchWebuiVersion('classic')`);
+  assert.equal(root.dataset.webuiVersion,'classic');
+  assert.equal(root.classList.contains('liquid-glass'),true);
+  assert.deepEqual(glassCalls,[['svg',true],['lens',true]]);
+  assert.equal(selectNode.value,'classic');
+  assert.equal(h.run(`state.bundle.form_values['WebUI.ui_version']`),'classic');
+  assert.equal(JSON.parse(storage.xcbotAppearanceCache).uiVersion,'classic');
+
+  // CSS rules scope modern workbench cleanly under html[data-webui-version="modern"]
+  assert.match(css,/html\[data-webui-version="modern"\]/);
+  assert.match(css,/\.ui-version-grid/);
+  assert.match(css,/@keyframes modern-page-in/);
+  assert.match(css,/data-compact-count="3"/);
+});
+
+test('插件空配置极简、模型识图与前置勾选、日志自动滚动与开关动画修复', () => {
+  const h=harness();
+  // 1. Plugin config omits author boilerplate and footer save reminder card
+  h.run(`_pluginSchemas={plain:{schema:{}},weather:{schema:{city:{type:'string',label:'城市'}}}};`);
+  const pluginHtml=h.run('renderPluginConfig()');
+  assert.match(pluginHtml,/<div class="card">[^]*plain[^]*该插件未提供配置项/);
+  assert.doesNotMatch(pluginHtml,/插件作者声明 config_schema/);
+  assert.doesNotMatch(pluginHtml,/PluginConfigs\.&lt;插件名&gt;\.&lt;字段&gt;/);
+  assert.match(pluginHtml,/<span class="plugin-config-caret" aria-hidden="true"><svg /);
+
+  // 2. Provider model row places enabled checkbox before model input and labels vision as 识图
+  h.run(`state.modelRowOpen={'0:0':true};`);
+  const modelHtml=h.run(`renderProviderModels({models:[{name:'gpt-4o',enabled:true,supports_multimodal:true,timeout_seconds:60}]},0)`);
+  assert.match(modelHtml,/>识图<\/label>/);
+  assert.doesNotMatch(modelHtml,/>多模态<\/label>/);
+  assert.match(modelHtml,/class="model-row"><input type="checkbox" title="启用此模型"[^>]*><input value="gpt-4o"/);
+  assert.match(modelHtml,/class="model-row-adv"/);
+
+  // 3. Log auto-scroll captures atBottom within 72px and auto-scrolls freshly mounted elements
+  vm.runInContext(section('function renderAutoScrollToggle()', 'function getMultimodalModels('),h.context);
+  const logEl={id:'log_full',scrollTop:940,scrollHeight:1050,clientHeight:60,scrollTo(x,y){this.scrollTop=y}};
+  const mountedEl={id:'log_new',scrollTop:0,scrollHeight:800,clientHeight:200,scrollTo(x,y){this.scrollTop=y}};
+  h.context.document.querySelectorAll=()=>[logEl];
+  const captured=h.run('captureLogScrollState()'); // remain = 1050 - 940 - 60 = 50 (< 72)
+  assert.equal(captured.log_full.atBottom,true);
+  logEl.scrollHeight=1200;
+  h.context.document.querySelectorAll=()=>[logEl,mountedEl];
+  h.context._prevScroll=captured;
+  h.run('restoreLogScrollState(_prevScroll)');
+  assert.equal(logEl.scrollTop,1200);
+  assert.equal(mountedEl.scrollTop,800);
+
+  // 4. CSS fixes modern RoleLife double-pill switch, narrow model checkbox row, carets, reveal animations & backdrop-root
+  assert.match(css,/html\[data-webui-version="modern"\] \.role-life \.switch:before\s*\{\s*display:\s*none !important;/);
+  assert.match(css,/\.model-row>input\[type="checkbox"\],\.embed-row>input\[type="checkbox"\]\{order:-2;flex:0 0 auto;margin:0\}/);
+  assert.match(css,/@keyframes ui-reveal-down/);
+  assert.match(css,/@keyframes ui-modal-pop/);
+  assert.match(css,/html\[data-webui-version="modern"\] \.page-anim > \.role-life \{\s*animation: none !important;/);
+});
+
+test('弹窗回车即时渲染、日志自动滚动、统计页升级、追踪完整请求与MCP统一保存', async () => {
+  const h=harness();
+  // 1. Model modal Enter blurs input & forceRender bypasses isEditingField and page-anim
+  vm.runInContext(section('function render(){','function renderWelcome('),h.context);
+  vm.runInContext(section('function isEditingField(','async function refreshAll('),h.context);
+  const inputNode=node('deepseek-chat');
+  inputNode.tagName='INPUT';
+  let blurred=false;
+  inputNode.focus=()=>{h.context.document.activeElement=inputNode};
+  inputNode.blur=()=>{blurred=true;h.context.document.activeElement=null};
+  const modalNode=node();
+  modalNode.contains=el=>el===inputNode;
+  const contentNode=node();
+  contentNode.dataset={currentPage:'providers'};
+  contentNode.classList.add('page-anim');
+  h.nodes.set('modelInputModal',modalNode);
+  h.nodes.set('modelInputValue',inputNode);
+  h.nodes.set('content',contentNode);
+  h.context.document.activeElement=inputNode;
+  h.context.document.querySelectorAll=()=>[];
+  h.run(`
+    snapshotPluginConfigOpen=()=>{};applyWebuiAppearance=()=>{};applyRoute=()=>{};
+    captureLogScrollState=()=>({});renderNav=()=>{};updateNavIndicator=()=>{};renderConnectionStatus=()=>{};
+    meta=()=>({key:'providers',title:'提供商',desc:''});
+    state.current='providers';state._lastPage='providers';
+    state.bundle.form_values['Others.llm_providers']=[{id:'p1',base_url:'https://api.example.com/v1',keys:['k1'],models:[]}];
+    openModelInput(0,'chat');
+    el('modelInputValue').value='deepseek-chat';
+    submitModelInput();
+  `);
+  assert.equal(blurred,true);
+  assert.equal(modalNode.style.display,'none');
+  assert.match(contentNode.innerHTML,/deepseek-chat/);
+  assert.equal(contentNode.classList.contains('page-anim'),false);
+
+  // 2. Log auto-scroll pins to bottom even on large bursts (remain > 80) and pauses cleanly
+  vm.runInContext(section('function renderAutoScrollToggle()', 'function getMultimodalModels('),h.context);
+  const logBox={id:'log_full',scrollTop:100,scrollHeight:2400,clientHeight:300,scrollTo(x,y){this.scrollTop=y}};
+  const btnNode=node();
+  h.context.document.querySelectorAll=sel=>sel==='pre.log'?[logBox]:sel==='[data-asbtn]'?[btnNode]:[];
+  h.run(`localStorage.webuiAutoScroll='true';scrollLogsToBottom();`);
+  assert.equal(logBox.scrollTop,2400);
+  h.run(`setAutoScrollState(false,false);`);
+  assert.equal(h.run(`localStorage.webuiAutoScroll`),'false');
+  assert.match(btnNode.innerHTML,/⬜ 自动滚动/);
+
+  // 3. Stats page shows cache hit rate, success rate, avg tokens, 24h token trend and omits 统计说明
+  vm.runInContext(section('function chartBars(', 'function dbgKV('),h.context);
+  h.run(`state.bundle.statistics={
+    generated_at:1700000000,
+    summary:{message_count:10,api_calls:12,api_tokens:24000,model_count:2,success_calls:11,failure_calls:1,success_rate:91.7,avg_tokens_per_call:2182,total_prompt_tokens:10000,total_cached_tokens:4500,cache_hit_rate:45.0},
+    message_scene:[{label:'群聊',value:8},{label:'规划器',value:3},{label:'角色生活',value:1}],
+    message_trend:[{label:'10-01 12:00',value:5}],
+    token_trend_1d:[{label:'10-01 12:00',value:12000}],
+    model_ranking:[{model:'p1/m1',calls:10,tokens:20000,cache_hit_rate:45.0}],
+    session_tokens_top10_1d:[{session:'群聊 100',calls:8,tokens:18000}],
+    api_history:[{model:'p1/m1',status:'success',scene:'规划器 · 群聊 100',host:'api.example.com',time:'2026-01-01 12:00:00',message_count:3,tokens:2000,prompt_tokens:1000,cached_tokens:500,preview:'test'}]
+  };`);
+  const statsHtml=h.run('renderStats()');
+  assert.match(statsHtml,/缓存平均命中率/);
+  assert.match(statsHtml,/45%/);
+  assert.match(statsHtml,/调用成功率/);
+  assert.match(statsHtml,/平均单次 Tokens/);
+  assert.match(statsHtml,/Token 消耗趋势/);
+  assert.match(statsHtml,/缓存 50%/);
+  assert.doesNotMatch(statsHtml,/仅统计真正触发 Bot 的消息/);
+  assert.doesNotMatch(statsHtml,/统计说明/);
+
+  // 4. Trace detail defaults 最终发送请求 and 上下文历史 to collapsed, supports retry attempt switching & raw JSON toggle
+  vm.runInContext(section('let traceState=', '// 自检结果存在这里'),h.context);
+  h.run(`
+    traceState.openId='t1';
+    traceState.reqOpen=false;traceState.ctxOpen=false;traceState.reqAttempt=-1;traceState.reqMode='structured';
+    traceState.detail={
+      id:'t1',ok:true,time:1700000000,duration_ms:1500,session_id:'group_100',context_type:'group',chat_id:'100',
+      model:'m2',display_model:'p1/m2',attempt_count:2,retry_count:1,
+      system_prompt:'sys prompt',prompt_chars:10,user_message:'hi',reply:'hello',
+      history_count:1,history_overview:[{role:'user',chars:4,content:'prev'}],
+      tokens:{prompt:500,completion:100,cached:200,total:600},
+      request_payload:{model:'m2',display_model:'p1/m2',stream:false,messages:[{role:'system',content:'sys2'},{role:'user',content:'hi'}]},
+      attempts:[
+        {index:0,ok:false,model:'m1',display_model:'p1/m1',duration_ms:400,category:'rate_limit',error:'429',request_payload:{model:'m1',display_model:'p1/m1',messages:[{role:'system',content:'sys1'}]}},
+        {index:1,ok:true,model:'m2',display_model:'p1/m2',duration_ms:1100,category:'success',request_payload:{model:'m2',display_model:'p1/m2',messages:[{role:'system',content:'sys2'},{role:'user',content:'hi'}]}}
+      ]
+    };
+  `);
+  const collapsedTrace=h.run('renderTraceDetail()');
+  assert.match(collapsedTrace,/最终发送请求/);
+  assert.doesNotMatch(collapsedTrace,/当次系统提示词/);
+  assert.doesNotMatch(collapsedTrace,/sys2/);
+  assert.doesNotMatch(collapsedTrace,/prev/);
+  h.run(`traceState.reqOpen=true;`);
+  const expandedFinal=h.run('renderTraceDetail()');
+  assert.match(expandedFinal,/sys2/);
+  assert.match(expandedFinal,/#1 p1\/m1 \(失败\)/);
+  assert.match(expandedFinal,/#2 p1\/m2 \(成功 · 最终\)/);
+  h.run(`traceState.reqAttempt=0;traceState.reqMode='raw';`);
+  const expandedFirstRaw=h.run('renderTraceDetail()');
+  assert.match(expandedFirstRaw,/sys1/);
+  assert.match(expandedFirstRaw,/&quot;model&quot;: &quot;m1&quot;/);
+
+  // 5. MCP save unified into saveAll(), no duplicate inner 保存配置 button, rename updates data-mcp-name
+  vm.runInContext(section('const AGENT_LEVEL_LABEL=', '// ==================== 首次设置访问 Token'),h.context);
+  h.run(`
+    state.bundle.agent_tools={mcp_tools:{enabled:true,level:'admin'}};
+    state.bundle.agent_tool_meta=[];
+    state.bundle.ui_schema=[{key:'agent',title:'Agent',fields:[{path:'Agent.enabled',label:'启用 Agent',type:'bool',desc:'desc'}]}];
+    state.current='agent';
+    mcpState={loaded:true,loading:false,data:{available:true,config_path:'data/mcp_server.json',servers:{},registered_tools:[]},draft:null,dirty:false};
+  `);
+  const agentToolsHtml=h.run(`renderAgentContent('tools')`);
+  assert.doesNotMatch(agentToolsHtml,/不会自动替你关闭主动回复/);
+  const mcpHtml=h.run('renderMcpPanel()');
+  assert.doesNotMatch(mcpHtml,/>保存配置</);
+  h.run('addMcpServer(false)');
+  assert.equal(h.run('mcpState.dirty'),true);
+  assert.equal(h.run('state.dirty'),true);
+  const renameInput={dataset:{mcpName:'server1'},closest:()=>cardMock};
+  const cmdInput={dataset:{mcpName:'server1'}};
+  const headingNode={textContent:'server1'};
+  const cardMock={dataset:{mcpCard:'server1'},querySelector:()=>headingNode,querySelectorAll:()=>[renameInput,cmdInput]};
+  h.context._renameInput=renameInput;
+  h.context._cmdInput=cmdInput;
+  h.run(`renameMcpServer('server1','my_mcp',_renameInput)`);
+  assert.equal(cmdInput.dataset.mcpName,'my_mcp');
+  assert.equal(headingNode.textContent,'my_mcp');
+  h.run(`setMcpField(_cmdInput.dataset.mcpName,'command','uvx')`);
+  assert.equal(h.json('mcpDraft()').my_mcp.command,'uvx');
+  const calls=[];
+  h.context.fetch=async (url,opt)=>{
+    calls.push({url,body:JSON.parse(opt.body)});
+    if(url==='/api/ui-state')return {status:200,ok:true,json:async()=>({ok:true,data:h.json('state.bundle')})};
+    if(url==='/api/agent/mcp')return {status:200,ok:true,json:async()=>({ok:true,data:{available:true,servers:h.json('mcpDraft()'),registered_tools:[]}})};
+    throw new Error('unexpected '+url);
+  };
+  await h.run('saveAll(true)');
+  assert.equal(calls.some(c=>c.url==='/api/agent/mcp'&&c.body.action==='save'&&c.body.servers.my_mcp.command==='uvx'),true);
+  assert.equal(h.run('mcpState.dirty'),false);
+
+  // 6. CSS layout fixes for Agent settings alignment & welcome .stat vertical centering
+  assert.match(css,/\.settings-panel-grid>\*\{grid-column:1 \/ -1;min-width:0\}/);
+  assert.match(css,/html\[data-webui-version="modern"\] \.stat \{[\s\S]*justify-content:\s*center;/);
+});
+
+test('Phase 4 WebUI/RoleLife: Agent卡全员同步、多模态渲染、MCP SSE、遗漏默认值、经验回拉与离开清理', async () => {
+  const h=harness();
+  vm.runInContext(section('function renderField(','function renderAutoScrollToggle('),h.context);
+  vm.runInContext(section('function getMultimodalModels(','function renderEndpointsEditor('),h.context);
+  vm.runInContext(section('function seedPluginConfigValues(','function renderPluginStore('),h.context);
+  vm.runInContext(section('let roleLifeState=','function roleLifeTab('),h.context);
+  vm.runInContext(section('const AGENT_LEVEL_LABEL=','// ==================== 首次设置访问 Token'),h.context);
+  vm.runInContext(section('function gotoPage(','function render(){'),h.context);
+
+  // 1) P1-6: renderProviders renders multimodal fields + addMcpServer(true) renders SSE URL
+  h.run(`
+    meta=()=>({key:'providers',title:'提供商',fields:[
+      {path:'Others.api_multimodal_model',label:'识图模型',type:'multimodal_model',desc:''},
+      {path:'Others.api_multimodal_image_mode',label:'图片处理模式',type:'select',options:['relay','direct'],desc:''}
+    ]});
+    state.bundle.form_values['Others.llm_providers']=[{id:'p1',base_url:'https://x/v1',keys:['k1'],models:[{name:'gpt-4o',enabled:true,supports_multimodal:true}]}];
+    state.bundle.form_values['Others.api_multimodal_model']='';
+    state.bundle.form_values['Others.api_multimodal_image_mode']='relay';
+    isValidPage=()=>true;forceRender=()=>{};clearDraft=()=>{};closeMobileNav=()=>{};updateRoute=()=>{};traceDiscardPending=()=>{};roleLifeRender=()=>{};refreshAll=async()=>{};
+  `);
+  const providersHtml=h.run('renderProviders()');
+  assert.match(providersHtml,/识图与图片处理/);
+  assert.match(providersHtml,/Others\.api_multimodal_model|f_Others_api_multimodal_model/);
+  assert.match(providersHtml,/f_Others_api_multimodal_image_mode/);
+  assert.match(providersHtml,/p1\/gpt-4o/);
+
+  h.run(`mcpState={loaded:true,loading:false,data:{available:true,config_path:'',servers:{},registered_tools:[]},draft:null,dirty:false};addMcpServer(true);`);
+  const sseHtml=h.run('renderMcpPanel()');
+  assert.match(sseHtml,/SSE 地址/);
+  assert.doesNotMatch(sseHtml,/启动命令/);
+  // Stale renameMcpServer with unknown oldName does not write undefined
+  h.run(`renameMcpServer('missing_old','new_name',null);`);
+  assert.equal(h.json('mcpDraft()').new_name,undefined);
+
+  // 2) P1-4: toggleAgentTool / setAgentToolLevel syncs all members of a grouped card
+  h.run(`
+    state.bundle.agent_tools={
+      file_write:{enabled:true,level:'admin'},
+      execute_shell:{enabled:true,level:'admin'},
+      execute_python:{enabled:true,level:'admin'}
+    };
+    state.bundle.agent_tool_meta=[{key:'file_write',members:['file_write','execute_shell','execute_python']}];
+  `);
+  const swMock={classList:classes()};
+  h.context._swMock=swMock;
+  h.run(`toggleAgentTool('file_write',_swMock);setAgentToolLevel('file_write','user');`);
+  const savedTools=h.json('state.bundle.agent_tools');
+  assert.equal(savedTools.file_write.enabled,false);
+  assert.equal(savedTools.execute_shell.enabled,false);
+  assert.equal(savedTools.execute_python.enabled,false);
+  assert.equal(savedTools.execute_shell.level,'user');
+  assert.equal(savedTools.execute_python.level,'user');
+
+  // 3) P2-5: missing plugin schema default is not seeded as null; leaveConfirm resets pendingBackground
+  h.run(`
+    _pluginSchemas={demo:{schema:{secret:{type:'string'},mode:{type:'select',default:'fast'}},values:{}}};
+    seedPluginConfigValues();
+  `);
+  assert.equal(Object.hasOwn(h.json('state.bundle.form_values'),'PluginConfigs.demo.secret'),false);
+  assert.equal(h.json('state.bundle.form_values')['PluginConfigs.demo.mode'],'fast');
+
+  const leaveModalNode=node();
+  leaveModalNode._pending={k:'welcome',section:''};
+  h.nodes.set('leaveModal',leaveModalNode);
+  h.run(`pendingBackground={filename:'bg.png',image_b64:'abc'};state.dirty=true;leaveConfirm();`);
+  assert.equal(h.run('pendingBackground'),null);
+
+  // 4) P2-2: roleLifeOpenExpEditor fetches full experience text when absent locally; clear resets page
+  h.context.fetch=async (url)=>{
+    if(String(url).startsWith('/api/role-life/records')){
+      return {status:200,ok:true,json:async()=>({ok:true,data:{items:[{id:'exp-missing',text:'完整历史经历正文'}],pages:1}})};
+    }
+    if(url==='/api/role-life/action'){
+      return {status:200,ok:true,json:async()=>({ok:true,data:{ok:true}})};
+    }
+    throw new Error('unexpected '+url);
+  };
+  h.run(`
+    loadRoleLife=async()=>{};roleLifeLoadRecords=async()=>{};roleLifeBusy=()=>false;
+    roleLifeState.account='global';roleLifeState.role='default';
+    roleLifeState.data={account:'global',role_id:'default',editable:true,status:{enabled:true,available:true,revision:'r1',epoch:0,state_version:1,recent:[],plan:{items:[]}}};
+    roleLifeState.records={activity:{items:[]},diary:{items:[]},dream:{items:[]}};
+    roleLifeState.page={activity:3,diary:2,dream:4,plans:1,jobs:2};
+  `);
+  await h.run(`roleLifeOpenExpEditor('exp-missing','')`);
+  assert.equal(h.json('roleLifeState.expEditor').text,'完整历史经历正文');
+  await h.run(`roleLifeAction('clear')`);
+  assert.equal(h.json('roleLifeState.page').activity,1);
+  assert.equal(h.json('roleLifeState.page').diary,1);
+  assert.equal(h.json('roleLifeState.page').dream,1);
+});
+
 (async()=>{
   let passed=0;
   for(const [name,fn] of tests){try{await fn();console.log(`ok ${++passed} - ${name}`)}catch(e){console.error(`FAIL - ${name}`);throw e;}}

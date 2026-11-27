@@ -30,7 +30,7 @@
   "_comment_protocol": "协议类型，固定 OneBot。Hyper 框架启动时硬索引此字段，改成其他值会启动失败。",
   "Others": {
     "project_name": "XcBot",
-    "version_name": "v4.1",
+    "version_name": "v4.2",
     "slogan": "✨ 忻城 ✨",
     "robot_name_triggers": [
       "忻城"
@@ -121,6 +121,7 @@
     "api_default_index": 1,
     "api_default_model": "",
     "api_multimodal_model": "",
+    "api_multimodal_image_mode": "relay",
     "_comment_api_multimodal_model": "多模态转述模型。当主模型不支持多模态且用户发送图片时，使用这里填写的多模态模型识图转述；留空则保持原行为，不额外调用多模态模型。",
     "personality_prompt": "你是一只猫娘，基于XcBot",
     "personality_presets": [
@@ -137,7 +138,7 @@
     "llm_split": {
       "enabled": true,
       "mode": "auto_prompt",
-      "prompt_suffix": "当你想把一句话分段发送或有多句话想说时，请使用 <split> 作为分隔符将它们拆开（例如：第一部分<split>第二部分<split>第三部分），系统会依次发送，像真人在连续打字聊天一样。如果遇到用户要求长文，或需要输出大段解释、代码等情况，则直接整段输出，无需使用分隔符。",
+      "prompt_suffix": "When a reply naturally fits multiple short chat bubbles, separate segments with <split> (e.g. 第一句<split>第二句<split>第三句) so they are sent sequentially like natural typing. For long explanations, lists, or code blocks, output a single message without <split>.",
       "split_regex": ".*?[。？！~。]+|.+$",
       "filter_regex": "\\n|\\r|<split>",
       "max_chars_no_split": 150
@@ -273,6 +274,7 @@
     "port": 7891,
     "access_token": "",
     "open_browser": false,
+    "ui_version": "classic",
     "theme_preset": "aurora",
     "background_image": "",
     "background_blur": 10,
@@ -282,9 +284,24 @@
     "card_background_blur": 3
   },
   "RoleLife": {
-    "_comment": "角色生活：每个机器人账号与人格预设一份独立生活（日程、经历、睡眠、日记、梦），默认关闭。",
-    "roles": {},
-    "_comment_roles": "结构：{\"账号QQ\": {\"人格预设ID\": {启用与作息等设置}}}。在 WebUI「角色生活」页保存后生效。"
+    "enabled": false,
+    "plan_enabled": true,
+    "activity_enabled": true,
+    "sleep_enabled": true,
+    "diary_enabled": true,
+    "dream_enabled": true,
+    "mood_tone_enabled": true,
+    "env_awareness_enabled": true,
+    "maintenance_enabled": false,
+    "maintenance_interval_seconds": 3600,
+    "timezone": "Asia/Shanghai",
+    "sleep_start": "00:30",
+    "sleep_hours": 8,
+    "diary_time": "23:50",
+    "activities_per_day": 5,
+    "retention_days": 30,
+    "model_override": "",
+    "preference": ""
   },
   "ProactiveReply": {
     "_comment": "主动回复：AI 在群里或私聊里沉默一段时间后主动开口。完全由 AI 判断要不要发，桥接只做闸门（黑白名单/空闲阈值/概率/熔断）。两边主动回复都默认关闭。黑白名单都为空仅表示不限制对象，不会开启主动回复。若启用了「角色生活」，AI 会结合当前空闲/心情/近期经历自然找话题（睡觉时段暂不主动打扰）。",

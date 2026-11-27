@@ -635,7 +635,7 @@ class SocialToolsTests(unittest.IsolatedAsyncioTestCase):
         for names in ([], ["select_reply"], self.registry.names()):
             guide = agent.build_agent_guide(names)
             self.assertIn(agent.SOCIAL_TOOL_GUIDE, guide)
-            for text in ("list_visible_messages", "select_reply", "首段", "一次性", "未调用", "120 秒", "enabled", "不会 sleep", "不可信数据"):
+            for text in ("list_visible_messages", "select_reply", "first segment", "one-time", "omit it", "120 seconds", "enabled", "does not sleep", "untrusted data"):
                 self.assertIn(text, guide)
 
 

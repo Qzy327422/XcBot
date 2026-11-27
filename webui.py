@@ -99,6 +99,7 @@ _stat_inc_state: Dict[str, Any] = {
     "log_path": "",
     "file_size": 0,
     "last_check": 0,
+    "last_rebuild": 0,
     "total_messages": 0,
     "message_trend": None,
     "message_scene": None,
@@ -136,12 +137,7 @@ from webui_core.agent_meta import (
     visible_tools, card_members, configurable_keys,
 )
 
-# 展示文案单独覆盖，不修改共享元数据或功能开关的默认值。
-FEATURE_META = [
-    {**item, "desc": "全局按概率允许弱黑名单用户获得 AI 回复，不影响命令和插件；群聊主动仅在引用他人消息时检查该作者，未引用或引用自己不套用用户弱名单"}
-    if item["key"] == "weak_blacklist" else item
-    for item in _FEATURE_META
-]
+FEATURE_META = list(_FEATURE_META)
 
 # Hyper 库自己往 stdout 打的噪音行，直接吞掉不进控制台/日志。
 # 典型是每轮重连都出现的 "🔴 *CRIT  重试次数达到最大值(5)，退出"——它描述的是
@@ -701,20 +697,215 @@ def _chatroom_pair_count(messages: list[Dict[str, Any]]) -> int:
     return len(seen) + loose
 
 
+def _chatroom_decode_data_url(data_url: str, max_bytes: int, name: str) -> bytes:
+    """解码浏览器传来的 base64 data URL，并限制最大原始字节数。"""
+    import base64
+
+    raw = str(data_url or "")
+    if not raw.startswith("data:") or ";base64," not in raw:
+        raise ValueError(f"文件「{name}」传输格式无效")
+    b64 = raw.split(";base64,", 1)[1].strip()
+    if len(b64) > (max_bytes * 4 // 3) + 64:
+        raise ValueError(f"文件「{name}」体积超过上限（最多 {max_bytes // (1024 * 1024)} MB）")
+    try:
+        decoded = base64.b64decode(b64, validate=True)
+    except Exception as e:
+        raise ValueError(f"文件「{name}」解码失败：{e}") from e
+    if len(decoded) > max_bytes:
+        raise ValueError(f"文件「{name}」体积超过上限（最多 {max_bytes // (1024 * 1024)} MB）")
+    return decoded
+
+
+def _chatroom_extract_attachment_text(att: Dict[str, Any]) -> tuple[str, bool]:
+    """提取文本/代码或常见办公文档（PDF/DOCX/XLSX）的可读正文。
+
+    返回 (extracted_text, is_document_or_text)。
+    """
+    import io
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    name = str(att.get("name", "附件") or "附件")[:120]
+    typ = str(att.get("type", "") or "").lower()[:80]
+    data_str = str(att.get("data", "") or "")
+    if (("text" in att and isinstance(att.get("text"), str) and not data_str.startswith("data:"))
+            or typ.startswith("text/")):
+        return str(att.get("text") or ""), True
+
+    ext = Path(name).suffix.lower()
+    if not data_str.startswith("data:"):
+        return "", False
+
+    is_pdf = ext == ".pdf" or typ == "application/pdf"
+    is_docx = ext == ".docx" or typ == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    is_xlsx = ext == ".xlsx" or typ == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if not (is_pdf or is_docx or is_xlsx):
+        return "", False
+
+    raw = _chatroom_decode_data_url(data_str, CHATROOM_MAX_DOC_BYTES, name)
+    if is_pdf:
+        try:
+            from pypdf import PdfReader
+        except ImportError as e:
+            raise ValueError("解析 PDF 需要安装 pypdf") from e
+        try:
+            reader = PdfReader(io.BytesIO(raw))
+            pages: list[str] = []
+            acc = 0
+            for page in reader.pages:
+                t = (page.extract_text() or "").strip()
+                if t:
+                    pages.append(t)
+                    acc += len(t)
+                    if acc >= CHATROOM_MAX_ATTACHMENT_TEXT + 1000:
+                        break
+        except Exception as e:
+            raise ValueError(f"无法解析 PDF「{name}」：{e}") from e
+        joined = "\n\n".join(pages).strip()
+        if not joined:
+            raise ValueError(f"PDF「{name}」未提取到文字（暂不支持纯扫描图片 PDF）")
+        return joined, True
+
+    max_xml_bytes = CHATROOM_MAX_DOC_BYTES * 4
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+    except Exception as e:
+        raise ValueError(f"无法读取文档「{name}」：{e}") from e
+
+    with zf:
+        if is_docx:
+            if "word/document.xml" not in zf.namelist():
+                raise ValueError(f"Word 文档「{name}」缺少正文内容")
+            info = zf.getinfo("word/document.xml")
+            if info.file_size > max_xml_bytes:
+                raise ValueError(f"Word 文档「{name}」解压后体积过大")
+            try:
+                root = ET.fromstring(zf.read("word/document.xml"))
+            except Exception as e:
+                raise ValueError(f"Word 文档「{name}」XML 解析失败：{e}") from e
+            lines: list[str] = []
+            for p in root.iter():
+                if not p.tag.endswith("}p"):
+                    continue
+                buf: list[str] = []
+                for node in p.iter():
+                    if node.tag.endswith("}t") and node.text:
+                        buf.append(node.text)
+                    elif node.tag.endswith("}tab"):
+                        buf.append("\t")
+                    elif node.tag.endswith("}br"):
+                        buf.append("\n")
+                line = "".join(buf).strip()
+                if line:
+                    lines.append(line)
+            joined = "\n".join(lines).strip()
+            if not joined:
+                raise ValueError(f"Word 文档「{name}」未提取到正文文字")
+            return joined, True
+
+        # .xlsx：解析共享字符串与前 5 个工作表
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            s_info = zf.getinfo("xl/sharedStrings.xml")
+            if s_info.file_size > max_xml_bytes:
+                raise ValueError(f"表格「{name}」共享字符串表体积过大")
+            try:
+                s_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+                for si in s_root:
+                    if si.tag.endswith("}si"):
+                        shared.append("".join(n.text for n in si.iter() if n.tag.endswith("}t") and n.text))
+            except Exception:
+                shared = []
+
+        sheet_names = sorted(
+            (n for n in zf.namelist() if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)),
+            key=lambda n: int(re.search(r"(\d+)", n).group(1)),
+        )[:5]
+        if not sheet_names:
+            raise ValueError(f"表格「{name}」缺少工作表")
+        sheet_blocks: list[str] = []
+        multi = len(sheet_names) > 1
+        for s_idx, s_name in enumerate(sheet_names, start=1):
+            s_info = zf.getinfo(s_name)
+            if s_info.file_size > max_xml_bytes:
+                raise ValueError(f"表格「{name}」工作表解压后体积过大")
+            try:
+                s_root = ET.fromstring(zf.read(s_name))
+            except Exception as e:
+                raise ValueError(f"表格「{name}」解析失败：{e}") from e
+            rows_out: list[str] = []
+            for row in s_root.iter():
+                if not row.tag.endswith("}row"):
+                    continue
+                cells_out: list[str] = []
+                for cell in row:
+                    if not cell.tag.endswith("}c"):
+                        continue
+                    ctype = cell.attrib.get("t", "")
+                    val = ""
+                    if ctype == "inlineStr":
+                        val = "".join(n.text for n in cell.iter() if n.tag.endswith("}t") and n.text)
+                    else:
+                        v_node = next((c for c in cell if c.tag.endswith("}v")), None)
+                        raw_v = (v_node.text or "") if v_node is not None else ""
+                        if ctype == "s" and raw_v.isdigit():
+                            idx = int(raw_v)
+                            val = shared[idx] if 0 <= idx < len(shared) else raw_v
+                        else:
+                            val = raw_v
+                    if val != "":
+                        cells_out.append(val)
+                if cells_out:
+                    rows_out.append("\t".join(cells_out))
+            if rows_out:
+                prefix = f"[工作表 {s_idx}]\n" if multi else ""
+                sheet_blocks.append(prefix + "\n".join(rows_out))
+        joined = "\n\n".join(sheet_blocks).strip()
+        if not joined:
+            raise ValueError(f"表格「{name}」未提取到单元格内容")
+        return joined, True
+
+
+def _chatroom_prepare_attachments(attachments: Optional[list[Dict[str, Any]]]) -> tuple[list[str], list[Dict[str, Any]]]:
+    """统一抽取附件文本并返回 (拼接正文片段列表, 精简持久化附件元数据列表)。"""
+    blocks: list[str] = []
+    stored: list[Dict[str, Any]] = []
+    for att in (attachments or [])[:CHATROOM_MAX_ATTACHMENTS]:
+        if not isinstance(att, dict):
+            continue
+        name = str(att.get("name", "附件") or "附件")[:120]
+        typ = str(att.get("type", "") or "")[:80]
+        try:
+            size = max(0, int(att.get("size") or 0))
+        except Exception:
+            size = 0
+        extracted, is_doc_or_text = _chatroom_extract_attachment_text(att)
+        if is_doc_or_text:
+            if len(extracted) > CHATROOM_MAX_ATTACHMENT_TEXT:
+                clipped = extracted[:CHATROOM_MAX_ATTACHMENT_TEXT] + "\n…（文件内容过长，已截断）"
+            else:
+                clipped = extracted
+            if clipped:
+                blocks.append(f"\n[文件：{name}]\n{clipped}")
+            else:
+                blocks.append(f"\n[文件：{name}]")
+            stored.append({"name": name, "type": typ, "size": size, "chars": len(clipped)})
+            continue
+        data_str = str(att.get("data", "") or "")
+        if typ.startswith("image/") and data_str.startswith("data:image/"):
+            blocks.append(f"\n[附件：{name}，{typ}]")
+            stored.append({"name": name, "type": typ, "size": size, "data": data_str})
+        else:
+            blocks.append(f"\n[附件：{name}{('，'+typ) if typ else ''}]")
+            stored.append({"name": name, "type": typ, "size": size})
+    return blocks, stored
+
+
 def _chatroom_text_with_attachments(text: str, attachments: Optional[list[Dict[str, Any]]] = None) -> str:
     text = str(text or "").strip()
     parts = [text] if text else []
-    for att in (attachments or [])[:8]:
-        name = str(att.get("name", "附件") or "附件")[:120]
-        typ = str(att.get("type", "") or "")[:80]
-        if typ.startswith("text/"):
-            data = str(att.get("text", "") or "")[:20000]
-            if data:
-                parts.append(f"\n[文件：{name}]\n{data}")
-            else:
-                parts.append(f"\n[文件：{name}]")
-        else:
-            parts.append(f"\n[附件：{name}{('，'+typ) if typ else ''}]")
+    blocks, _ = _chatroom_prepare_attachments(attachments)
+    parts.extend(blocks)
     return "\n".join(p for p in parts if p).strip()
 
 
@@ -1036,6 +1227,13 @@ CHATROOM_AGENT_MAX_CHARS = 512 * 1024
 # 单条消息保留的思维链上限。思考模型动辄几千字，会话里存十几条就把
 # CHATROOM_MAX_CHARS 撑爆；这里先截断，_chatroom_msg_size 也会把它计入体积。
 CHATROOM_REASONING_MAX_CHARS = 8000
+CHATROOM_STEP_TEXT_MAX = 4000
+CHATROOM_MAX_STEPS_PER_TURN = 60
+
+
+def _chatroom_now_monotonic() -> float:
+    fn = getattr(time, "monotonic", None)
+    return float(fn()) if callable(fn) else float(time.time())
 
 
 def _chatroom_clip_reasoning(text: str) -> str:
@@ -1045,11 +1243,72 @@ def _chatroom_clip_reasoning(text: str) -> str:
     return reasoning[:CHATROOM_REASONING_MAX_CHARS] + "\n\n…（思考过程过长，已截断）"
 
 
+def _chatroom_clip_step_text(text: Any) -> str:
+    s = str(text or "")
+    if len(s) <= CHATROOM_STEP_TEXT_MAX:
+        return s
+    return s[:CHATROOM_STEP_TEXT_MAX] + "\n…（已截断）"
+
+
+def _chatroom_sanitize_steps(steps: Any) -> list[Dict[str, Any]]:
+    """规范化单轮穿插步骤（thinking / text / tool），用于持久化与 SSE。"""
+    if not isinstance(steps, list):
+        return []
+    out: list[Dict[str, Any]] = []
+    for raw in steps:
+        if not isinstance(raw, dict):
+            continue
+        typ = str(raw.get("type") or "").strip().lower()
+        if typ == "thinking":
+            text = _chatroom_clip_reasoning(str(raw.get("text") or ""))
+            if not text:
+                continue
+            item: Dict[str, Any] = {"type": "thinking", "text": text}
+            dur = int(raw.get("duration_ms") or 0)
+            if dur > 0:
+                item["duration_ms"] = dur
+            out.append(item)
+        elif typ == "text":
+            text = str(raw.get("text") or "").strip()
+            if not text:
+                continue
+            out.append({"type": "text", "text": _chatroom_clip_step_text(text)})
+        elif typ == "tool":
+            name = str(raw.get("name") or "").strip()
+            if not name:
+                continue
+            status = str(raw.get("status") or ("ok" if raw.get("ok") else "error")).strip().lower()
+            if status not in ("running", "ok", "error", "cancelled"):
+                status = "error"
+            result_str = _chatroom_clip_step_text(raw.get("result") or "")
+            out.append({
+                "type": "tool",
+                "call_id": str(raw.get("call_id") or ""),
+                "round": int(raw.get("round") or 1),
+                "name": name,
+                "arguments": _chatroom_clip_step_text(raw.get("arguments") or ""),
+                "status": status,
+                "ok": bool(raw.get("ok", status == "ok")),
+                "duration_ms": max(0, int(raw.get("duration_ms") or 0)),
+                "result": result_str,
+                "result_chars": max(len(result_str), int(raw.get("result_chars") or 0)),
+            })
+        if len(out) >= CHATROOM_MAX_STEPS_PER_TURN:
+            break
+    return out
+
+
 def _chatroom_msg_size(msg: Dict[str, Any]) -> int:
     size = len(str(msg.get("content", "") or ""))
     # 思维链是 assistant 消息的独立字段，不算进来的话裁剪预算会严重低估，
     # data/webui/chatroom/*.json 会远超 CHATROOM_MAX_CHARS。
     size += len(str(msg.get("reasoning", "") or ""))
+    for step in msg.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        size += len(str(step.get("text", "") or ""))
+        size += len(str(step.get("arguments", "") or ""))
+        size += len(str(step.get("result", "") or ""))
     for att in msg.get("attachments") or []:
         size += len(str(att.get("data", "") or "")) + len(str(att.get("text", "") or ""))
     return size
@@ -1097,30 +1356,32 @@ def _chatroom_trim_agent_history(obj: Dict[str, Any]) -> None:
 # 它无论如何都裁不掉——必须在入库前独立拒绝，不能指望事后裁剪。
 CHATROOM_MAX_ONE_MESSAGE = 1024 * 1024
 CHATROOM_MAX_ATTACHMENTS = 8
+CHATROOM_MAX_ATTACHMENT_TEXT = 20000
+CHATROOM_MAX_DOC_BYTES = 8 * 1024 * 1024
 
 
-def _chatroom_validate_incoming(text: str, attachments: Optional[list] = None) -> None:
-    """入库前校验单条消息，超限直接拒绝。"""
+def _chatroom_validate_incoming(text: str, attachments: Optional[list] = None) -> tuple[str, list[Dict[str, Any]]]:
+    """入库前抽取附件文本并校验单条消息大小，超限直接拒绝。"""
     atts = attachments or []
     if len(atts) > CHATROOM_MAX_ATTACHMENTS:
         raise ValueError(f"附件数量超过上限（{len(atts)} 个，最多 {CHATROOM_MAX_ATTACHMENTS} 个）")
-    size = len(str(text or ""))
-    for att in atts:
-        if not isinstance(att, dict):
-            continue
-        size += len(str(att.get("data", "") or "")) + len(str(att.get("text", "") or ""))
+    raw_text = str(text or "").strip()
+    blocks, stored = _chatroom_prepare_attachments(atts)
+    full_text = "\n".join(p for p in ([raw_text] if raw_text else []) + blocks if p).strip()
+    size = len(full_text)
+    for att in stored:
+        size += len(str(att.get("data", "") or ""))
     if size > CHATROOM_MAX_ONE_MESSAGE:
         raise ValueError(
             f"这条消息连附件共 {size} 字符，超过单条上限 {CHATROOM_MAX_ONE_MESSAGE}。"
             "请压缩图片或分几次发送。"
         )
+    return full_text, stored
 
 
 def _chatroom_prepare_user_message(session_id: str, model: str, text: str, attachments: Optional[list[Dict[str, Any]]] = None) -> tuple[Dict[str, Any], str]:
-    # 先校验原始输入：_chatroom_text_with_attachments 会把文本附件拼进正文，
-    # 拼完再算大小就晚了
-    _chatroom_validate_incoming(text, attachments)
-    text = _chatroom_text_with_attachments(text, attachments)
+    raw_text = str(text or "").strip()
+    text, stored_attachments = _chatroom_validate_incoming(raw_text, attachments)
     if not text:
         raise ValueError("消息内容不能为空")
     with _chatroom_lock:
@@ -1137,9 +1398,10 @@ def _chatroom_prepare_user_message(session_id: str, model: str, text: str, attac
         obj["_rotation_signature"] = signature
         now = int(time.time())
         request_id = uuid.uuid4().hex
-        msg = {"id": uuid.uuid4().hex, "role": "user", "content": text, "ts": now, "request_id": request_id}
-        if attachments:
-            msg["attachments"] = attachments[:8]
+        msg: Dict[str, Any] = {"id": uuid.uuid4().hex, "role": "user", "content": text, "ts": now, "request_id": request_id}
+        if stored_attachments:
+            msg["attachments"] = stored_attachments
+            msg["user_text"] = raw_text
         obj["messages"].append(msg)
         _chatroom_trim_history(obj)
         _chatroom_trim_agent_history(obj)
@@ -1242,27 +1504,36 @@ def _chatroom_reply_filter_hit(text: str) -> str:
 def _chatroom_append_assistant(obj: Dict[str, Any], reply: str,
                                agent_state: Optional[Dict[str, Any]] = None,
                                progress_messages: Optional[list[str]] = None,
-                               reasoning: str = "") -> Dict[str, Any]:
+                               reasoning: str = "",
+                               steps: Optional[list[Dict[str, Any]]] = None,
+                               duration_ms: int = 0) -> Dict[str, Any]:
     with _chatroom_lock:
         fresh = _chatroom_load(obj.get("id", "")) or obj
         request_id = next((
             m.get("request_id") for m in reversed(fresh.get("messages", []))
             if m.get("role") == "user" and m.get("request_id")
         ), "")
-        for content in progress_messages or []:
-            content = str(content or "").strip()
-            if content:
-                fresh.setdefault("messages", []).append({
-                    "id": uuid.uuid4().hex,
-                    "role": "assistant", "content": content, "ts": int(time.time()),
-                    "request_id": request_id,
-                })
+        raw_steps = steps if steps is not None else (agent_state.get("steps") if isinstance(agent_state, dict) else None)
+        clean_steps = _chatroom_sanitize_steps(raw_steps)
+        has_interleaved = any(s.get("type") in ("tool", "text") for s in clean_steps)
+        thinking_steps = [s for s in clean_steps if s.get("type") == "thinking"]
+        turn_duration = max(0, int(duration_ms or (agent_state.get("duration_ms") if isinstance(agent_state, dict) else 0) or 0))
+        # 若已有按真实时序交错的 steps（含 tool 或 text），不再前置重复的 progress 气泡
+        if not has_interleaved:
+            for content in progress_messages or []:
+                content = str(content or "").strip()
+                if content:
+                    fresh.setdefault("messages", []).append({
+                        "id": uuid.uuid4().hex,
+                        "role": "assistant", "content": content, "ts": int(time.time()),
+                        "request_id": request_id,
+                    })
         # 思维链跟着回复存，但只作为独立字段——不进 content，
         # 所以既不会被当正文渲染，也不会进 _agent_history 污染上下文。
         # 存前截断：思考模型的思维链动辄几千字，不限长会撑爆会话文件。
         reasoning = _chatroom_clip_reasoning(reasoning)
-        # 按分段设置把这条回复拆成多段气泡；每段都带上同一份思维链，
-        # 前端就能在每段上方各显示一次思考过程。分段关闭时只有一段。
+        # 按分段设置把这条回复拆成多段气泡；仅首段携带整轮思考与工具步骤，
+        # 避免 <split> 后每段上方都出现重复的「思考过程」标签。
         segments = _chatroom_split_reply(reply)
         if not segments:
             segments = [reply]
@@ -1283,15 +1554,21 @@ def _chatroom_append_assistant(obj: Dict[str, Any], reply: str,
                 "request_id": request_id,
             })
         else:
-            for seg in segments:
-                assistant_msg = {
+            attach_steps = clean_steps if (has_interleaved or len(thinking_steps) > 1) else []
+            for seg_idx, seg in enumerate(segments):
+                assistant_msg: Dict[str, Any] = {
                     # 同轮分段会共用时间戳和请求号，独立 ID 才能稳定区分各气泡。
                     "id": uuid.uuid4().hex,
                     "role": "assistant", "content": seg, "ts": int(time.time()),
                     "request_id": request_id,
                 }
-                if reasoning:
-                    assistant_msg["reasoning"] = reasoning
+                if seg_idx == 0:
+                    if reasoning:
+                        assistant_msg["reasoning"] = reasoning
+                    if attach_steps:
+                        assistant_msg["steps"] = attach_steps
+                    if turn_duration > 0:
+                        assistant_msg["duration_ms"] = turn_duration
                 fresh.setdefault("messages", []).append(assistant_msg)
         if isinstance(agent_state, dict):
             history = agent_state.get("history")
@@ -1305,24 +1582,32 @@ def _chatroom_append_assistant(obj: Dict[str, Any], reply: str,
         return fresh
 
 
-def _chatroom_append_error(obj: Dict[str, Any], error_text: str) -> Dict[str, Any]:
+def _chatroom_append_error(obj: Dict[str, Any], error_text: str,
+                           steps: Optional[list[Dict[str, Any]]] = None,
+                           duration_ms: int = 0) -> Dict[str, Any]:
     """生成失败时把报错原因作为一条带 error 标记的消息存进会话。
 
     保留用户那条消息（不再删掉），报错以红色气泡形式持久化，刷新后仍在。
     带 error 标记的消息不会进 LLM 上下文（见 _chatroom_build_llm_messages）。
     """
     error_text = str(error_text or "").strip() or "生成失败"
+    clean_steps = _chatroom_sanitize_steps(steps)
     with _chatroom_lock:
         fresh = _chatroom_load(obj.get("id", "")) or obj
         request_id = next((
             m.get("request_id") for m in reversed(fresh.get("messages", []))
             if m.get("role") == "user" and m.get("request_id")
         ), "")
-        fresh.setdefault("messages", []).append({
+        err_msg: Dict[str, Any] = {
             "id": uuid.uuid4().hex,
             "role": "assistant", "content": error_text, "error": True,
             "ts": int(time.time()), "request_id": request_id,
-        })
+        }
+        if clean_steps and any(s.get("type") in ("tool", "text") for s in clean_steps):
+            err_msg["steps"] = clean_steps
+        if duration_ms and int(duration_ms) > 0:
+            err_msg["duration_ms"] = int(duration_ms)
+        fresh.setdefault("messages", []).append(err_msg)
         _chatroom_trim_history(fresh)
         _chatroom_save(fresh)
         return fresh
@@ -1346,6 +1631,7 @@ def _chatroom_remove_pending_user(session_id: str, request_id: str) -> None:
 def _chatroom_send(session_id: str, model: str, text: str,
                    attachments: Optional[list[Dict[str, Any]]] = None) -> Dict[str, Any]:
     with _chatroom_session_lock(session_id):
+        turn_started = _chatroom_now_monotonic()
         obj, text = _chatroom_prepare_user_message(session_id, model, text, attachments)
         request_id = next((
             m.get("request_id") for m in reversed(obj.get("messages", []))
@@ -1362,7 +1648,7 @@ def _chatroom_send(session_id: str, model: str, text: str,
                     "id": session_id,
                     "model": obj.get("model", ""),
                     "text": text,
-                    "attachments": attachments or [],
+                    "attachments": (obj.get("messages") or [{}])[-1].get("attachments") or [],
                     "persona": obj.get("persona") or "",
                     "agent_history": obj.get("_agent_history") or [],
                     "total_tokens": obj.get("_agent_total_tokens") or 0,
@@ -1382,10 +1668,12 @@ def _chatroom_send(session_id: str, model: str, text: str,
             # 刷新后仍能看到失败原因；该 error 气泡不会进 LLM 上下文。
             _chatroom_append_error(obj, str(e))
             raise
+        turn_duration = max(0, int((_chatroom_now_monotonic() - turn_started) * 1000))
         obj = _chatroom_append_assistant(
             obj, reply, agent_state=agent_state,
             progress_messages=_chatroom_progress_messages(agent_state),
             reasoning=reasoning,
+            duration_ms=(agent_state.get("duration_ms") if isinstance(agent_state, dict) else None) or turn_duration,
         )
         return {"reply": reply, "session": _chatroom_public(obj)}
 
@@ -1409,6 +1697,15 @@ def merge_string_lists(*items: Any) -> list[str]:
     return result
 
 
+def _normalize_webui_version(value: Any, default: str = "classic") -> str:
+    text = str(value or "").strip().lower()
+    if text in ("modern", "new", "v2", "新版", "现代"):
+        return "modern"
+    if text in ("classic", "legacy", "old", "v1", "旧版", "老版"):
+        return "classic"
+    return default
+
+
 def get_webui_config() -> Dict[str, Any]:
     cfg = read_json(CONFIG_PATH, {})
     webui = cfg.get("WebUI") or cfg.get("webui") or {}
@@ -1417,6 +1714,7 @@ def get_webui_config() -> Dict[str, Any]:
         "host": str(webui.get("host", "127.0.0.1")),
         "port": int(webui.get("port", 8765)),
         "access_token": str(webui.get("access_token", "")),
+        "ui_version": _normalize_webui_version(webui.get("ui_version", "classic")),
         "theme_preset": str(webui.get("theme_preset", "xcbot") or "xcbot"),
         "background_image": str(webui.get("background_image", "") or ""),
         "background_blur": int(float(webui.get("background_blur", 10) or 0)),
@@ -1620,7 +1918,7 @@ def collect_config_bundle() -> Dict[str, Any]:
         "agent_tools": collect_agent_tools(cfg),
         # 只下发要展示的工具：隐藏工具（只读查询、只作用于当前会话的操作）
         # 既不出现在页面上，也不写进 config.json
-        "agent_tool_meta": visible_tools(),
+        "agent_tool_meta": [{**m, "members": card_members(m["key"])} for m in visible_tools()],
         "agent_tool_groups": AGENT_TOOL_GROUPS,
         "ui_schema": build_ui_schema(cfg),
         "super_users": super_users,
@@ -2176,9 +2474,11 @@ def _role_life_experiences_page(account: str, role_id: str, kinds: set[str],
         if page_no >= pages or not items:
             break
         page_no += 1
-    result = {"items": collected[(page - 1) * page_size: page * page_size],
-              "page": page, "page_size": page_size, "total": len(collected),
-              "pages": max(1, (len(collected) + page_size - 1) // page_size)}
+    pages_total = max(1, (len(collected) + page_size - 1) // page_size)
+    clamped_page = max(1, min(page, pages_total))
+    result = {"items": collected[(clamped_page - 1) * page_size: clamped_page * page_size],
+              "page": clamped_page, "page_size": page_size, "total": len(collected),
+              "pages": pages_total}
     with _role_life_runtime_lock:
         if len(_ROLE_LIFE_RECORD_CACHE) > 64:
             _ROLE_LIFE_RECORD_CACHE.clear()
@@ -2489,17 +2789,26 @@ def _save_config_bundle_locked(data: Dict[str, Any]):
                 new_section = copy.deepcopy(rl_mod.DEFAULT_ROLE_CONFIG)
             elif not isinstance(incoming_rl, dict):
                 raise ValueError("RoleLife 必须是对象")
-            elif "roles" in incoming_rl and not any(k in rl_mod.DEFAULT_ROLE_CONFIG for k in incoming_rl):
-                # 旧格式提交：严格校验每一项后再提取为统一扁平配置
-                validated = rl_mod.normalize_role_life_section(incoming_rl)
-                new_section = rl_mod.resolve_global_config(validated)
             else:
-                unknown_keys = [k for k in incoming_rl if k not in rl_mod.DEFAULT_ROLE_CONFIG and k != "chat_feedback_enabled"]
-                if unknown_keys:
-                    raise ValueError(f"包含不支持的字段：{', '.join(unknown_keys[:5])}")
-                base_rl = rl_mod.resolve_global_config(existing.get("RoleLife"))
-                base_rl.update(incoming_rl)
-                new_section = rl_mod.normalize_role_config(base_rl)
+                cleaned_rl = {k: v for k, v in incoming_rl.items() if not str(k).startswith("_comment")}
+                has_flat_keys = any(k in rl_mod.DEFAULT_ROLE_CONFIG for k in cleaned_rl)
+                if "roles" in cleaned_rl and not has_flat_keys:
+                    # 旧格式提交：严格校验每一项后再提取为统一扁平配置
+                    validated = rl_mod.normalize_role_life_section(cleaned_rl)
+                    new_section = rl_mod.resolve_global_config(validated)
+                else:
+                    # 兼容清理旧模板深合并残留下来的空 roles 壳及废弃扁平键，避免阻塞正常保存
+                    if has_flat_keys:
+                        if cleaned_rl.get("roles") == {}:
+                            cleaned_rl.pop("roles", None)
+                        for _dead_rl in ("role_daily_limit", "weather_city"):
+                            cleaned_rl.pop(_dead_rl, None)
+                    unknown_keys = [k for k in cleaned_rl if k not in rl_mod.DEFAULT_ROLE_CONFIG and k != "chat_feedback_enabled"]
+                    if unknown_keys:
+                        raise ValueError(f"包含不支持的字段：{', '.join(unknown_keys[:5])}")
+                    base_rl = rl_mod.resolve_global_config(existing.get("RoleLife"))
+                    base_rl.update(cleaned_rl)
+                    new_section = rl_mod.normalize_role_config(base_rl)
         except ValueError as exc:
             raise ValueError(f"RoleLife 配置无效：{exc}") from None
         cfg["RoleLife"] = new_section
@@ -2555,8 +2864,14 @@ def _save_config_bundle_locked(data: Dict[str, Any]):
         # 前端只发代表工具的状态，这里展开到同卡片的全部成员，否则其余成员会被
         # 当成"没提交"而退回默认值，用户关了开关却发现工具还能用。
         incoming_all = {}
-        for name, value in (data["agent_tools"] or {}).items():
-            if name not in allowed or not isinstance(value, dict):
+        raw_agent_tools = data.get("agent_tools") or {}
+        rep_keys = {m["key"] for m in visible_tools()}
+        for name, value in raw_agent_tools.items():
+            if name not in allowed or not isinstance(value, dict) or name in rep_keys:
+                continue
+            incoming_all[name] = value
+        for name, value in raw_agent_tools.items():
+            if name not in allowed or not isinstance(value, dict) or name not in rep_keys:
                 continue
             for member in card_members(name):
                 incoming_all[member] = value
@@ -2706,6 +3021,9 @@ def _save_config_bundle_locked(data: Dict[str, Any]):
     sync_provider_config(others)
     sync_personality_presets(others)
     cfg.pop("split_reply_quote", None)
+    webui_section = cfg.get("WebUI")
+    if isinstance(webui_section, dict) and "ui_version" in webui_section:
+        webui_section["ui_version"] = _normalize_webui_version(webui_section.get("ui_version"), default="classic")
 
     data["config_json"] = cfg
     write_json(CONFIG_PATH, cfg)
@@ -2742,7 +3060,7 @@ def field(path: str, label: str, typ="text", desc="", default=None, options=None
 def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
     return [
         {"key": "welcome", "title": "欢迎", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>', "desc": "", "fields": []},
-        {"key": "stats", "title": "数据统计", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" x2="18" y1="20" y2="10"/><line x1="12" x2="12" y1="20" y2="4"/><line x1="6" x2="6" y1="20" y2="14"/></svg>', "desc": "消息数、模型调用历史、模型排名与最近 1 天 Tokens Top 10", "fields": []},
+        {"key": "stats", "title": "数据统计", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" x2="18" y1="20" y2="10"/><line x1="12" x2="12" y1="20" y2="4"/><line x1="6" x2="6" y1="20" y2="14"/></svg>', "desc": "模型调用、缓存命中率、模型排名与最近 24 小时用量", "fields": []},
         {"key": "bot", "title": "机器人", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="10" x="3" y="11" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" x2="8" y1="16" y2="16"/><line x1="16" x2="16" y1="16" y2="16"/></svg>', "desc": "机器人名称、触发词和命令前缀", "fields": [
             field("Others.bot_name", "中文名", "text"),
             field("Others.bot_name_en", "英文名", "text"),
@@ -2750,22 +3068,22 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("Others.robot_name_triggers", "触发词", "list", "一行一个，群里提到会触发回复"),
         ]},
         {"key": "ai", "title": "AI 配置", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>', "desc": "配置上下文、回复过滤与分段回复", "fields": [
-            field("Others.auto_compress_after_messages", "自动压缩触发轮数", "number", "完整对话达到此轮数时自动尝试压缩，也是手动压缩的最低准入轮数；仍需满足保留轮数与冷却条件", 40, category="上下文与记忆", min=1),
-            field("Others.compression_keep_recent", "保留近期对话轮数", "number", "保留最近完整轮次及其图片；较早对话合并为详细结构化记忆，摘要保存成功后删除被压缩轮次的原图，压缩仍可能损失细节", 20, category="上下文与记忆", min=1),
-            field("Others.context_max_messages", "上下文保留上限（轮）", "number", "按完整对话轮次计算，超限裁掉较早对话；建议上限大于自动压缩触发轮数，避免触发前就被裁剪", 60, category="上下文与记忆", min=1),
-            field("Others.llm_reply_failover_keywords", "回复过滤关键词", "list", "一行一个。仅在最终要发给用户的回复上检查（不检查 Agent 中间步骤）；命中任一关键词则跳过当前模型的全部 Key，按轮换列表尝试下一模型；全部命中则失败、不发送", category="上下文与过滤"),
-            field("Others.llm_split.enabled", "启用 LLM 分段回复", "bool", "仅对大模型生成结果生效，不影响普通群聊回复是否引用", category="分段回复"),
+            field("Others.auto_compress_after_messages", "自动压缩触发轮数", "number", "对话达到此轮数时自动尝试压缩，同时作为手动压缩的最低轮数", 40, category="上下文与记忆", min=1),
+            field("Others.compression_keep_recent", "保留近期对话轮数", "number", "保留最近完整对话轮数，较早对话将压缩为摘要", 20, category="上下文与记忆", min=1),
+            field("Others.context_max_messages", "上下文保留上限（轮）", "number", "最大保留完整对话轮数，建议大于自动压缩触发轮数", 60, category="上下文与记忆", min=1),
+            field("Others.llm_reply_failover_keywords", "回复过滤关键词", "list", "一行一个，命中任一关键词则跳过当前模型并按轮换切换下一个", category="上下文与过滤"),
+            field("Others.llm_split.enabled", "启用 LLM 分段回复", "bool", "开启后按下方模式将长回复拆分为多条消息发送", category="分段回复"),
             field("Others.llm_split.mode", "LLM 分段模式", "select", "auto_prompt=大模型自主分段；regex=按正则切分模型输出", "auto_prompt", ["auto_prompt", "regex"], category="分段回复"),
-            field("Others.llm_split.prompt_suffix", "自主分段提示词", "textarea", "模式一使用。会自动追加到每次 LLM 用户消息后。建议保留 <split> 分隔符说明", category="分段回复"),
-            field("Others.llm_split.split_regex", "分段正则表达式", "textarea", "模式二使用。用于识别分段点。建议：.*?[。？！~]+|.+$", category="分段回复"),
-            field("Others.llm_split.filter_regex", "内容过滤正则表达式", "textarea", "仅模式二使用。对每段文本做清理，例如移除换行：\\n|\\r。模式一不受它影响，模型自己排的换行会原样保留", category="分段回复"),
-            field("Others.llm_split.max_chars_no_split", "超过多少字不分段", "number", "最终要发送的整条内容超过[ ]字时，忽略 <split>/正则分段，改为单条发送；填 0 表示不限制", 0, category="分段回复"),
+            field("Others.llm_split.prompt_suffix", "自主分段提示词", "textarea", "自主分段模式使用，会自动追加到每次用户消息后，建议保留 <split> 说明", category="分段回复"),
+            field("Others.llm_split.split_regex", "分段正则表达式", "textarea", "正则分段模式使用，例如：.*?[。？！~]+|.+$", category="分段回复"),
+            field("Others.llm_split.filter_regex", "内容过滤正则表达式", "textarea", "仅正则分段模式生效，用于清理每段文本，例如移除换行：\\n|\\r", category="分段回复"),
+            field("Others.llm_split.max_chars_no_split", "超过多少字不分段", "number", "整条回复超过该字数时改为单条发送，填 0 表示不限制", 0, category="分段回复"),
         ]},
         {"key": "providers", "title": "提供商", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>', "desc": "配置提供商、对话模型、嵌入模型和判断模型", "fields": [
-            field("Others.llm_providers", "提供商（对话 / 嵌入 / 判断）", "providers", "对话、嵌入和判断模型共用同一提供商的 Base URL、Key 和代理。判断模型用于主动回复是否发言的判断，正文由对话模型生成；嵌入和判断模型不参与对话模型轮换。"),
+            field("Others.llm_providers", "提供商（对话 / 嵌入 / 判断）", "providers", "对话、嵌入和判断模型共用同一提供商的 Base URL、Key 和代理"),
             field("Others.llm_rotation", "模型轮换", "rotation"),
-            field("Others.api_multimodal_model", "多模态图片模型", "multimodal_model", "主模型不支持多模态且用户发送图片时使用的多模态模型"),
-            field("Others.api_multimodal_image_mode", "图片处理模式", "select", "relay=多模态模型先转述图片，再交给主模型回复；direct=直接由多模态模型回复图片消息", "relay", ["relay", "direct"]),
+            field("Others.api_multimodal_model", "识图模型", "multimodal_model", "主模型不支持识图且收到图片时使用的识图模型"),
+            field("Others.api_multimodal_image_mode", "图片处理模式", "select", "relay=识图模型先转述图片再交给主模型回复；direct=直接由识图模型回复图片消息", "relay", ["relay", "direct"]),
         ]},
         {"key": "knowledge", "title": "知识库", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z"/></svg>', "desc": "上传文档，配置向量检索或 SQLite 全文检索", "fields": [
             field("KnowledgeBase.enabled", "启用知识库", "bool", "开启后 Agent 会自动检索 WebUI 上传的知识库文档。"),
@@ -2785,10 +3103,10 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
         ]},
         {"key": "role-life", "title": "角色生活", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22c4-3.5 8-7 8-11a8 8 0 1 0-16 0c0 4 4 7.5 8 11Z"/><path d="M8 11a4 4 0 0 1 4-4"/></svg>', "desc": "让机器人拥有自己的日常作息、经历、日记与梦，让聊天更有活人感", "fields": []},
         {"key": "features", "title": "功能配置", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="14" y="3" rx="1"/><path d="M10 21V8a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5a1 1 0 0 0-1-1H3"/></svg>', "desc": "配置功能", "fields": [
-            field("Others.sensitive_words", "屏蔽词", "list", "一行一条，格式「原词=替换成的词」；只写原词则删掉它。只替换用户发给机器人的消息，机器人回复、昵称、人设、群聊总结等不受影响"),
+            field("Others.sensitive_words", "屏蔽词", "list", "一行一条，格式「原词=替换词」，只写原词则删除（仅处理用户消息）"),
             field("Others.emoji_plus_one_cooldown_seconds", "表情 +1 冷却秒数", "number", "单个表情自动复读的防抖时间"),
-            field("Others.weak_blacklist_trigger_probability", "弱黑名单回复概率", "number", "全局 AI 回复的放行概率，支持 0~1，也兼容 0~100；0=不回复，1=全部放行，越小越容易拦截。群聊和私聊均生效，不影响命令和插件；群聊主动仅在引用他人消息时检查该作者，未引用或引用自己不套用用户弱名单", 0.3, min=0, max=100, step=0.05),
-            field("Others.weak_blacklist_users", "弱黑名单用户", "list", "一行一个 QQ 号。全局限制这些用户的 AI 回复，不影响命令和插件；群聊主动仅在引用他人消息时检查该作者，未引用或引用自己不套用用户弱名单"),
+            field("Others.weak_blacklist_trigger_probability", "弱黑名单回复概率", "number", "黑名单用户的 AI 回复放行概率，支持 0~1 或 0~100（0=不回复，1=全部放行）", 0.3, min=0, max=100, step=0.05),
+            field("Others.weak_blacklist_users", "弱黑名单用户", "list", "一行一个 QQ 号，按上方概率限制这些用户的 AI 回复"),
             field("Others.group_random_reply_probability", "群聊概率触发概率", "number", "普通群消息命中该概率时，机器人会主动接话。支持 0~1，也兼容 0~100；填 0 表示关闭"),
             field("Others.group_random_reply_quote", "群聊概率触发时引用消息", "bool", "开启后，概率触发的回复会引用原消息；关闭则直接发送"),
             field("Others.group_chat_context_max_messages", "群聊上下文最大条数", "number", "功能配置里开启「群聊上下文感知」后，每个群旁听缓冲最多保留多少条", 30, min=1, max=300),
@@ -2800,7 +3118,7 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("Others.system.trace_max_records", "追踪保存条数", "number", "AI 对话追踪最多保留多少条记录，超出丢最旧的。条数越多占用磁盘和内存越大", 100, category="系统设置", min=1, max=1000),
         ]},
         {"key": "proactive", "title": "主动回复", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M8 9h8"/><path d="M8 13h6"/></svg>', "desc": "群聊与私聊的主动回复", "fields": [
-            field("ProactiveReply.group.enabled", "群聊：启用主动回复", "bool", "开启后在群聊空闲时由判断模型决定是否主动发言；同时受「群聊响应」开关约束", False, category="群聊"),
+            field("ProactiveReply.group.enabled", "群聊：启用主动回复", "bool", "开启后在群聊空闲时由规划器决定是否主动发言", False, category="群聊"),
             field("ProactiveReply.group.trigger_probability", "群聊：触发概率", "number", "0~1，冷场时抽中后才会触发思考是否发言；调高更活跃", 0.25, category="群聊", min=0, max=1, step=0.05),
             field("ProactiveReply.group.check_interval_seconds", "群聊：检查间隔（秒）", "number", "调度器对同一个群的最短检查间隔", 180, category="群聊", min=10, max=3600),
             field("ProactiveReply.group.idle_threshold_seconds", "群聊：群空闲阈值（秒）", "number", "群里最后一条消息距今超过该时长才考虑主动发言（默认 30 分钟）", 1800, category="群聊", min=60, max=86400),
@@ -2809,7 +3127,7 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("ProactiveReply.group.max_contacts_per_day", "群聊：每日最多主动次数", "number", "单个群 24 小时内最多主动发起多少次聊天；填 0 表示不限制（默认 0）", 0, category="群聊", min=0, max=50),
             field("ProactiveReply.group.whitelist", "群聊：白名单", "list", "一行一个群号；非空时仅对名单内群主动，留空表示不限群（黑名单除外）", category="群聊"),
             field("ProactiveReply.group.blacklist", "群聊：黑名单", "list", "一行一个群号；名单内群不触发主动回复", category="群聊"),
-            field("ProactiveReply.group.observation.enabled", "群聊：发完后继续观察", "bool", "开启后在发言后短时间留意群里是否顺着话题接话；不是必须发送、无人说话不催发，普通一问一答不等这些计时", True, category="群聊观察"),
+            field("ProactiveReply.group.observation.enabled", "群聊：发完后继续观察", "bool", "发言后短时间留意群聊是否继续，由规划器决定是否续聊", True, category="群聊观察"),
             field("ProactiveReply.group.observation.trigger_probability", "群聊：发言后继续观察概率", "number", "0~1，普通回复或首次主动发言后是否进入观察的概率", 0.35, category="群聊观察", min=0, max=1, step=0.05),
             field("ProactiveReply.group.observation.default_wait_seconds", "规划器等待默认/上限（秒）", "number", "规划器可选等待时间的上限与兜底默认值", 60, category="群聊观察", min=1, max=3600, step=1),
             field("ProactiveReply.group.observation.min_wait_seconds", "最少等多久再判断（秒）", "number", "规划器可选等待时间的下限", 10, category="群聊观察", min=1, max=3600, step=1),
@@ -2817,8 +3135,8 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("ProactiveReply.group.observation.debounce_seconds", "有人接话后合并几秒再判断", "number", "把短时间内的群消息合并后再判断，0 表示不合并等待", 8, category="群聊观察", min=0, max=300, step=1),
             field("ProactiveReply.group.observation.max_debounce_seconds", "最多合并等待几秒", "number", "从第一条新消息起最多合并等待多久", 20, category="群聊观察", min=0, max=300, step=1),
             field("ProactiveReply.group.observation.min_continuation_interval_seconds", "续聊最小发言间隔（秒）", "number", "观察续聊两次主动发言的最短间隔", 30, category="群聊观察", min=1, max=3600, step=1),
-            field("ProactiveReply.private.enabled", "私聊：启用主动回复", "bool", "开启后在私聊沉默一段时间时由判断模型决定是否主动开口；同时受「私聊响应」开关约束", False, category="私聊"),
-            field("ProactiveReply.private.trigger_probability", "私聊：触发概率", "number", "0~1，冷场抽中后由判断模型结合状态决定是否开口", 0.2, category="私聊", min=0, max=1, step=0.05),
+            field("ProactiveReply.private.enabled", "私聊：启用主动回复", "bool", "开启后在私聊沉默时由规划器决定是否主动开口", False, category="私聊"),
+            field("ProactiveReply.private.trigger_probability", "私聊：触发概率", "number", "0~1，冷场抽中后由规划器结合状态决定是否开口", 0.2, category="私聊", min=0, max=1, step=0.05),
             field("ProactiveReply.private.check_interval_seconds", "私聊：检查间隔（秒）", "number", "对同一个用户的最短检查间隔", 180, category="私聊", min=30, max=7200),
             field("ProactiveReply.private.idle_threshold_seconds", "私聊：用户沉默阈值（秒）", "number", "对方最后一条消息距今超过该时长后才考虑主动开口（默认 2 小时）", 7200, category="私聊", min=300, max=604800),
             field("ProactiveReply.private.max_unanswered_messages", "私聊：未回复熔断", "number", "连续 N 条主动消息未获回复即停止主动，直到对方再次发言", 3, category="私聊", min=1, max=10),
@@ -2826,7 +3144,7 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("ProactiveReply.private.max_contacts_per_day", "私聊：每日最多主动次数", "number", "单个好友 24 小时内最多主动发起多少次聊天；填 0 表示不限制（默认 0）", 0, category="私聊", min=0, max=50),
             field("ProactiveReply.private.whitelist", "私聊：白名单", "list", "一行一个 QQ 号；非空时仅对名单内用户主动，留空表示不限用户（黑名单除外）", category="私聊"),
             field("ProactiveReply.private.blacklist", "私聊：黑名单", "list", "一行一个 QQ 号；名单内用户不触发主动回复", category="私聊"),
-            field("ProactiveReply.private.observation.enabled", "私聊：发完后继续观察", "bool", "私聊默认关闭；开启后在发言后短时间留意对方是否继续聊，不是必须发送、无人说话不催发，普通一问一答不等这些计时", False, category="私聊观察"),
+            field("ProactiveReply.private.observation.enabled", "私聊：发完后继续观察", "bool", "发言后短时间留意对方是否继续聊，由规划器决定是否续聊", False, category="私聊观察"),
             field("ProactiveReply.private.observation.trigger_probability", "私聊：发言后继续观察概率", "number", "0~1，普通回复或首次主动发言后是否进入观察的概率", 0.35, category="私聊观察", min=0, max=1, step=0.05),
             field("ProactiveReply.private.observation.default_wait_seconds", "规划器等待默认/上限（秒）", "number", "规划器可选等待时间的上限与兜底默认值", 60, category="私聊观察", min=1, max=3600, step=1),
             field("ProactiveReply.private.observation.min_wait_seconds", "最少等多久再判断（秒）", "number", "规划器可选等待时间的下限", 10, category="私聊观察", min=1, max=3600, step=1),
@@ -2836,14 +3154,14 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("ProactiveReply.private.observation.min_continuation_interval_seconds", "续聊最小发言间隔（秒）", "number", "观察续聊两次主动发言的最短间隔", 30, category="私聊观察", min=1, max=3600, step=1),
         ]},
         {"key": "agent", "title": "Agent", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>', "desc": "配置 AI 自主调用工具的基本设置、执行限制与联网搜索", "fields": [
-            field("Agent.enabled", "启用 Agent", "bool", "总开关。关闭时完全不向模型传 tools，与旧版行为一致", category="基本设置"),
+            field("Agent.enabled", "启用 Agent", "bool", "开启后允许 AI 自主调用已启用的工具", category="基本设置"),
             field("Agent.max_rounds", "最大工具轮数", "number", "单次任务最多允许连续调用工具的轮数", 30, category="基本设置", min=1, max=50),
-            field("Agent.retry_attempts", "失败后额外重试次数", "number", "当前模型/Key 失败后再试几次；用尽后按轮换顺序切换下一个模型/Key。空回复（模型既没调工具也没给文本）也算失败。默认 3，设置为 0 表示直接轮换", 3, category="执行限制", min=0, max=5),
-            field("Agent.clear_workspace_on_reset", "/reset 命令清空工作区", "bool", "开启后 /reset 会同时清空当前会话的 Agent 工作区；关闭后仍清除聊天记忆，但保留工作区文件", category="执行限制"),
-            field("Agent.tool_result_max_chars", "工具结果最大字数", "number", "超出部分写入 data/agent_overflow，只回灌预览+路径，AI 可用 file_read 读全文", 8000, category="执行限制", min=500, max=60000),
+            field("Agent.retry_attempts", "失败后额外重试次数", "number", "当前模型失败后的重试次数，用尽后按轮换切换下一个（0 表示直接轮换）", 3, category="执行限制", min=0, max=5),
+            field("Agent.clear_workspace_on_reset", "/reset 命令清空工作区", "bool", "开启后 /reset 会同时清空当前会话的 Agent 工作区", category="执行限制"),
+            field("Agent.tool_result_max_chars", "工具结果最大字数", "number", "超出部分写入 data/agent_overflow，仅回灌预览与路径", 8000, category="执行限制", min=500, max=60000),
             field("Agent.tool_timeout", "工具超时秒数", "number", "单个工具的执行上限", 120, category="执行限制", min=10, max=600),
-            field("Agent.parallel_tools", "并发执行工具", "bool", "同一轮多个工具并发跑，更快且不增加模型请求次数", category="执行限制"),
-            field("Agent.show_time", "显示当前时间", "bool", "开启后每次对话在用户消息末尾附加当前时间，让 AI 知道现在几点", category="基本设置"),
+            field("Agent.parallel_tools", "并发执行工具", "bool", "同一轮多个工具并发执行，加快响应速度", category="执行限制"),
+            field("Agent.show_time", "显示当前时间", "bool", "开启后在用户消息末尾附加当前时间", category="基本设置"),
             field("Agent.search.provider", "搜索源", "select", "auto=有 Key 优先付费源，否则回落百度/DuckDuckGo", "auto", ["auto", "tavily", "bocha", "baidu", "duckduckgo"], category="联网搜索"),
             field("Agent.search.tavily_api_key", "Tavily API Key", "password", "留空则不使用", category="联网搜索"),
             field("Agent.search.bocha_api_key", "博查 API Key", "password", "国内搜索源，留空则不使用", category="联网搜索"),
@@ -2851,7 +3169,7 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
         ]},
         {"key": "store", "title": "插件管理", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" x2="21" y1="6" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>', "desc": "管理已安装插件的配置项，或从插件商店下载新插件", "fields": []},
         {"key": "security", "title": "权限/名单", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2-1 4-2 7-2 2.5 0 4.5 1 6.5 2a1 1 0 0 1 1 1v7z"/><path d="m9 12 2 2 4-4"/></svg>', "desc": "设置管理用户和黑名单", "fields": [
-            field("manage_users", "管理用户", "list", "唯一高权限入口，一行一个 "),
+            field("manage_users", "管理用户", "list", "管理员 QQ 号，一行一个"),
             field("black_list", "配置黑名单", "list", "用户号或群号，一行一个"),
         ]},
         {"key": "connection", "title": "连接", "icon": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>', "desc": "OneBot / Hyper 连接参数", "fields": [
@@ -2871,6 +3189,7 @@ def build_ui_schema(cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
             field("Others.github_repo", "GitHub 更新仓库", "text", "格式 owner/repo，例如 Qzy327422/XcBot；留空使用默认仓库", category="更新与网络"),
             field("Others.github_download_mirrors", "GitHub 备用更新镜像", "list", "一行一个镜像前缀。检查/下载更新时先直连 GitHub，失败后按顺序尝试这些地址", category="更新与网络"),
             field("Others.http_proxy", "HTTP 代理", "text", "格式 http://127.0.0.1:7890，影响 GitHub 更新检查 / 插件市场与 Agent 联网（搜索、抓网页）；模型调用请在「提供商」里为每个提供商单独填代理。留空不使用代理", category="更新与网络"),
+            field("WebUI.ui_version", "WebUI 界面版本", "select", "自由切换经典卡片风旧版（classic）与全新现代工作台版（modern），切换后实时预览，点「保存设置」持久化", "classic", ["classic", "modern"], category="界面外观"),
             field("WebUI.theme_preset", "主题色", "select", "选择一套背景主题色", "aurora", ["aurora", "midnight", "sakura", "forest", "sunset", "ocean"], category="界面外观"),
             field("WebUI.background_image", "自定义背景图片", "background_image", "从本机选一张图，点「保存设置」时上传", category="界面外观"),
             field("WebUI.background_blur", "背景模糊度", "range", "0 到 40，数值越大越柔和", 10, category="界面外观", min=0, max=40, step=1),
@@ -2999,8 +3318,10 @@ def _save_ui_state_locked(data: Dict[str, Any]):
                 if key == "blacklist_file" and isinstance(values, dict) and "black_list" in values:
                     continue
                 payload[key] = data[key]
-    payload["manage_users"] = normalize_string_list(payload.get("manage_users", []))
-    payload["blacklist_file"] = normalize_string_list(payload.get("blacklist_file", []))
+    if "manage_users" in payload:
+        payload["manage_users"] = normalize_string_list(payload.get("manage_users", []))
+    if "blacklist_file" in payload:
+        payload["blacklist_file"] = normalize_string_list(payload.get("blacklist_file", []))
     # 调 _locked 版本：外层已经持有事务锁，再走 save_config_bundle 会重入死锁
     _save_config_bundle_locked(payload)
 
@@ -3150,22 +3471,56 @@ _API_REQ_RE = re.compile(
     r"^\[(?P<time>[^\]]+)\] \[[^\]]+\] \[API\] (?P<scene>.+?) -> (?P<model>.+?) @(?P<host>[^\s]+) key=(?P<key>[^\s]+) msg=(?P<msg>\d+) q=(?P<preview>.*)$"
 )
 _API_OK_RE = re.compile(
-    r"^\[(?P<time>[^\]]+)\] \[[^\]]+\] \[API\] (?P<scene>.+?) <- (?P<model>.+?) ok tokens=(?P<tokens>\d+) a=(?P<reply>.*)$"
+    r"^\[(?P<time>[^\]]+)\] \[[^\]]+\] \[API\] (?P<scene>.+?) <- (?P<model>.+?) ok tokens=(?P<tokens>\d+)(?: prompt=(?P<prompt>\d+) cached=(?P<cached>\d+))? a=(?P<reply>.*)$"
 )
 _API_FAIL_RE = re.compile(
     r"^\[(?P<time>[^\]]+)\] \[[^\]]+\] \[API\] (?P<scene>.+?) xx (?P<model>.+?) key=(?P<key>[^\s]+) err=(?P<error>.*)$"
 )
 # 三条正则都要求行里有 [API]，先做一次廉价的子串判断能跳过绝大多数行
 _API_MARK = "[API] "
+_ROLE_LIFE_SCENE_NAMES = {
+    "schedule": "日程",
+    "activity": "经历",
+    "diary": "日记",
+    "dream": "梦境",
+}
 
 
 def _pretty_scene(raw: str) -> str:
     raw = raw.strip()
+    if raw.startswith("proactive_judge_group_"):
+        return f"规划器 · 群聊 {raw[22:]}"
+    if raw.startswith("proactive_judge_private_"):
+        return f"规划器 · 私聊 {raw[24:]}"
+    if raw.startswith("proactive_judge_"):
+        return f"规划器 {raw[16:]}"
+    if raw.startswith("role_life_"):
+        kind = raw[10:].strip()
+        label = _ROLE_LIFE_SCENE_NAMES.get(kind, kind)
+        return f"角色生活 · {label}" if label else "角色生活"
     if raw.startswith("group_"):
-        return f"群聊 {raw[6:]}"
+        rest = raw[6:]
+        if rest.endswith(":vision"):
+            return f"群聊 {rest[:-7]} (识图)"
+        return f"群聊 {rest}"
     if raw.startswith("private_"):
-        return f"私聊 {raw[8:]}"
+        rest = raw[8:]
+        if rest.endswith(":vision"):
+            return f"私聊 {rest[:-7]} (识图)"
+        return f"私聊 {rest}"
     return raw
+
+
+def _scene_bucket(scene: str) -> str:
+    if scene.startswith("私聊"):
+        return "私聊"
+    if scene.startswith("群聊"):
+        return "群聊"
+    if scene.startswith("规划器"):
+        return "规划器"
+    if scene.startswith("角色生活"):
+        return "角色生活"
+    return "其他"
 
 
 def _stat_new_accumulator() -> Dict[str, Any]:
@@ -3174,10 +3529,20 @@ def _stat_new_accumulator() -> Dict[str, Any]:
         "message_trend": Counter(),
         "message_scene": Counter(),
         "api_request_history": [],
-        "model_rank": defaultdict(lambda: {"calls": 0, "tokens": 0, "success": 0, "failure": 0}),
+        "model_rank": defaultdict(lambda: {
+            "calls": 0,
+            "tokens": 0,
+            "success": 0,
+            "failure": 0,
+            "prompt_tokens": 0,
+            "cached_tokens": 0,
+        }),
         "session_tokens_1d": defaultdict(lambda: {"tokens": 0, "calls": 0, "last_time": 0}),
         "token_trend_1d": Counter(),
         "pending_api_by_scene": {},
+        "total_prompt_tokens": 0,
+        "total_cached_tokens": 0,
+        "cache_measured_calls": 0,
     }
 
 
@@ -3199,12 +3564,7 @@ def _stat_feed_lines(acc: Dict[str, Any], lines, one_day_ago: int) -> None:
             acc["total_messages"] += 1
             if ts:
                 acc["message_trend"][datetime.fromtimestamp(ts).strftime("%m-%d %H:00")] += 1
-            if scene.startswith("私聊"):
-                acc["message_scene"]["私聊"] += 1
-            elif scene.startswith("群聊"):
-                acc["message_scene"]["群聊"] += 1
-            else:
-                acc["message_scene"]["其他"] += 1
+            acc["message_scene"][_scene_bucket(scene)] += 1
             item = {
                 "time": m.group("time").strip(),
                 "timestamp": ts,
@@ -3215,6 +3575,8 @@ def _stat_feed_lines(acc: Dict[str, Any], lines, one_day_ago: int) -> None:
                 "preview": m.group("preview").strip(),
                 "status": "pending",
                 "tokens": 0,
+                "prompt_tokens": 0,
+                "cached_tokens": 0,
             }
             acc["api_request_history"].append(item)
             pending[scene] = item
@@ -3227,11 +3589,20 @@ def _stat_feed_lines(acc: Dict[str, Any], lines, one_day_ago: int) -> None:
             scene = _pretty_scene(m.group("scene"))
             model = m.group("model").strip()
             tokens = int(m.group("tokens") or 0)
+            prompt_tokens = int(m.group("prompt") or 0)
+            cached_tokens = int(m.group("cached") or 0)
             stats = model_rank[model]
             stats["tokens"] += tokens
             stats["success"] += 1
+            if prompt_tokens > 0:
+                acc["total_prompt_tokens"] += prompt_tokens
+                acc["total_cached_tokens"] += cached_tokens
+                acc["cache_measured_calls"] += 1
+                stats["prompt_tokens"] += prompt_tokens
+                stats["cached_tokens"] += cached_tokens
             if ts >= one_day_ago:
-                row = session_tokens_1d[scene or "unknown"]
+                session_key = scene[:-5] if scene.endswith(" (识图)") else scene
+                row = session_tokens_1d[session_key or "unknown"]
                 row["tokens"] += tokens
                 row["calls"] += 1
                 row["last_time"] = max(row["last_time"], ts)
@@ -3239,6 +3610,8 @@ def _stat_feed_lines(acc: Dict[str, Any], lines, one_day_ago: int) -> None:
             if scene in pending:
                 pending[scene]["status"] = "success"
                 pending[scene]["tokens"] = tokens
+                pending[scene]["prompt_tokens"] = prompt_tokens
+                pending[scene]["cached_tokens"] = cached_tokens
             continue
 
         m = _API_FAIL_RE.match(line)
@@ -3269,7 +3642,7 @@ def _stat_read_incremental(one_day_ago: int) -> Dict[str, Any]:
         rewound = size < st["file_size"]
         # 累加器里的 24h 窗口数据会过期，超过 6 小时就重建一次，
         # 否则 message_trend / token_trend 会一直留着一天前的桶
-        stale = (int(time.time()) - int(st["last_check"] or 0)) > 6 * 3600
+        stale = (int(time.time()) - int(st.get("last_rebuild") or 0)) > 6 * 3600
         acc = st.get("_acc")
 
         if acc is None or not same_file or rewound or stale:
@@ -3279,7 +3652,9 @@ def _stat_read_incremental(one_day_ago: int) -> Dict[str, Any]:
             st["_acc"] = acc
             st["log_path"] = str(path)
             st["file_size"] = size
-            st["last_check"] = int(time.time())
+            now_ts = int(time.time())
+            st["last_rebuild"] = now_ts
+            st["last_check"] = now_ts
             return acc
 
         if size > st["file_size"]:
@@ -3327,7 +3702,14 @@ def collect_statistics() -> Dict[str, Any]:
         for key in sorted(token_trend_1d.keys())[-24:]
     ]
     model_rank_list = sorted([
-        {"model": model, **values}
+        {
+            "model": model,
+            **values,
+            "cache_hit_rate": (
+                round(min(100.0, values.get("cached_tokens", 0) * 100.0 / values["prompt_tokens"]), 1)
+                if values.get("prompt_tokens", 0) > 0 else None
+            ),
+        }
         for model, values in model_rank.items()
     ], key=lambda x: (x.get("tokens", 0), x.get("calls", 0)), reverse=True)
     session_top10 = sorted([
@@ -3348,6 +3730,20 @@ def collect_statistics() -> Dict[str, Any]:
 
     total_api_calls = sum(item.get("calls", 0) for item in model_rank_list)
     total_api_tokens = sum(item.get("tokens", 0) for item in model_rank_list)
+    total_success_calls = sum(item.get("success", 0) for item in model_rank_list)
+    total_failure_calls = sum(item.get("failure", 0) for item in model_rank_list)
+    completed_calls = total_success_calls + total_failure_calls
+    total_prompt_tokens = int(acc.get("total_prompt_tokens", 0) or 0)
+    total_cached_tokens = int(acc.get("total_cached_tokens", 0) or 0)
+    cache_hit_rate = (
+        round(min(100.0, total_cached_tokens * 100.0 / total_prompt_tokens), 1)
+        if total_prompt_tokens > 0 else None
+    )
+    success_rate = (
+        round(total_success_calls * 100.0 / completed_calls, 1)
+        if completed_calls > 0 else None
+    )
+    avg_tokens_per_call = round(total_api_tokens / total_success_calls) if total_success_calls > 0 else 0
 
     result = {
         "summary": {
@@ -3355,6 +3751,14 @@ def collect_statistics() -> Dict[str, Any]:
             "api_calls": total_api_calls,
             "api_tokens": total_api_tokens,
             "model_count": len(model_rank_list),
+            "success_calls": total_success_calls,
+            "failure_calls": total_failure_calls,
+            "success_rate": success_rate,
+            "avg_tokens_per_call": avg_tokens_per_call,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_cached_tokens": total_cached_tokens,
+            "cache_hit_rate": cache_hit_rate,
+            "cache_measured_calls": int(acc.get("cache_measured_calls", 0) or 0),
         },
         "message_scene": [
             {"label": label, "value": value}
@@ -3804,7 +4208,7 @@ def install_latest_update() -> None:
                                 "Accept": "*/*",
                             },
                         )
-                        with urllib.request.urlopen(req, timeout=60) as resp, zip_path.open("wb") as f:
+                        with _make_opener().open(req, timeout=60) as resp, zip_path.open("wb") as f:
                             _read_capped_response(resp, sink=f)
                         last_error = None
                         print(f"[更新] 下载成功: {candidate}")
@@ -3949,7 +4353,11 @@ def _scrape_latest_tag_via_redirect(repo: str, timeout: float = 6.0) -> Tuple[st
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
-    opener = urllib.request.build_opener(_NoRedirect)
+    proxy = _get_http_proxy()
+    handlers = [_NoRedirect]
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*handlers)
     github_url = f"https://github.com/{repo}/releases/latest"
     last_error = None
     for url in _github_accelerated_urls(github_url):
@@ -4567,8 +4975,14 @@ def _collect_plugin_schemas() -> Dict[str, Any]:
         current = current if isinstance(current, dict) else {}
         fallback = info.get("values", info.get("current_values", {}))
         fallback = fallback if isinstance(fallback, dict) else {}
-        values = {key: copy.deepcopy(current.get(key, fallback.get(key, spec.get("default"))))
-                  for key, spec in schema.items()}
+        values = {}
+        for key, spec in schema.items():
+            if key in current:
+                values[key] = copy.deepcopy(current[key])
+            elif key in fallback and fallback[key] is not None:
+                values[key] = copy.deepcopy(fallback[key])
+            elif "default" in spec and spec["default"] is not None:
+                values[key] = copy.deepcopy(spec["default"])
         result[name] = {"schema": schema, "values": values}
     return result
 
@@ -4723,10 +5137,26 @@ def _safe_write_zip_member(dest_root: Path, rel: str, data: bytes) -> bool:
     return True
 
 
+def _safe_plugin_dest(name: str) -> Path:
+    raw = str(name or "").strip()
+    if (
+        not raw
+        or raw in (".", "..")
+        or any(ch in raw for ch in ("/", "\\", ":"))
+        or any(ord(ch) < 32 for ch in raw)
+        or raw.endswith((".", " "))
+    ):
+        raise ValueError("无效的插件名")
+    root = PLUGIN_DIR.resolve()
+    dest = (root / raw).resolve()
+    if dest.parent != root or dest == root:
+        raise ValueError("无效的插件名")
+    return dest
+
+
 def _store_install(name: str, path: str) -> str:
     """下载并解压单个插件到 plugins/ 目录，返回安装结果描述"""
-    if not name or "/" in name or "\\" in name or ".." in name:
-        raise ValueError("无效的插件名")
+    dest = _safe_plugin_dest(name)
     path = str(path or "").replace("\\", "/").strip().strip("/")
     if not path or ".." in path.split("/") or path.startswith("/"):
         raise ValueError("无效的插件路径")
@@ -4749,7 +5179,6 @@ def _store_install(name: str, path: str) -> str:
     PLUGIN_DIR.mkdir(exist_ok=True)
     repo_short = PLUGIN_STORE_REPO.split("/")[-1]
     prefix = f"{repo_short}-main/{path}/"
-    dest = PLUGIN_DIR / name
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         _check_zip_safety(zf)
         members = [m for m in zf.namelist() if m.startswith(prefix) and not m.endswith("/")]
@@ -5138,45 +5567,37 @@ class WebUIHandler(BaseHTTPRequestHandler):
             return False
         if not path.startswith("/api/"):
             return True
-        # 登录探测口先看冷却。锁定期内即使 Token 正确也拒绝，
-        # 否则「猜对就放过」等于限流形同虚设。
-        is_probe = path == self.LOGIN_PROBE_PATH
         client = _login_client_key(self)
-        if is_probe:
-            remain = _login_locked_for(client)
-            if remain > 0:
+        remain = _login_locked_for(client)
+        if remain > 0:
+            _json_response(self, {
+                "ok": False,
+                "error": f"登录失败次数过多，请等待 {_fmt_lock_remain(remain)} 后重试",
+                "locked": True, "retry_after": int(remain + 0.5),
+                "login": "/auth/login",
+            }, 429)
+            return False
+        if not self._auth_ok():
+            fails, locked = _login_note_failure(client)
+            if locked:
+                print(f"⚠️ WebUI 登录连续失败 {fails} 次（来源 {client}），"
+                      f"已锁定 {_fmt_lock_remain(locked)}。")
                 _json_response(self, {
                     "ok": False,
-                    "error": f"登录失败次数过多，请等待 {_fmt_lock_remain(remain)} 后重试",
-                    "locked": True, "retry_after": int(remain + 0.5),
+                    "error": f"登录失败次数过多，请等待 {_fmt_lock_remain(locked)} 后重试",
+                    "locked": True, "retry_after": int(locked),
                     "login": "/auth/login",
                 }, 429)
                 return False
-        if not self._auth_ok():
-            if is_probe:
-                fails, locked = _login_note_failure(client)
-                if locked:
-                    print(f"⚠️ WebUI 登录连续失败 {fails} 次（来源 {client}），"
-                          f"已锁定 {_fmt_lock_remain(locked)}。")
-                    _json_response(self, {
-                        "ok": False,
-                        "error": f"登录失败次数过多，请等待 {_fmt_lock_remain(locked)} 后重试",
-                        "locked": True, "retry_after": int(locked),
-                        "login": "/auth/login",
-                    }, 429)
-                    return False
-                left = max(0, LOGIN_MAX_FAILS - fails)
-                _json_response(self, {
-                    "ok": False,
-                    "error": f"访问 Token 不正确（还可尝试 {left} 次）" if left
-                             else "访问 Token 不正确",
-                    "remaining_attempts": left, "login": "/auth/login",
-                }, 401)
-                return False
-            _json_response(self, {"ok": False, "error": "未授权：访问 Token 不正确或已失效", "login": "/auth/login"}, 401)
+            left = max(0, LOGIN_MAX_FAILS - fails)
+            _json_response(self, {
+                "ok": False,
+                "error": f"访问 Token 不正确（还可尝试 {left} 次）" if left
+                         else "访问 Token 不正确",
+                "remaining_attempts": left, "login": "/auth/login",
+            }, 401)
             return False
-        if is_probe:
-            _login_note_success(client)
+        _login_note_success(client)
         return True
 
     def do_GET(self):
@@ -5586,8 +6007,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 payload = data or {}
                 name = str(payload.get("name", "") or "").strip().removesuffix(".zip")
                 zip_b64 = str(payload.get("zip_b64", "") or "")
-                if not name or "/" in name or "\\" in name or ".." in name:
-                    raise ValueError("无效的插件名")
+                dest = _safe_plugin_dest(name)
                 # 约 12MB 原始 zip 上限（base64 膨胀后约 16MB 文本）
                 if len(zip_b64) > 16 * 1024 * 1024:
                     raise ValueError("插件包过大（上限约 12MB）")
@@ -5597,7 +6017,6 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     raise ValueError("插件 zip 数据无效")
                 if len(raw) > 12 * 1024 * 1024:
                     raise ValueError("插件包过大（上限约 12MB）")
-                dest = PLUGIN_DIR / name
                 PLUGIN_DIR.mkdir(exist_ok=True)
                 if dest.exists():
                     shutil.rmtree(dest)
@@ -5626,9 +6045,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/plugins/uninstall":
                 payload = data or {}
                 name = str(payload.get("name", "") or "").strip()
-                if not name or "/" in name or ".." in name:
-                    raise ValueError("无效的插件名")
-                dest = PLUGIN_DIR / name
+                dest = _safe_plugin_dest(name)
                 if not dest.exists():
                     raise RuntimeError(f"插件 {name} 未安装")
                 shutil.rmtree(dest)
@@ -5680,13 +6097,26 @@ class WebUIHandler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         sse_state["gone"] = True
+                turn_started = _chatroom_now_monotonic()
                 reply_parts = []
                 streamed_parts = []
                 progress_messages = []
                 reasoning_parts = []
+                live_steps = []
+                live_tools_by_id = {}
+                live_thinking = {"step": None}
                 agent_state = None
                 assistant_saved = False
                 obj = None
+
+                def _close_live_thinking():
+                    cur = live_thinking["step"]
+                    if cur is not None:
+                        t0 = cur.pop("_t0", None)
+                        if t0 is not None:
+                            cur["duration_ms"] = max(0, int((_chatroom_now_monotonic() - t0) * 1000))
+                        live_thinking["step"] = None
+
                 with _chatroom_session_lock(sid):
                     try:
                         _chatroom_mark_generating(sid, True)
@@ -5699,7 +6129,9 @@ class WebUIHandler(BaseHTTPRequestHandler):
                             def _emit_progress(progress: str):
                                 progress = str(progress or "").strip()
                                 if progress:
+                                    _close_live_thinking()
                                     progress_messages.append(progress)
+                                    live_steps.append({"type": "text", "text": _chatroom_clip_step_text(progress)})
                                     _sse("progress", {"text": progress})
 
                             def _emit_delta(chunk):
@@ -5717,13 +6149,96 @@ class WebUIHandler(BaseHTTPRequestHandler):
                                 text = str(chunk or "")
                                 if text:
                                     reasoning_parts.append(text)
+                                    cur = live_thinking["step"]
+                                    if cur is None:
+                                        cur = {"type": "thinking", "text": "", "_t0": _chatroom_now_monotonic(), "duration_ms": 0}
+                                        live_steps.append(cur)
+                                        live_thinking["step"] = cur
+                                    cur["text"] += text
+                                    cur["duration_ms"] = max(0, int((_chatroom_now_monotonic() - cur["_t0"]) * 1000))
                                     _sse("reasoning", {"text": text})
+
+                            def _emit_agent_event(event):
+                                if not isinstance(event, dict):
+                                    return
+                                ev_type = str(event.get("type") or "")
+                                if ev_type == "attempt_reset":
+                                    _close_live_thinking()
+                                    if not any(s.get("type") == "tool" for s in live_steps):
+                                        live_steps.clear()
+                                    _sse("agent_event", {"type": "attempt_reset", "model": str(event.get("model") or "")})
+                                    return
+                                if ev_type == "round_start":
+                                    _close_live_thinking()
+                                    _sse("agent_event", {"type": "round_start", "round": int(event.get("round") or 1)})
+                                    return
+                                if ev_type == "tool_start":
+                                    _close_live_thinking()
+                                    cid = str(event.get("call_id") or "")
+                                    step = {
+                                        "type": "tool",
+                                        "call_id": cid,
+                                        "round": int(event.get("round") or 1),
+                                        "name": str(event.get("name") or ""),
+                                        "arguments": _chatroom_clip_step_text(event.get("arguments") or ""),
+                                        "status": "running",
+                                        "duration_ms": 0,
+                                        "result": "",
+                                        "result_chars": 0,
+                                    }
+                                    live_steps.append(step)
+                                    if cid:
+                                        live_tools_by_id[cid] = step
+                                    _sse("agent_event", {"type": "tool_start", **{k: v for k, v in step.items() if k != "type"}})
+                                    return
+                                if ev_type == "tool_end":
+                                    cid = str(event.get("call_id") or "")
+                                    clipped_res = _chatroom_clip_step_text(event.get("result") or "")
+                                    dur = max(0, int(event.get("duration_ms") or 0))
+                                    st = str(event.get("status") or ("ok" if event.get("ok") else "error"))
+                                    ok_flag = bool(event.get("ok", st == "ok"))
+                                    chars = int(event.get("result_chars") or len(clipped_res))
+                                    existing = live_tools_by_id.get(cid)
+                                    if existing is not None:
+                                        existing["status"] = st
+                                        existing["ok"] = ok_flag
+                                        existing["duration_ms"] = dur
+                                        existing["result"] = clipped_res
+                                        existing["result_chars"] = chars
+                                    else:
+                                        step = {
+                                            "type": "tool",
+                                            "call_id": cid,
+                                            "round": int(event.get("round") or 1),
+                                            "name": str(event.get("name") or ""),
+                                            "arguments": _chatroom_clip_step_text(event.get("arguments") or ""),
+                                            "status": st,
+                                            "ok": ok_flag,
+                                            "duration_ms": dur,
+                                            "result": clipped_res,
+                                            "result_chars": chars,
+                                        }
+                                        live_steps.append(step)
+                                        if cid:
+                                            live_tools_by_id[cid] = step
+                                    _sse("agent_event", {
+                                        "type": "tool_end",
+                                        "call_id": cid,
+                                        "round": int(event.get("round") or 1),
+                                        "name": str(event.get("name") or ""),
+                                        "arguments": _chatroom_clip_step_text(event.get("arguments") or ""),
+                                        "status": st,
+                                        "ok": ok_flag,
+                                        "duration_ms": dur,
+                                        "result": clipped_res,
+                                        "result_chars": chars,
+                                    })
 
                             result = _chatroom_agent_callback({
                                 "id": sid,
                                 "model": obj.get("model", ""),
                                 "text": full_text,
-                                "attachments": attachments,
+                                "attachments": (obj.get("messages") or [{}])[-1].get("attachments") or [],
                                 "persona": obj.get("persona") or "",
                                 "agent_history": obj.get("_agent_history") or [],
                                 "total_tokens": obj.get("_agent_total_tokens") or 0,
@@ -5733,6 +6248,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                                 "progress_callback": _emit_progress,
                                 "stream_callback": _emit_delta,
                                 "reasoning_callback": _emit_reasoning,
+                                "event_callback": _emit_agent_event,
                             })
                             if not isinstance(result, dict):
                                 raise RuntimeError("聊天室 Agent 回调返回格式无效")
@@ -5757,16 +6273,27 @@ class WebUIHandler(BaseHTTPRequestHandler):
                                 if reply_reasoning:
                                     reasoning_parts.append(reply_reasoning)
                                     _sse("reasoning", {"text": reply_reasoning})
+                        _close_live_thinking()
+                        turn_duration = max(0, int((_chatroom_now_monotonic() - turn_started) * 1000))
+                        final_steps = (agent_state.get("steps") if isinstance(agent_state, dict) else None)
+                        if not final_steps and live_steps:
+                            final_steps = live_steps
+                        final_duration = (agent_state.get("duration_ms") if isinstance(agent_state, dict) else None) or turn_duration
                         fresh = _chatroom_append_assistant(
                             obj, "".join(reply_parts), agent_state=agent_state,
                             progress_messages=_chatroom_progress_messages(agent_state),
                             reasoning="".join(reasoning_parts),
+                            steps=final_steps,
+                            duration_ms=final_duration,
                         )
                         assistant_saved = True
                         _sse("done", {"session": _chatroom_public(fresh)})
                     except Exception as e:
                         # 模型网络异常也走统一报错；浏览器断开不影响 user、半篇回复和错误落盘。
                         # 回调抛错时最终 reply 尚未返回，安全可见片段仍在 streamed_parts 中。
+                        _close_live_thinking()
+                        turn_duration = max(0, int((_chatroom_now_monotonic() - turn_started) * 1000))
+                        err_steps = (agent_state.get("steps") if isinstance(agent_state, dict) else None) or (live_steps if live_steps else None)
                         partial = "".join(reply_parts or streamed_parts).strip()
                         if obj is not None and partial and not assistant_saved:
                             try:
@@ -5774,6 +6301,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
                                     obj, partial, agent_state=agent_state,
                                     progress_messages=_chatroom_progress_messages(agent_state) or progress_messages,
                                     reasoning="".join(reasoning_parts),
+                                    steps=err_steps,
+                                    duration_ms=turn_duration,
                                 )
                                 assistant_saved = True
                             except Exception as save_error:
@@ -5781,7 +6310,11 @@ class WebUIHandler(BaseHTTPRequestHandler):
                         err_session = None
                         try:
                             if obj is not None:
-                                err_session = _chatroom_public(_chatroom_append_error(obj, str(e)))
+                                err_session = _chatroom_public(_chatroom_append_error(
+                                    obj, str(e),
+                                    steps=(None if assistant_saved else err_steps),
+                                    duration_ms=turn_duration,
+                                ))
                         except Exception as save_error:
                             # 落盘失败也不能删除已经保存的提问。
                             _append_log(f"[聊天室] 保存报错失败：{save_error}", "webui")
@@ -6086,7 +6619,7 @@ atexit.register(stop_webui)
 
 
 LOGIN_HTML = r'''<!doctype html>
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN" data-theme="light" data-webui-version="classic">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>XcBot WebUI 登录</title><link rel="icon" href="/assets/icon.jpg">
   <style>
@@ -6162,6 +6695,23 @@ LOGIN_HTML = r'''<!doctype html>
       88%{transform:translateY(var(--cardY)) translateX(1px)}
     }
     @media (prefers-reduced-motion: reduce){.shake{animation:none}}
+    /* 新版现代工作台登录页样式 */
+    html[data-webui-version="modern"]{--bg0:#1d2028;--bg1:#262a34;--text:#f1f3f8;--muted:#a8b0c2;--line:rgba(255,255,255,.10);--accent:#2563eb;--bad:#fb7185}
+    html[data-webui-version="modern"][data-theme="light"]{--bg0:#f6f6f7;--bg1:#ffffff;--text:#18181b;--muted:#52525b;--line:#e4e4e7;--accent:#2563eb;--bad:#be123c}
+    html[data-webui-version="modern"]:not(.has-bg) body{background:var(--bg0) !important}
+    html[data-webui-version="modern"] .login{width:min(392px,calc(100vw - 32px));padding:30px;border-radius:14px;background:var(--bg1);border:1px solid var(--line);box-shadow:0 16px 40px -8px rgba(0,0,0,.28);backdrop-filter:blur(18px);--cardY:0px}
+    html[data-webui-version="modern"][data-theme="light"] .login{box-shadow:0 4px 20px -2px rgba(0,0,0,.06),0 1px 3px rgba(0,0,0,.04)}
+    html[data-webui-version="modern"] .login:before{display:none}
+    html[data-webui-version="modern"] .logo{width:42px;height:42px;border-radius:10px;box-shadow:none;border:1px solid var(--line)}
+    html[data-webui-version="modern"] .theme{width:34px;height:34px;border-radius:8px;background:transparent;box-shadow:none}
+    html[data-webui-version="modern"] h1{font-size:20px;font-weight:600;letter-spacing:-.015em;margin:18px 0 4px}
+    html[data-webui-version="modern"] .sub{font-size:13.5px;margin-bottom:22px}
+    html[data-webui-version="modern"] .field{height:42px;border-radius:8px;background:#1f232c;border-color:rgba(255,255,255,.15);box-shadow:none}
+    html[data-webui-version="modern"][data-theme="light"] .field{background:#ffffff;border-color:#d4d4d8;box-shadow:none}
+    html[data-webui-version="modern"] .field:focus-within{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 22%,transparent)}
+    html[data-webui-version="modern"] .field input{height:38px;line-height:38px;font-size:14px;transform:none}
+    html[data-webui-version="modern"] .btn{height:40px;border-radius:8px;background:var(--accent) !important;color:#ffffff !important;font-weight:500;font-size:14px;box-shadow:0 1px 2px rgba(0,0,0,.14)}
+    html[data-webui-version="modern"] .btn:hover{transform:none;filter:brightness(1.06)}
   
   </style>
 </head>
@@ -6169,7 +6719,7 @@ LOGIN_HTML = r'''<!doctype html>
 
 
 INDEX_HTML = r'''<!doctype html>
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN" data-theme="light" data-webui-version="classic">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>XcBot WebUI</title><link rel="icon" href="/assets/icon.jpg">
   <script>
@@ -6181,6 +6731,7 @@ INDEX_HTML = r'''<!doctype html>
     if(t==='light'||t==='dark')d.setAttribute('data-theme',t);
     var o=JSON.parse(localStorage.getItem('xcbotAppearanceCache')||'null');
     if(!o)return;
+    if(o.uiVersion==='classic'||o.uiVersion==='modern')d.setAttribute('data-webui-version',o.uiVersion);
     if(o.preset)d.setAttribute('data-webui-preset',o.preset);
     if(typeof o.blur==='number')d.style.setProperty('--user-bg-blur',o.blur+'px');
     if(o.bgUrl){d.style.setProperty('--user-bg-image','url("'+String(o.bgUrl).replace(/"/g,'%22')+'")');d.classList.add('has-bg')}
@@ -6190,7 +6741,7 @@ INDEX_HTML = r'''<!doctype html>
   </script>
   <link rel="stylesheet" href="/static/app.css">
 </head>
-<body><svg style="position:absolute;width:0;height:0;pointer-events:none" aria-hidden="true"><defs><filter id="xcbot-liquid-glass" x="0%" y="0%" width="100%" height="100%" filterUnits="objectBoundingBox" color-interpolation-filters="sRGB"><feImage id="xcbot-liquid-map" x="0" y="0" width="100%" height="100%" preserveAspectRatio="none" result="xcbot-map"/><feDisplacementMap id="xcbot-liquid-displacement-r" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-red-displaced"/><feDisplacementMap id="xcbot-liquid-displacement-g" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-green-displaced"/><feDisplacementMap id="xcbot-liquid-displacement-b" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-blue-displaced"/><feColorMatrix in="xcbot-red-displaced" type="matrix" values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="xcbot-red-channel"/><feColorMatrix in="xcbot-green-displaced" type="matrix" values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="xcbot-green-channel"/><feColorMatrix in="xcbot-blue-displaced" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="xcbot-blue-channel"/><feBlend in="xcbot-green-channel" in2="xcbot-blue-channel" mode="screen" result="xcbot-gb"/><feBlend in="xcbot-red-channel" in2="xcbot-gb" mode="screen" result="xcbot-rgb"/><feComposite in="xcbot-rgb" in2="SourceAlpha" operator="in"/></filter></defs></svg><div class="app"><aside class="sidebar"><div class="brand"><div class="logo"><img src="/assets/icon.jpg" alt="XcBot"></div><div><h1 id="brandName">XcBot</h1><p>实时 Web 管理台</p></div></div><div class="nav-title">功能列表</div><nav id="nav" class="nav"></nav><div class="nav-title">OneBot / Hyper 连接状态</div><div id="connectionStatus" class="pill">加载中...</div><div id="connectionDetail" class="desc" style="margin:10px 12px 0 12px"></div></aside><div class="nav-scrim" id="navScrim" onclick="closeMobileNav()"></div><main class="main"><div class="topbar"><button class="nav-toggle" id="navToggle" onclick="toggleMobileNav()" aria-label="展开导航" aria-expanded="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h16"/></svg></button><div class="title"><h2 id="pageTitle">加载中...</h2><p id="pageDesc">正在连接 WebUI</p></div><span id="saveState" class="pill">未加载</span><div class="topbar-actions"><div class="toolbar"><button class="btn" onclick="gotoPage('chatroom')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>聊天室</button><button class="btn" onclick="gotoPage('debug')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>调试</button><button class="btn" id="themeBtn" onclick="toggleTheme()">深色</button><button class="btn primary" onclick="saveAll()">保存设置</button></div></div></div><section id="content" class="grid"></section></main></div><div id="toast" class="toast"></div><div id="submitModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center"><div style="max-width:420px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 16px;color:var(--text)">提交插件</h3><div style="display:grid;gap:10px"><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div><div class="label">插件名</div><input class="input" id="submitName" placeholder="your_plugin"></div><div><div class="label">作者</div><input class="input" id="submitAuthor" placeholder="你的名字"></div></div><div><div class="label">功能描述</div><textarea class="input" id="submitDesc" rows="3" placeholder="简单描述插件功能" style="resize:vertical"></textarea></div><p class="desc">提交后将打开 GitHub Issue 页面，把 zip 拖入评论框上传后点提交</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="el('submitModal').style.display='none'">取消</button><button class="btn primary" onclick="storeSubmit()">打开 GitHub Issue</button></div></div></div></div><div id="leaveModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center"><div style="max-width:360px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 8px;color:var(--text)">确认操作</h3><p style="margin:0 0 24px;color:var(--muted)">当前页面有未保存修改，离开后将丢失这些更改。是否离开？</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="leaveCancel()">取消</button><button class="btn primary" onclick="leaveConfirm()">确定</button></div></div></div><div id="tokenModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:10000;align-items:center;justify-content:center"><div style="max-width:460px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 style="margin:0 0 10px;color:var(--text)">设置访问 Token</h3><p style="margin:0 0 6px;color:var(--muted);font-size:13px">当前未设置访问 Token，任何能打开这个地址的人都可以查看你的 LLM API Key、以机器人身份发消息。</p><p id="tokenModalHost" style="margin:0 0 18px;color:var(--bad,#e11d48);font-size:13px;display:none"></p><div style="display:grid;gap:10px"><div><div class="label">访问 Token</div><input class="input" id="newToken" type="password" placeholder="建议用随机字符串" autocomplete="new-password"></div><div><div class="label">再输入一次</div><input class="input" id="newToken2" type="password" placeholder="确认 Token" autocomplete="new-password"></div><div id="tokenModalMsg" class="desc" style="min-height:18px;color:var(--bad,#e11d48)"></div><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn primary" id="tokenModalBtn" onclick="submitNewToken()">保存并使用</button></div></div></div></div><div id="modelInputModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;align-items:center;justify-content:center" onclick="if(event.target===this)closeModelInput()"><div style="max-width:440px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 id="modelInputTitle" style="margin:0 0 18px;color:var(--text)">添加模型</h3><div class="field"><div class="label"><span id="modelInputLabel">模型名称</span></div><input id="modelInputValue" placeholder="例如 model-name" onkeydown="if(event.key==='Enter')submitModelInput();if(event.key==='Escape')closeModelInput()"><div class="desc">保存后模型将显示为“提供商/模型名”。</div></div><div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button class="btn" onclick="closeModelInput()">取消</button><button class="btn primary" onclick="submitModelInput()">添加</button></div></div></div><div id="modelInputModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;align-items:center;justify-content:center" onclick="if(event.target===this)closeModelInput()"><div style="max-width:440px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 id="modelInputTitle" style="margin:0 0 18px;color:var(--text)">添加模型</h3><div class="field"><div class="label"><span id="modelInputLabel">模型名称</span></div><input id="modelInputValue" placeholder="例如 model-name" onkeydown="if(event.key==='Enter')submitModelInput();if(event.key==='Escape')closeModelInput()"><div class="desc">保存后模型将显示为“提供商/模型名”。</div></div><div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button class="btn" onclick="closeModelInput()">取消</button><button class="btn primary" onclick="submitModelInput()">添加</button></div></div></div><input id="pluginUploadInput" type="file" accept=".zip" style="display:none" onchange="storeUploadFile(this)"><button id="pluginUploadBtn" onclick="el('pluginUploadInput').click()" title="上传本地插件" style="display:none;position:fixed;right:24px;bottom:24px;width:48px;height:48px;border-radius:50%;background:var(--accent,#6366f1);border:none;cursor:pointer;font-size:22px;color:#fff;box-shadow:0 2px 8px #0004;z-index:999">&#8679;</button>
+<body><svg style="position:absolute;width:0;height:0;pointer-events:none" aria-hidden="true"><defs><filter id="xcbot-liquid-glass" x="0%" y="0%" width="100%" height="100%" filterUnits="objectBoundingBox" color-interpolation-filters="sRGB"><feImage id="xcbot-liquid-map" x="0" y="0" width="100%" height="100%" preserveAspectRatio="none" result="xcbot-map"/><feDisplacementMap id="xcbot-liquid-displacement-r" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-red-displaced"/><feDisplacementMap id="xcbot-liquid-displacement-g" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-green-displaced"/><feDisplacementMap id="xcbot-liquid-displacement-b" in="SourceGraphic" in2="xcbot-map" scale="0" xChannelSelector="R" yChannelSelector="G" result="xcbot-blue-displaced"/><feColorMatrix in="xcbot-red-displaced" type="matrix" values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="xcbot-red-channel"/><feColorMatrix in="xcbot-green-displaced" type="matrix" values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="xcbot-green-channel"/><feColorMatrix in="xcbot-blue-displaced" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="xcbot-blue-channel"/><feBlend in="xcbot-green-channel" in2="xcbot-blue-channel" mode="screen" result="xcbot-gb"/><feBlend in="xcbot-red-channel" in2="xcbot-gb" mode="screen" result="xcbot-rgb"/><feComposite in="xcbot-rgb" in2="SourceAlpha" operator="in"/></filter></defs></svg><div class="app"><aside class="sidebar"><div class="brand"><div class="logo"><img src="/assets/icon.jpg" alt="XcBot"></div><div><h1 id="brandName">XcBot</h1><p>实时 Web 管理台</p></div></div><div class="nav-title">功能列表</div><nav id="nav" class="nav"></nav><div class="sidebar-foot"><div class="nav-title">OneBot / Hyper 连接状态</div><div id="connectionStatus" class="pill">加载中...</div><div id="connectionDetail" class="desc" style="margin:10px 12px 0 12px"></div></div></aside><div class="nav-scrim" id="navScrim" onclick="closeMobileNav()"></div><main class="main"><div class="topbar"><button class="nav-toggle" id="navToggle" onclick="toggleMobileNav()" aria-label="展开导航" aria-expanded="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h16"/></svg></button><div class="title"><h2 id="pageTitle">加载中...</h2><p id="pageDesc">正在连接 WebUI</p></div><span id="saveState" class="pill">未加载</span><div class="topbar-actions"><div class="toolbar"><button class="btn" onclick="gotoPage('chatroom')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>聊天室</button><button class="btn" onclick="gotoPage('debug')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;vertical-align:-2px;margin-right:5px"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>调试</button><button class="btn" id="themeBtn" onclick="toggleTheme()">深色</button><button class="btn primary" onclick="saveAll()">保存设置</button></div></div></div><section id="content" class="grid"></section></main></div><div id="toast" class="toast"></div><div id="submitModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center" onclick="if(event.target===this)closeSubmitModal()"><div style="max-width:420px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 16px;color:var(--text)">提交插件</h3><div style="display:grid;gap:10px"><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div><div class="label">插件名</div><input class="input" id="submitName" placeholder="your_plugin" onkeydown="if(event.key==='Enter'){event.preventDefault();storeSubmit()}else if(event.key==='Escape'){event.preventDefault();closeSubmitModal()}"></div><div><div class="label">作者</div><input class="input" id="submitAuthor" placeholder="你的名字" onkeydown="if(event.key==='Enter'){event.preventDefault();storeSubmit()}else if(event.key==='Escape'){event.preventDefault();closeSubmitModal()}"></div></div><div><div class="label">功能描述</div><textarea class="input" id="submitDesc" rows="3" placeholder="简单描述插件功能" style="resize:vertical" onkeydown="if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();storeSubmit()}else if(event.key==='Escape'){event.preventDefault();closeSubmitModal()}"></textarea></div><p class="desc">提交后将打开 GitHub Issue 页面，把 zip 拖入评论框上传后点提交</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="closeSubmitModal()">取消</button><button class="btn primary" onclick="storeSubmit()">打开 GitHub Issue</button></div></div></div></div><div id="leaveModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center" onclick="if(event.target===this)leaveCancel()"><div style="max-width:360px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.4)"><h3 style="margin:0 0 8px;color:var(--text)">确认操作</h3><p style="margin:0 0 24px;color:var(--muted)">当前页面有未保存修改，离开后将丢失这些更改。是否离开？</p><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" onclick="leaveCancel()">取消</button><button class="btn primary" id="leaveConfirmBtn" onclick="leaveConfirm()">确定</button></div></div></div><div id="tokenModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:10000;align-items:center;justify-content:center"><div style="max-width:460px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 style="margin:0 0 10px;color:var(--text)">设置访问 Token</h3><p style="margin:0 0 6px;color:var(--muted);font-size:13px">当前未设置访问 Token，任何能打开这个地址的人都可以查看你的 LLM API Key、以机器人身份发消息。</p><p id="tokenModalHost" style="margin:0 0 18px;color:var(--bad,#e11d48);font-size:13px;display:none"></p><div style="display:grid;gap:10px"><div><div class="label">访问 Token</div><input class="input" id="newToken" type="password" placeholder="建议用随机字符串" autocomplete="new-password" onkeydown="if(event.key==='Enter'){event.preventDefault();const n2=el('newToken2');if(n2&&!n2.value.trim())n2.focus();else submitNewToken()}"></div><div><div class="label">再输入一次</div><input class="input" id="newToken2" type="password" placeholder="确认 Token" autocomplete="new-password" onkeydown="if(event.key==='Enter'){event.preventDefault();submitNewToken()}"></div><div id="tokenModalMsg" class="desc" style="min-height:18px;color:var(--bad,#e11d48)"></div><div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn primary" id="tokenModalBtn" onclick="submitNewToken()">保存并使用</button></div></div></div></div><div id="modelInputModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;align-items:center;justify-content:center" onclick="if(event.target===this)closeModelInput()"><div style="max-width:440px;width:90%;padding:28px 32px;border-radius:var(--radius,26px);background:var(--bg2);border:1px solid var(--line);box-shadow:0 24px 90px rgba(0,0,0,.45)"><h3 id="modelInputTitle" style="margin:0 0 18px;color:var(--text)">添加模型</h3><div class="field"><div class="label"><span id="modelInputLabel">模型名称</span></div><input id="modelInputValue" placeholder="例如 model-name" onkeydown="if(event.key==='Enter'){event.preventDefault();submitModelInput()}else if(event.key==='Escape'){event.preventDefault();closeModelInput()}"><div class="desc">保存后模型将显示为“提供商/模型名”。</div></div><div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button class="btn" onclick="closeModelInput()">取消</button><button class="btn primary" onclick="submitModelInput()">添加</button></div></div></div><input id="pluginUploadInput" type="file" accept=".zip" style="display:none" onchange="storeUploadFile(this)"><button id="pluginUploadBtn" onclick="el('pluginUploadInput').click()" title="上传本地插件" style="display:none;position:fixed;right:24px;bottom:24px;width:48px;height:48px;border-radius:50%;background:var(--accent,#6366f1);border:none;cursor:pointer;font-size:22px;color:#fff;box-shadow:0 2px 8px #0004;z-index:999">&#8679;</button>
 <script src="/static/app.js"></script></body></html>'''
 
 def _static_asset_version(filename: str) -> str:
